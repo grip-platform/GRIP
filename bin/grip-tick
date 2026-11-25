@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# grip-tick -- the always-on tick: a deterministic floor every five minutes, no model.
+# Thin wrapper: lib/grip_tick.py runs the fleet watch, the pending-question,
+# hypothesis-deadline, launchd-exit and spend-step checks, reports new findings
+# once on WhatsApp, and never stops anything it did not start.
+# Exit 0 quiet, 1 findings, 2 overran or could not run.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec "$here/bin/grip-py" "$here/lib/grip_tick.py" "$@"

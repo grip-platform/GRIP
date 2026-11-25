@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  grip-harness-link  —  make CLAUDE_DIR (~/.claude) resolve to GRIP_HOME (~/.grip)
+#
+#  Claude Code's harness reads ~/.claude. GRIP lives in ~/.grip. This tool
+#  makes ~/.claude POINT AT ~/.grip so the harness and the GRIP repo are the
+#  same tree — exactly like scripts/blackbook phase 5 does on macOS, but
+#  cross-platform (POSIX symlink OR Windows directory junction).
+#
+#  Usage:
+#    grip-harness-link [--grip-home DIR] [--claude-dir DIR] [--force-backup] [--dry-run]
+#
+#    --grip-home DIR    where GRIP lives           (default: $HOME/.grip)
+#    --claude-dir DIR   the harness dir to link    (default: $HOME/.claude)
+#    --force-backup     migrate a REAL ~/.claude into GRIP_HOME, back up the rest
+#    --dry-run          print what would happen; change nothing
+#
+#  POSIX (macOS/Linux):  ln -sfn "$GRIP_HOME" "$CLAUDE_DIR"
+#  Windows (Git-Bash) :  cmd //c mklink /J "<win CLAUDE_DIR>" "<win GRIP_HOME>"
+#                        (a directory junction — needs NO admin / Developer Mode)
+#
+#  SAFE BY DEFAULT: if CLAUDE_DIR is a REAL directory (not a link) it REFUSES
+#  (exit 3) and tells you the exact --force-backup command. Nothing is ever
+#  clobbered without --force-backup.
+#
+#  Test seam: set GRIP_HARNESS_LINK_OS=windows|posix to force the code path.
+#  Exit codes: 0 success/already-linked · 2 bad args · 3 refuse (real dir) · 1 error.
+# ============================================================================
+set -u
+
+# --- Layer-0 harness files preserved across a --force-backup migration -------
+# (all gitignored inside GRIP_HOME; these carry the operator's live CC state)
+LAYER0=(settings.local.json .credentials.json .claude.json projects todos statsig shell-snapshots ide)
+
+have(){ command -v "$1" >/dev/null 2>&1; }
+say(){ printf '%s\n' "$*"; }
+err(){ printf '%s\n' "$*" >&2; }
+
+usage(){
+  sed -n '3,26p' "$0" 2>/dev/null | sed 's/^#  \{0,1\}//; s/^#//'
+}
+
+# canonicalise a directory (resolve all symlinks); empty if it does not exist
+_canon(){ ( cd "$1" 2>/dev/null && pwd -P ); }
+
+# detect platform → posix | windows  (override with GRIP_HARNESS_LINK_OS)
+_detect_os(){
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*|Windows_NT) echo windows ;;
+    *)                               echo posix ;;
+  esac
+}
+
+# /c/Users/<Your Name>  ->  C:\Users\<Your Name>   (MSYS/Cygwin -> Windows)
+_win_path(){
+  if have cygpath; then cygpath -w "$1"; return; fi
+  local p="$1"
+  case "$p" in
+    /cygdrive/?/*) p="/${p#/cygdrive/}" ;;   # /cygdrive/c/... -> /c/...
+  esac
+  case "$p" in
+    /?/*|/?)
+      local drive rest
+      drive="$(printf '%s' "${p:1:1}" | tr '[:lower:]' '[:upper:]')"
+      rest="$(printf '%s' "${p:2}" | tr '/' '\\')"
+      printf '%s:%s' "$drive" "$rest"
+      ;;
+    *) printf '%s' "$p" | tr '/' '\\' ;;
+  esac
+}
+
+# is CLAUDE_DIR already the link/junction we want?
+_already_linked(){
+  local want cur
+  want="$(_canon "$GRIP_HOME")"
+  [ -n "$want" ] || return 1
+  if [ -L "$CLAUDE_DIR" ]; then
+    cur="$(_canon "$CLAUDE_DIR")"
+    [ -n "$cur" ] && [ "$cur" = "$want" ]
+  elif [ "$OS" = windows ] && [ -d "$CLAUDE_DIR" ]; then
+    # Windows junctions are not -L in MSYS; compare canonical targets.
+    cur="$(_canon "$CLAUDE_DIR")"
+    [ -n "$cur" ] && [ "$cur" = "$want" ]
+  else
+    return 1
+  fi
+}
+
+_create_link(){
+  if [ "$OS" = windows ]; then
+    local cd_win gh_win
+    cd_win="$(_win_path "$CLAUDE_DIR")"
+    gh_win="$(_win_path "$GRIP_HOME")"
+    if [ -n "$DRY_RUN" ]; then
+      say "would run: cmd //c mklink /J \"$cd_win\" \"$gh_win\""
+      return 0
+    fi
+    cmd //c mklink /J "$cd_win" "$gh_win"
+  else
+    if [ -n "$DRY_RUN" ]; then
+      say "would run: ln -sfn \"$GRIP_HOME\" \"$CLAUDE_DIR\""
+      return 0
+    fi
+    mkdir -p "$(dirname "$CLAUDE_DIR")"
+    ln -sfn "$GRIP_HOME" "$CLAUDE_DIR"
+  fi
+}
+
+_refuse(){
+  err "REFUSED: $CLAUDE_DIR is a real directory, not a link."
+  err "Refusing to touch it so nothing is lost."
+  err ""
+  err "To migrate it into GRIP and create the link, re-run with --force-backup:"
+  err "    bash \"$SELF\" --grip-home \"$GRIP_HOME\" --claude-dir \"$CLAUDE_DIR\" --force-backup"
+  err ""
+  err "That moves your Claude Code harness files (settings.local.json, .credentials.json,"
+  err ".claude.json, projects, todos, statsig, shell-snapshots, ide) into $GRIP_HOME,"
+  err "backs up the rest to ${CLAUDE_DIR}.bak-<timestamp>, then links $CLAUDE_DIR -> $GRIP_HOME."
+  exit 3
+}
+
+_migrate(){
+  local ts bak e
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  bak="${CLAUDE_DIR}.bak-${ts}"
+  if [ -n "$DRY_RUN" ]; then
+    say "would move Layer-0 harness files from $CLAUDE_DIR into $GRIP_HOME"
+    say "would move the remainder of $CLAUDE_DIR to $bak"
+    say "would link $CLAUDE_DIR -> $GRIP_HOME"
+    return 0
+  fi
+  mkdir -p "$GRIP_HOME"
+  for e in "${LAYER0[@]}"; do
+    if [ -e "$CLAUDE_DIR/$e" ] || [ -L "$CLAUDE_DIR/$e" ]; then
+      if [ -e "$GRIP_HOME/$e" ] || [ -L "$GRIP_HOME/$e" ]; then
+        say "  keep GRIP's own $e (skip)"
+      else
+        mv "$CLAUDE_DIR/$e" "$GRIP_HOME/$e" && say "  moved $e -> GRIP_HOME"
+      fi
+    fi
+  done
+  mv "$CLAUDE_DIR" "$bak" && say "backed up remainder -> $bak"
+  _create_link && say "linked $CLAUDE_DIR -> $GRIP_HOME"
+}
+
+_agy_link(){
+  local agy_dir="$HOME/.gemini/antigravity-cli"
+  if [ -d "$agy_dir" ]; then
+    local target="$agy_dir/builtin/skills/grip"
+    if [ -L "$target" ]; then
+      return 0
+    fi
+    if [ -n "$DRY_RUN" ]; then
+      say "would link $GRIP_HOME/skills -> $target"
+    else
+      mkdir -p "$(dirname "$target")"
+      ln -sfn "$GRIP_HOME/skills" "$target"
+      say "ok: linked $GRIP_HOME/skills -> $target for agy"
+    fi
+  fi
+}
+
+# --------------------------------- main -------------------------------------
+GRIP_HOME_ARG=""; CLAUDE_DIR_ARG=""; FORCE_BACKUP=""; DRY_RUN=""
+SELF="$0"; case "$SELF" in /*) : ;; *) SELF="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")" ;; esac
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --grip-home)    GRIP_HOME_ARG="${2:?--grip-home needs a value}"; shift 2 ;;
+    --grip-home=*)  GRIP_HOME_ARG="${1#*=}"; shift ;;
+    --claude-dir)   CLAUDE_DIR_ARG="${2:?--claude-dir needs a value}"; shift 2 ;;
+    --claude-dir=*) CLAUDE_DIR_ARG="${1#*=}"; shift ;;
+    --force-backup) FORCE_BACKUP=1; shift ;;
+    --dry-run)      DRY_RUN=1; shift ;;
+    -h|--help)      usage; exit 0 ;;
+    *)              err "unknown argument: $1"; usage >&2; exit 2 ;;
+  esac
+done
+
+GRIP_HOME="${GRIP_HOME_ARG:-${GRIP_HOME:-$HOME/.grip}}"
+CLAUDE_DIR="${CLAUDE_DIR_ARG:-${CLAUDE_DIR:-$HOME/.claude}}"
+OS="${GRIP_HARNESS_LINK_OS:-$(_detect_os)}"
+
+# Guard: CLAUDE_DIR and GRIP_HOME are literally the same path — refuse (nonsense).
+#
+# Restored 2026-08-01 (#4264). 34e8e680 (the agy feature) turned this refusal
+# into `say "ok: ... nothing to link"; _agy_link; exit 0` so that the agy link
+# would still run here. That was not needed: _agy_link is invoked on every other
+# exit path (already-linked, force-backup, fresh link), so a correct invocation
+# always reaches it. The cost was real — asking to link a directory onto itself
+# is a malformed request, and reporting success taught the caller it had worked.
+#
+# Note this compares the ARGUMENTS as given. A genuine symlinked setup
+# (--claude-dir ~/.claude --grip-home ~/.grip) has two different strings and is
+# handled by _already_linked below; only literally passing the same path twice
+# lands here.
+if [ "$CLAUDE_DIR" = "$GRIP_HOME" ]; then
+  err "error: --claude-dir and --grip-home are the same path ($CLAUDE_DIR) — cannot link a directory to itself"
+  exit 2
+fi
+
+# 1. Already the link we want → idempotent no-op.
+if _already_linked; then
+  say "ok: $CLAUDE_DIR already resolves to $GRIP_HOME — nothing to do"
+  _agy_link
+  exit 0
+fi
+
+# 2. A REAL directory/file that is not a link → clobber guard.
+if { [ -e "$CLAUDE_DIR" ] && [ ! -L "$CLAUDE_DIR" ]; }; then
+  if [ -n "$FORCE_BACKUP" ]; then
+    say "migrating real $CLAUDE_DIR into $GRIP_HOME (--force-backup)"
+    _migrate
+    say "ok: $CLAUDE_DIR now links to $GRIP_HOME"
+    _agy_link
+    exit 0
+  fi
+  _refuse
+fi
+
+# 3. Nothing there, or a stale/broken symlink → (re)create the link.
+if _create_link; then
+  if [ -n "$DRY_RUN" ]; then
+    say "dry-run: no changes made"
+  else
+    say "ok: linked $CLAUDE_DIR -> $GRIP_HOME"
+  fi
+  _agy_link
+  exit 0
+fi
+err "error: failed to link $CLAUDE_DIR -> $GRIP_HOME"
+exit 1

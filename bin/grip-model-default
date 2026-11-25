@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# grip-model-default -- the one way to change the default Claude Code model for the
+# sessions GRIP launches on this machine. Writes the machine-local pin
+# (config/model-pin.local.json), then cleans the live settings.json (any saved
+# `model` key and any env.ANTHROPIC_MODEL entry removed). bin/grip injects the pin
+# at launch; hooks/model-pin-guard.py keeps the settings file clean afterwards.
+# Sessions GRIP does not launch (a plain `claude`, the Desktop app, headless
+# `claude -p`) take the account default. The /model picker's Enter cannot change this.
+#
+#   grip-model-default fable-5-1        # an alias from lib/grip_model.py
+#   grip-model-default claude-opus-5-5  # a Claude Code model id, or a vendor alias (opus, sonnet, ...)
+#   grip-model-default default          # the account default, enforced: the guard still removes saved picks
+#   grip-model-default off              # unmanaged: no pin file, the guard does nothing
+#   grip-model-default show
+#
+# Library: lib/model_pin.py. Runs under the GRIP venv (rules/never-system-python-for-grip.md).
+set -euo pipefail
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+lib="$CLAUDE_DIR/lib/model_pin.py"
+[[ -f "$lib" ]] || { echo "grip-model-default: $lib not found" >&2; exit 1; }
+case "${1:-}" in
+    ""|-h|--help) exec bash "$CLAUDE_DIR/lib/grip-python.sh" "$lib" --help ;;
+    show|off|reconcile) exec bash "$CLAUDE_DIR/lib/grip-python.sh" "$lib" "$@" ;;
+    *) exec bash "$CLAUDE_DIR/lib/grip-python.sh" "$lib" set "$1" ;;
+esac

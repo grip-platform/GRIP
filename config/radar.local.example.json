@@ -1,0 +1,19 @@
+{
+  "_comment": "Copy to config/radar.local.json (gitignored) and fill in this machine's values. A list here replaces the committed list in config/radar.json; an object merges into it. Secrets never go here: the Vercel token is the keychain item grip-vercel (or VERCEL_TOKEN), Reddit is grip-reddit as client_id:secret, Bluesky is grip-bluesky as handle:app-password.",
+  "vercel": {
+    "projects": [
+      {"name": "grasp-web", "projectId": "prj_xxxxxxxxxxxxxxxxxxxxxxxx", "teamId": "team_xxxxxxxxxxxxxxxxxxxxxxxx"},
+      {"name": "happi.md", "projectId": "prj_yyyyyyyyyyyyyyyyyyyyyyyy"}
+    ]
+  },
+  "search_console": {
+    "properties": ["sc-domain:codetonight.co.za", "https://happi.md/"]
+  },
+  "ietf": {
+    "extra_terms": ["a-surname"]
+  },
+  "mentions": {
+    "alerts_rss": ["https://www.google.com/alerts/feeds/00000000000000000000/11111111111111111111"],
+    "extra_terms": ["\"A Person's Name\"", "draft-a-surname"]
+  }
+}

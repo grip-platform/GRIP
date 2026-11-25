@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Thin wrapper — all logic in lib/output_tier.py.
+# Mirrors the grip-channels-wizard / grip-output-tier convention.
+exec python3 "$HOME/.claude/lib/output_tier.py" "$@"

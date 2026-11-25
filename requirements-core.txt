@@ -1,0 +1,44 @@
+# GRIP core Python dependencies: what a fresh install needs (GRIP#9399).
+#
+# Install with:
+#   <venv-python> -m pip install --prefer-binary -r requirements-core.txt
+# Check with:
+#   <venv-python> lib/core_requirements.py check-imports
+#
+# The public build ships this file and not requirements.txt. requirements.txt is
+# the full list for a checkout that wants every optional feature; it holds each
+# line below, spelled the same way (tests/test_core_requirements.py checks it).
+#
+# A package belongs here only when a file the public build ships imports it at
+# module level, outside any try block, so that file fails to import without it.
+# The same test enforces that, so a package nothing needs cannot creep in.
+#
+# --prefer-binary matters. cryptography 50.0.2 publishes macOS wheels for arm64
+# only, so on an Intel Mac a plain `pip install` picks it and tries a Rust build;
+# with --prefer-binary pip takes 48.0.1, whose universal2 wheel installs.
+# Measured 2026-11-24 with `uv pip compile --only-binary :all:` (uv 0.13.6, which
+# evaluates dependency markers for the target): the whole list, dependencies
+# included, resolves to wheels only on Windows x64, macOS arm64 and x86_64, and
+# manylinux_2_28 x86_64 and aarch64, for CPython 3.11 to 3.15, 25 targets in all.
+
+# KONO semantic memory, e.g. lib/embeddings.py.
+apsw>=3.49
+sqlite-vec>=0.1.1
+
+# Configuration and mode files, e.g. lib/mesh_discovery.py.
+pyyaml>=6.0
+
+# Both halves of the dual record seal, Ed25519 and ML-DSA-65. Below 48 a pip wheel
+# cannot make the ML-DSA half, and records fall back to a forgeable demo seal
+# (rules/never-system-python-for-grip.md). Module level in lib/strat_ops_witness.py.
+cryptography>=48
+
+# lib/session_monitor_rich.py
+rich>=13.0
+
+# lib/aide/slack_oracle.py
+websockets>=12.0
+
+# Imported as Crypto. bin/ff-ops ships and loads lib/ff_ops.py, which needs it at
+# module level (Codex on GRIP#9435). Wheels on all five targets, CPython 3.11-3.15.
+pycryptodome>=3.20.0

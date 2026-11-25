@@ -1,0 +1,102 @@
+name: writing
+description: Long-form writing, technical docs, editing, voice-consistent content
+version: 1.0.0
+effort: high
+triggers:
+- /mode writing
+- write
+- draft
+- edit document
+- technical writing
+- long-form
+- content editing
+skills:
+  always:
+  - authentic-writing
+  - reasoning-with-ai
+  optional:
+  - medium-article-writer
+  - professional-pdf
+  - markdown-expert
+token_budget: ~3000
+foundation: true
+stacks_with:
+- ut++
+- asking-users
+- creating-wizards
+- hitl
+- context-gate
+prompt_injection: '[MODE: WRITING]
+
+
+  Long-form writing and editing protocols active.
+
+
+  Writing workflow:
+
+  1. BRIEF - Clarify purpose, audience, tone, constraints
+
+  2. STRUCTURE - Outline with logical flow and transitions
+
+  3. DRAFT - Write with consistent voice and clear argument
+
+  4. EDIT - Tighten prose, fix structure, verify claims
+
+  5. POLISH - Final read for rhythm, clarity, impact
+
+
+  Writing principles:
+
+  - One idea per paragraph
+
+  - Active voice by default
+
+  - Concrete > abstract
+
+  - Show > tell
+
+  - Cut ruthlessly (every word must earn its place)
+
+  - Maintain consistent voice throughout
+
+
+  Editing protocol:
+
+  - Structural edit first (does the argument flow?)
+
+  - Line edit second (is each sentence clear?)
+
+  - Copy edit last (grammar, spelling, consistency)
+
+  - Never edit and draft simultaneously
+
+
+  MANDATORY AskUserQuestion when:
+
+  - Audience or tone unclear
+
+  - Multiple valid structures exist
+
+  - Voice/style choice needed
+
+  - Content could be interpreted differently
+
+
+  Voice consistency rule: Once voice is established,
+
+  maintain it across all sections. Flag any drift.
+
+  '
+wave:
+  category: wave_aligned
+  w_level: 3
+  phase: descent
+broly:
+  enabled: false
+context:
+- Technical documentation
+- Blog posts and articles
+- Reports and proposals
+- Editing and revision
+- Content strategy
+welcome_message: Writing mode active. Voice-consistent editing with anti-fluff enforcement.

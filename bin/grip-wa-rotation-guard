@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""grip-wa-rotation-guard — rescue rotated WhatsApp mirror files before they are destroyed.
+
+WHY THIS EXISTS
+    ``mcp-servers/grip-channel/src/history-store.ts::rotateIfNeeded`` renames a
+    thread file that has reached its size cap into a retention ring. Once the
+    ring is full the oldest slot falls out, and ``rename(2)`` over an existing
+    destination *replaces* it, so that history is gone.
+
+    UPDATED for GRIP#6025. This docstring previously said the drop happened with
+    "no error, no log line, no ``.2``". Two of those three are no longer true:
+    the daemon now ANNOUNCES every drop with its byte count, and
+    ``GRIP_WA_HISTORY_KEEP`` raises the ring depth so ``.2`` and deeper exist.
+    The drop itself is still real and still irreversible once the ring is full
+    at whatever depth is configured.
+
+    This remains a guard, not the fix, and it is still worth running for three
+    reasons that survive GRIP#6025: it protects machines whose daemon predates
+    that change or was never restarted; it copies rescued generations OUTSIDE
+    the ring, where no later lowering of the depth can strand or overwrite them;
+    and it needs nothing configured to work.
+
+    Note the ring depth is deliberately NOT read here. This tool rescues whatever
+    generations exist on disk, which is the correct behaviour when the daemon's
+    environment and this process's environment may differ.
+
+WHAT IT DOES
+    Copies every rotated mirror file (``<name>.<n>.jsonl``) into a vault outside
+    the repository, named by content::
+
+        <vault>/<name>.<n>.<sha256[:16]>.jsonl
+
+    Content-addressing makes it three things at once:
+
+      * **idempotent** — re-running is free; an already-held byte sequence is
+        recognised and skipped;
+      * **non-destructive** — a DIFFERENT rotation has a different digest, so it
+        lands as a NEW file rather than overwriting the last rescue. That is
+        precisely the failure this exists to undo;
+      * **self-describing** — the name is the hash of the bytes, so a rescued
+        file proves its own integrity without a side table.
+
+    It COPIES (``copy2``, timestamps preserved); the mirror keeps its own file.
+    It reads bytes and hashes them — it never parses, prints or stores message
+    text, only the count of files it rescued.
+
+WHAT IT DOES NOT DO
+    It does not fix the daemon, recover a rotation that has ALREADY been
+    overwritten (those bytes are gone), or prove a rescued message is genuine.
+    It preserves bytes that were about to be lost, and that is all it claims.
+
+    bin/grip-wa-rotation-guard [--mirror DIR] [--vault DIR] [--dry-run] [--quiet]
+
+Environment: ``GRIP_WA_MIRROR`` (mirror), ``GRIP_WA_MATTER`` (vault defaults to
+``<matter>/rotated``). A single unreadable file is reported and skipped, never
+allowed to stop the sweep for every other thread.
+
+Exit codes: 0 swept clean · 1 files could not be rescued · 2 bad input.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import re
+import shutil
+import sys
+import time
+from pathlib import Path
+
+#: A rotated sibling: ``<thread>.<n>.jsonl`` where n is one or more digits.
+#: Matched by regex rather than the literal ``*.1.jsonl`` so a future daemon
+#: that writes ``.2``/``.3`` is covered without a change here.
+_ROTATED = re.compile(r"\.\d+\.jsonl$")
+
+
+def default_mirror() -> Path:
+    return Path(os.environ.get("GRIP_WA_MIRROR")
+                or Path.home() / ".claude" / "state" / "whatsapp-history")
+
+
+def default_vault() -> Path:
+    matter = os.environ.get("GRIP_WA_MATTER")
+    base = Path(matter) if matter else Path.home() / "wa-forensics"
+    return base / "rotated"
+
+
+def rescue(mirror: Path, vault: Path, *, dry_run: bool = False):
+    """Copy each rotated file in *mirror* into *vault*, content-addressed.
+
+    Returns ``(rescued, already_held, errors)``. Never raises on a single bad
+    file — one unreadable file must not stop the sweep for every other thread.
+    """
+    rescued = already = 0
+    errors: list[str] = []
+
+    if not dry_run:
+        vault.mkdir(parents=True, exist_ok=True)
+
+    for src in sorted(mirror.glob("*.jsonl")):
+        if not _ROTATED.search(src.name):
+            continue                       # the live file is not ours to touch
+        try:
+            digest = hashlib.sha256(src.read_bytes()).hexdigest()[:16]
+        except OSError as exc:
+            errors.append(f"{src.name}: {exc}")
+            continue
+        stem = src.name[: -len(".jsonl")]  # "thread.1"
+        dest = vault / f"{stem}.{digest}.jsonl"
+        if dest.exists():
+            already += 1
+            continue
+        if dry_run:
+            rescued += 1
+            continue
+        try:
+            shutil.copy2(src, dest)        # copy, never move
+        except OSError as exc:
+            errors.append(f"{src.name} -> {dest.name}: {exc}")
+            continue
+        rescued += 1
+
+    return rescued, already, errors
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--mirror", default=None,
+                    help="mirror directory (default: $GRIP_WA_MIRROR or the live store)")
+    ap.add_argument("--vault", default=None,
+                    help="rescue vault (default: $GRIP_WA_MATTER/rotated or ~/wa-forensics/rotated)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="report what would be rescued; write nothing")
+    ap.add_argument("--quiet", action="store_true",
+                    help="print nothing on a clean sweep")
+    a = ap.parse_args(argv)
+
+    mirror = Path(a.mirror) if a.mirror else default_mirror()
+    vault = Path(a.vault) if a.vault else default_vault()
+
+    if not mirror.is_dir():
+        print(f"mirror not found: {mirror}", file=sys.stderr)
+        return 2
+
+    rescued, already, errors = rescue(mirror, vault, dry_run=a.dry_run)
+
+    for err in errors:
+        print(f"  ! {err}", file=sys.stderr)
+
+    if not a.quiet and (rescued or already or errors):
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        note = " (dry-run)" if a.dry_run else ""
+        extra = f", {len(errors)} error(s)" if errors else ""
+        print(f"{stamp} rescued {rescued}, already held {already}{note}{extra} "
+              f"vault={vault}")
+
+    if errors:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

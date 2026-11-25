@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""grip-moat — a four-pane viewer for GRIP's cryptographic-causation moat.
+
+One screen joins WHAT WAS DECIDED (the signed IDR envelope + its content
+address), WHAT WAS BELIEVED at that moment (the belief nodes citing it), WHAT IT
+CITED (cite.verify tallies), and ITS DER ANCHOR (a 4-leg offline receipt).
+
+The delight: press 't' and TRY TO FORGE IT. Every red is produced by the same
+shipped verifier that produced the green a moment earlier. Nothing is simulated
+and nothing is ever written — tamper mutates in memory only.
+
+Usage:
+  grip-moat                    # interactive, colour if TTY
+  grip-moat --no-colour        # plain text (pipes, logs)
+  grip-moat --colour           # force colour (e.g. | less -R)
+  grip-moat --demo             # scripted walkthrough, no tty needed (CI)
+  grip-moat --json             # machine-readable verdict dump
+  grip-moat --no-tty           # render one frame and exit
+  grip-moat --claude-dir PATH  # data root (default $CLAUDE_DIR, else ~/.claude)
+  grip-moat --back N           # belief scope: Nth-from-last snapshot
+  grip-moat --limit N          # max belief nodes in the verify scope
+  grip-moat --help
+
+Keys: j/k or arrows move · enter open · / filter · t tamper · p proof
+      1-9 apply a tamper vector · r reset to pristine · esc back · ? help · q quit
+
+Written in Python rather than the usual thin-bash house shim (bin/grip-ascent)
+for one reason: it must be runnable BOTH as ``./bin/grip-moat`` and as
+``python3 bin/grip-moat`` — a bash file dies with a SyntaxError under the
+latter, and a launcher that breaks on its own documented invocation is a defect,
+not a style choice. The responsibilities are identical to the bash version: pin
+the paths, pick an interpreter, delegate. No logic lives here.
+"""
+from __future__ import annotations
+
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+#: Set on re-exec so a venv that ALSO lacks cryptography cannot loop forever.
+_SENTINEL = "GRIP_MOAT_REEXEC"
+
+# DATA root (which ledgers to read) and CODE root (which checkout to run) are
+# resolved SEPARATELY and deliberately. CLAUDE_DIR pins the data; the code comes
+# from this script's own location, so a shim inside a worktree runs THAT
+# worktree's modules against the live ledgers instead of silently executing the
+# installed copy — the difference between testing your change and testing main.
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR") or (Path.home() / ".claude"))
+os.environ["CLAUDE_DIR"] = str(CLAUDE_DIR)
+CODE_ROOT = Path(__file__).resolve().parent.parent
+
+# Both entries are MANDATORY: the moat libraries use `from lib.x import y`
+# (repo root) AND bare `from x import y` (lib/ — e.g. lib/context_head.py does
+# `from task_namespace import ...`), so either alone breaks the import graph.
+_PATHS = [str(CODE_ROOT), str(CODE_ROOT / "lib")]
+
+
+def _venv_pythons() -> list[Path]:
+    """Interpreters that may carry `cryptography`, nearest checkout first."""
+    return [
+        root / "venv" / "bin" / name
+        for root in (CODE_ROOT, CLAUDE_DIR)
+        for name in ("python3", "python")
+    ]
+
+
+def _has_crypto(python: Path) -> bool:
+    """Ask the candidate interpreter itself whether it can do Ed25519.
+
+    A PROBE, not a guess. Two guesses were tried and both are wrong:
+    ``Path.resolve()`` on a venv python follows the symlink back to the base
+    interpreter, so a perfectly good venv compares EQUAL to the current one and
+    is skipped (the bug this replaced — the re-exec silently never fired, and
+    the DER leg stayed disabled while reporting itself honestly); and merely
+    existing on disk does not mean a venv carries `cryptography`. Running the
+    import is the only answer that cannot be wrong.
+    """
+    import subprocess
+
+    try:
+        return subprocess.run(
+            [str(python), "-c", "import cryptography"],
+            capture_output=True, timeout=15, check=False,
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _reexec_into_venv() -> None:
+    """Re-exec under a venv interpreter when this one lacks `cryptography`.
+
+    Without it the DER authenticity leg reports "cannot verify" on every run.
+    That is HONEST — it is never rendered as a failed signature — but it would
+    silently disable the centrepiece of the tool, so the launcher goes looking
+    for an interpreter that can actually check a signature before giving up.
+    """
+    if os.environ.get(_SENTINEL) or importlib.util.find_spec("cryptography"):
+        return
+    os.environ[_SENTINEL] = "1"  # set BEFORE any exec: bounds the loop at one
+    for candidate in _venv_pythons():
+        if not (candidate.is_file() and os.access(candidate, os.X_OK)):
+            continue
+        if str(candidate) == sys.executable or not _has_crypto(candidate):
+            continue
+        os.environ["PYTHONPATH"] = os.pathsep.join(
+            _PATHS + [os.environ.get("PYTHONPATH", "")]
+        ).rstrip(os.pathsep)
+        os.execv(str(candidate), [str(candidate), str(Path(__file__).resolve()), *sys.argv[1:]])
+    # No capable interpreter: continue on this one. The DER leg reports
+    # "cannot verify — crypto unavailable" in grey, never a false red.
+
+
+def main() -> int:
+    for entry in reversed(_PATHS):
+        if entry not in sys.path:
+            sys.path.insert(0, entry)
+    _reexec_into_venv()
+    from lib.moat_tui.app import main as app_main
+
+    return app_main(sys.argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

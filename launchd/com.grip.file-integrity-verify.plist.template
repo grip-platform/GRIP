@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    GRIP File Integrity Verifier — daily launchd schedule.
+
+    Install:
+      sed "s|__CLAUDE_DIR__|$HOME/.claude|g" \
+        $HOME/.claude/launchd/com.grip.file-integrity-verify.plist.template \
+        > $HOME/Library/LaunchAgents/com.grip.file-integrity-verify.plist
+      launchctl bootstrap gui/$UID $HOME/Library/LaunchAgents/com.grip.file-integrity-verify.plist
+
+    Behavior:
+      - Runs daily at 03:30 local time.
+      - Exit code 0 = all registered files intact.
+      - Exit code 1 = at least one mismatch; stderr logged to
+        $HOME/.claude/logs/file-integrity-verify.err.log for follow-up.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.grip.file-integrity-verify</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__CLAUDE_DIR__/bin/file-integrity</string>
+        <string>verify</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__CLAUDE_DIR__/logs/file-integrity-verify.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__CLAUDE_DIR__/logs/file-integrity-verify.err.log</string>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

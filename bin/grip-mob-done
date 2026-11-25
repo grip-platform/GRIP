@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""grip-mob-done -- guarded wrapper over `mob done`.
+
+Refuses if mob is not on PATH, or if the current branch is main/master.
+Otherwise execs the real `mob done <args>`, which collapses the WIP branch
+back onto the base branch and leaves the changes staged but uncommitted.
+
+Usage: bin/grip-mob-done [mob done args]
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+from mob_guards import preflight_done, run_guarded  # noqa: E402
+
+if __name__ == "__main__":
+    cwd = Path.cwd()
+    sys.exit(run_guarded("done", preflight_done(cwd), ["done", *sys.argv[1:]]))

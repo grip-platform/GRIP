@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.grip.weekly-rule20-triage</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.claude/venv/bin/python3</string>
+        <string>__HOME__/.claude/lib/weekly_rule20_triage.py</string>
+    </array>
+
+    <!-- Monday 09:00 SAST (TZ set via EnvironmentVariables below) -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>1</integer>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>CLAUDE_DIR</key>
+        <string>__HOME__/.claude</string>
+        <key>PYTHONPATH</key>
+        <string>__HOME__/.claude</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>TZ</key>
+        <string>Africa/Johannesburg</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.claude</string>
+
+    <key>WakeFromSleep</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.claude/logs/weekly-rule20-triage.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.claude/logs/weekly-rule20-triage.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>Nice</key>
+    <integer>10</integer>
+
+    <key>TimeOut</key>
+    <integer>1800</integer>
+</dict>
+</plist>

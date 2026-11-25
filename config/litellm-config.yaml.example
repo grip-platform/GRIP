@@ -1,0 +1,351 @@
+# HAL → LiteLLM multi-provider config
+# Maps Claude model IDs to all HAL provider backends. Multiple entries per
+# model_name enable automatic failover (latency-based-routing picks fastest).
+#
+# Keychain services: grip-groq, grip-gemini, grip-dashscope, grip-deepseek,
+#   grip-moonshot, grip-zhipu, grip-mistral, grip-openrouter, grip-openai,
+#   grip-soruxgpt
+#
+# Launched via: grip-hal (all providers) or grip-gemini (Gemini-only subset).
+# grip-hal exports missing keys as unset; LiteLLM silently skips those entries.
+#
+# Vulavula (translate/transcribe/sentiment) has no chat-completions API —
+# it cannot be proxied here and is used only via lib/hal/registry directly.
+
+model_list:
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # CLAUDE MODEL ID MAPPINGS — drop-in replacement for all three Claude tiers
+  # ══════════════════════════════════════════════════════════════════════════
+
+  # ── Opus tier: best reasoning quality
+  - model_name: claude-opus-4-7
+    litellm_params:
+      model: gemini/gemini-3.1-pro-preview-customtools
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: claude-opus-4-7
+    litellm_params:
+      model: gemini/gemini-3.1-pro-preview
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: claude-opus-4-7
+    litellm_params:
+      model: deepseek/deepseek-reasoner
+      api_key: os.environ/DEEPSEEK_API_KEY
+      max_tokens: 8192
+  - model_name: claude-opus-4-7
+    litellm_params:
+      model: groq/qwen3-32b
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: claude-opus-4-7
+    litellm_params:
+      model: openai/o3-mini
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: claude-opus-4-7
+    litellm_params:
+      model: openrouter/deepseek/deepseek-r1
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: claude-opus-4-7
+    litellm_params:
+      model: openai/kimi-k3
+      api_key: os.environ/MOONSHOT_API_KEY
+      api_base: https://api.moonshot.ai/v1
+  - model_name: claude-opus-4-7
+    litellm_params:
+      model: ollama/gemma4:26b
+      api_base: http://localhost:11434
+      max_tokens: 8192
+
+  # ── Sonnet tier: balanced speed/quality
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: groq/openai/gpt-oss-120b
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+      max_tokens: 8192
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: openrouter/google/gemma-4-31b-it
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: openai/glm-5.1
+      api_key: os.environ/ZHIPU_API_KEY
+      api_base: https://api.z.ai/api/coding/paas/v4
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: mistral/mistral-small-latest
+      api_key: os.environ/MISTRAL_API_KEY
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: openai/qwen3.5-plus
+      api_key: os.environ/DASHSCOPE_API_KEY
+      api_base: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: ollama/gemma4:26b
+      api_base: http://localhost:11434
+      max_tokens: 8192
+
+  # ── Haiku tier: fast and cheap
+  - model_name: claude-haiku-4-5-20251001
+    litellm_params:
+      model: groq/llama-4-scout-17b-16e-instruct
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: claude-haiku-4-5-20251001
+    litellm_params:
+      model: openai/qwen3.5-flash
+      api_key: os.environ/DASHSCOPE_API_KEY
+      api_base: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+  - model_name: claude-haiku-4-5-20251001
+    litellm_params:
+      model: openrouter/google/gemma-4-26b-a4b-it
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: claude-haiku-4-5-20251001
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: claude-haiku-4-5-20251001
+    litellm_params:
+      model: openai/gemini-2.0-flash-exp
+      api_key: os.environ/SORUXGPT_API_KEY
+      api_base: https://service.soruxgpt.com/api/api
+  - model_name: claude-haiku-4-5-20251001
+    litellm_params:
+      model: ollama/gemma4:26b
+      api_base: http://localhost:11434
+      max_tokens: 8192
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # DIRECT PROVIDER MODELS — use as model_name for explicit provider targeting
+  # ══════════════════════════════════════════════════════════════════════════
+
+  # Groq
+  - model_name: groq/openai/gpt-oss-120b
+    litellm_params:
+      model: groq/openai/gpt-oss-120b
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: groq/llama-4-scout-17b-16e-instruct
+    litellm_params:
+      model: groq/llama-4-scout-17b-16e-instruct
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: groq/qwen3-32b
+    litellm_params:
+      model: groq/qwen3-32b
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: groq/deepseek-r1-distill-llama-70b
+    litellm_params:
+      model: groq/deepseek-r1-distill-llama-70b
+      api_key: os.environ/GROQ_API_KEY
+
+  # Gemini
+  - model_name: gemini/gemini-2.5-flash
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: gemini/gemini-3.1-pro-preview
+    litellm_params:
+      model: gemini/gemini-3.1-pro-preview
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: gemini/gemma-4-27b
+    litellm_params:
+      model: gemini/gemma-4-27b
+      api_key: os.environ/GEMINI_API_KEY
+
+  # DeepSeek — max output 8192 tokens (API hard limit for all deepseek models)
+  - model_name: deepseek/deepseek-chat
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+      max_tokens: 8192
+  - model_name: deepseek/deepseek-reasoner
+    litellm_params:
+      model: deepseek/deepseek-reasoner
+      api_key: os.environ/DEEPSEEK_API_KEY
+      max_tokens: 8192
+  - model_name: deepseek/deepseek-v3.2
+    litellm_params:
+      model: openai/deepseek-v3.2
+      api_key: os.environ/DEEPSEEK_API_KEY
+      api_base: https://api.deepseek.com/v1
+      max_tokens: 8192
+
+  # Qwen / Alibaba DashScope
+  - model_name: qwen/qwen3.5-flash
+    litellm_params:
+      model: openai/qwen3.5-flash
+      api_key: os.environ/DASHSCOPE_API_KEY
+      api_base: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+  - model_name: qwen/qwen3.5-plus
+    litellm_params:
+      model: openai/qwen3.5-plus
+      api_key: os.environ/DASHSCOPE_API_KEY
+      api_base: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+  - model_name: qwen/qwen3.6-plus-preview
+    litellm_params:
+      model: openai/qwen3.6-plus-preview
+      api_key: os.environ/DASHSCOPE_API_KEY
+      api_base: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+
+  # Moonshot Kimi (moonshot-v1-* retired 2026-08-31)
+  - model_name: moonshot/kimi-k3
+    litellm_params:
+      model: openai/kimi-k3
+      api_key: os.environ/MOONSHOT_API_KEY
+      api_base: https://api.moonshot.ai/v1
+
+  # Zhipu / GLM
+  - model_name: zhipu/glm-5.1
+    litellm_params:
+      model: openai/glm-5.1
+      api_key: os.environ/ZHIPU_API_KEY
+      api_base: https://api.z.ai/api/coding/paas/v4
+  - model_name: zhipu/glm-5-turbo
+    litellm_params:
+      model: openai/glm-5-turbo
+      api_key: os.environ/ZHIPU_API_KEY
+      api_base: https://api.z.ai/api/coding/paas/v4
+  - model_name: zhipu/glm-4.5-air
+    litellm_params:
+      model: openai/glm-4.5-air
+      api_key: os.environ/ZHIPU_API_KEY
+      api_base: https://api.z.ai/api/coding/paas/v4
+
+  # Mistral
+  - model_name: mistral/mistral-small-latest
+    litellm_params:
+      model: mistral/mistral-small-latest
+      api_key: os.environ/MISTRAL_API_KEY
+
+  # OpenRouter
+  - model_name: openrouter/google/gemma-4-31b-it
+    litellm_params:
+      model: openrouter/google/gemma-4-31b-it
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: openrouter/google/gemma-4-26b-a4b-it
+    litellm_params:
+      model: openrouter/google/gemma-4-26b-a4b-it
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: openrouter/meta-llama/llama-4-maverick
+    litellm_params:
+      model: openrouter/meta-llama/llama-4-maverick
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # OpenAI
+  - model_name: openai/gpt-4o
+    litellm_params:
+      model: gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: openai/gpt-4o-mini
+    litellm_params:
+      model: gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: openai/o3-mini
+    litellm_params:
+      model: o3-mini
+      api_key: os.environ/OPENAI_API_KEY
+
+  # Soruxgpt (OpenAI-compat proxy)
+  - model_name: soruxgpt/gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/SORUXGPT_API_KEY
+      api_base: https://service.soruxgpt.com/api/api
+  - model_name: soruxgpt/claude-3-5-sonnet
+    litellm_params:
+      model: openai/claude-3-5-sonnet-20241022
+      api_key: os.environ/SORUXGPT_API_KEY
+      api_base: https://service.soruxgpt.com/api/api
+  - model_name: soruxgpt/deepseek-chat
+    litellm_params:
+      model: openai/deepseek-chat
+      api_key: os.environ/SORUXGPT_API_KEY
+      api_base: https://service.soruxgpt.com/api/api
+  - model_name: soruxgpt/gemini-flash
+    litellm_params:
+      model: openai/gemini-2.0-flash-exp
+      api_key: os.environ/SORUXGPT_API_KEY
+      api_base: https://service.soruxgpt.com/api/api
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # LOCAL PROVIDERS — silently fail if server not running; cloud fallback applies
+  # ══════════════════════════════════════════════════════════════════════════
+
+  # Lemonade (port 7860)
+  - model_name: lemonade/auto
+    litellm_params:
+      model: openai/auto
+      api_key: "none"
+      api_base: http://localhost:7860/v1
+
+  # Ollama (port 11434) — primary: gemma4:26b (MoE, 256K ctx, multimodal)
+  # max_tokens: 8192 — conservative cap; local models vary by loaded weights
+  - model_name: ollama/gemma4:26b
+    litellm_params:
+      model: ollama/gemma4:26b
+      api_base: http://localhost:11434
+      max_tokens: 8192
+  - model_name: ollama/auto
+    litellm_params:
+      model: openai/auto
+      api_key: "none"
+      api_base: http://localhost:11434/v1
+      max_tokens: 8192
+
+  # vLLM (port 8000)
+  - model_name: vllm/auto
+    litellm_params:
+      model: openai/auto
+      api_key: "none"
+      api_base: http://localhost:8000/v1
+
+  # LM Studio (port 1234)
+  - model_name: lmstudio/auto
+    litellm_params:
+      model: openai/auto
+      api_key: "none"
+      api_base: http://localhost:1234/v1
+
+  # MLX-VLM (port 8080) — vision/audio/OCR; 180s timeout for large models
+  - model_name: mlx_vlm/auto
+    litellm_params:
+      model: openai/auto
+      api_key: "none"
+      api_base: http://localhost:8080
+      timeout: 180
+
+router_settings:
+  routing_strategy: latency-based-routing
+  # Tier escalation: if ALL deployments of a tier fail, try the next tier up.
+  fallbacks:
+    - "claude-haiku-4-5-20251001": ["claude-sonnet-4-6"]
+    - "claude-sonnet-4-6": ["claude-opus-4-7"]
+
+litellm_settings:
+  drop_params: true
+
+  # Four attempts (down from 6): multi-provider failover across deployments
+  # reduces retry pressure per individual provider.
+  num_retries: 4
+  request_timeout: 600
+
+  retry_policy:
+    RateLimitErrorRetries: 4
+    TimeoutErrorRetries: 2
+    InternalServerErrorRetries: 2
+    ContentPolicyViolationErrorRetries: 0
+    AuthenticationErrorRetries: 0
+    BadRequestErrorRetries: 0
+
+  allowed_fails: 5
+  cooldown_time: 60

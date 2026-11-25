@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.grip.wa-visibility</string>
+
+    <!-- Installed by `grip-wa-visibility arm`, which replaces __GRIP_DIR__ with
+         the GRIP folder it resolved ($CLAUDE_DIR, else ~/.claude) and __HOME__
+         with the home folder, and refuses while config/wa-visibility.local.json
+         names no contact. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__GRIP_DIR__/bin/grip-wa-visibility</string>
+        <string>check</string>
+        <string>--quiet</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__GRIP_DIR__</string>
+
+    <!-- Hourly. A profile's visibility changes rarely, and each check asks
+         WhatsApp three read-only questions per contact. -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- launchd gives a job a minimal PATH; the check needs security(1) for
+         the bridge token and osascript for the macOS alert. CLAUDE_DIR keeps
+         the job on the installation that armed it. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>CLAUDE_DIR</key>
+        <string>__GRIP_DIR__</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__GRIP_DIR__/logs/wa-visibility.log</string>
+    <key>StandardErrorPath</key>
+    <string>__GRIP_DIR__/logs/wa-visibility.log</string>
+</dict>
+</plist>

@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""grip-vision — image -> text via the recommended HAL vision model.
+
+When the active model is non-vision (deepseek-v4-pro), route image inference
+here instead of asking the operator which model to use. The standing decision
+is recorded in memory/grip-vision-model-routing.md (primary: gemini-3.1-pro-preview,
+fallback: gpt-5.5).
+
+Usage:
+  grip-vision <image> ["prompt"]        # describe the image
+  grip-vision <image> -p "question"     # answer a question about the image
+
+Gateway: GRIP_VISION_GATEWAY defaults to the local HAL gateway
+(http://127.0.0.1:4010). That default is correct in the same environments the
+GRIP_1M_MODEL pin targets — any GRIP-launched session on a machine running the
+HAL gateway (cd ~/.hal && python3 -m lib.hal.gateway --port 4010). Set
+GRIP_VISION_GATEWAY explicitly only to point at a non-default gateway.
+"""
+from __future__ import annotations
+
+import base64
+import json
+import os
+import sys
+import urllib.request
+from pathlib import Path
+
+PRIMARY = "gemini-3.1-pro-preview"
+FALLBACK = "gpt-5.5"
+# HAL gateway, OpenAI-compatible surface (see lib/sovereign_council.py).
+GATEWAY = os.environ.get("GRIP_VISION_GATEWAY", "http://127.0.0.1:4010")
+
+
+def _mime(path: Path) -> str:
+    return {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".gif": "image/gif", ".webp": "image/webp",
+    }.get(path.suffix.lower(), "image/png")
+
+
+def _call(model: str, image: Path, prompt: str) -> str:
+    b64 = base64.b64encode(image.read_bytes()).decode()
+    body = {
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt or "Describe this image."},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:{_mime(image)};base64,{b64}"}},
+            ],
+        }],
+        "max_tokens": 2000,
+    }
+    req = urllib.request.Request(
+        f"{GATEWAY}/v1/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json",
+                 "User-Agent": "grip-vision/1.0"})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        data = json.load(resp)
+    text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+    if not text:
+        raise RuntimeError(f"empty response from {model}")
+    return text
+
+
+def _describe(image: Path, prompt: str) -> tuple[str, str]:
+    """(text, model) — try PRIMARY, then FALLBACK, so the advertised fallback is real."""
+    try:
+        return _call(PRIMARY, image, prompt), PRIMARY
+    except Exception:
+        try:
+            return _call(FALLBACK, image, prompt), FALLBACK
+        except Exception as exc:
+            print(f"grip-vision: {type(exc).__name__}: {exc}", file=sys.stderr)
+            print(f"  (primary {PRIMARY} and fallback {FALLBACK} both failed "
+                  f"via {GATEWAY})", file=sys.stderr)
+            raise
+
+
+def main(argv: list[str]) -> int:
+    if not argv:
+        print(__doc__)
+        return 2
+    image = Path(argv[0])
+    if not image.exists():
+        print(f"grip-vision: no such image {image}", file=sys.stderr)
+        return 2
+    prompt = ""
+    if len(argv) >= 2:
+        if argv[1] in ("-p", "--prompt"):
+            prompt = " ".join(argv[2:])
+        else:
+            prompt = " ".join(argv[1:])
+    try:
+        text, model = _describe(image, prompt)
+    except Exception:
+        return 1
+    print(text)
+    # stderr, not stdout — the description is the only stdout. Gated behind
+    # GRIP_VISION_VERBOSE=1 so normal caller output stays clean; opt in to log
+    # which backend actually ran.
+    if os.environ.get("GRIP_VISION_VERBOSE") == "1":
+        print(f"# (model: {model})", file=sys.stderr)
+    if model == FALLBACK:
+        print(f"# (fell back to {FALLBACK})", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

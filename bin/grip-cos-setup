@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+#
+# grip-cos-setup — one command to get a Mac ready for the Chief-of-Staff iPhone shortcut.
+#
+# It does the two things a fresh machine is missing, then tells you exactly what to
+# do on the phone:
+#   1. installs cloudflared (the public tunnel grip-cos needs) if it isn't there;
+#   2. confirms grip-cos itself is present (i.e. GRIP is up to date enough);
+#   3. prints the 4 steps to finish on the iPhone.
+#
+# Safe + idempotent — run it as many times as you like.
+#
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+PY="$(command -v python3 || command -v python || true)"
+
+if [ -z "$PY" ]; then
+    echo "grip-cos-setup: need python3 on PATH first (install Python 3)." >&2
+    exit 1
+fi
+
+echo "Chief of Staff — setup"
+echo
+
+echo "1/3  cloudflared (the public tunnel grip-cos opens)..."
+if "$PY" "$CLAUDE_DIR/lib/ensure_cloudflared.py"; then
+    :
+else
+    echo
+    echo "    ^ couldn't get cloudflared automatically. Run the command above, then re-run this." >&2
+    exit 1
+fi
+echo
+
+echo "2/3  grip-cos itself..."
+if [ ! -x "$CLAUDE_DIR/bin/grip-cos" ]; then
+    echo "    grip-cos is missing — your GRIP needs updating before this will work." >&2
+    echo "    Ask the team to run a safe GRIP update on this machine, then re-run." >&2
+    exit 1
+fi
+echo "     grip-cos ready ($CLAUDE_DIR/bin/grip-cos)"
+echo
+
+echo "3/3  Finish on your iPhone:"
+cat <<'STEPS'
+     a) On this Mac, run:   grip-cos up
+        It prints a web address and an access token (and keeps running — leave it open).
+     b) Open the Chief-of-Staff shortcut we sent you (tap the file on your iPhone to import it).
+     c) In the shortcut, replace the two placeholders:
+           PASTE-YOUR-URL-HERE    -> the web address from step (a)
+           PASTE-YOUR-TOKEN-HERE  -> the access token from step (a)
+     d) Say "Hey Siri, Chief of Staff" and talk.
+STEPS
+echo
+echo "You're set."

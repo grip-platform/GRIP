@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# grip-happiverse — single door to the HAPPIVERSE (GRIP entrypoints).
+#
+# Routes to already-shipped entrypoints only. Never fakes liveness.
+# Each target is probed; NOT-LIVE is reported honestly with the reason.
+#
+# Usage:
+#   grip-happiverse              print the door map (all targets + live/not-live)
+#   grip-happiverse status       exec grip-happiverse-status (HAL bin) if live
+#   grip-happiverse ask "<q>"    route prompt to HAL inference :4010 if up
+#                                env: GRIP_HAPPIVERSE_MODEL (default: claude-sonnet-4-6)
+#   grip-happiverse council "<q>" exec bin/grip-council
+#   grip-happiverse harness ...  exec bin/grip-harness
+#   grip-happiverse verify       exec grip-verify-spine (HAL bin) if live
+#                                fallback: bin/ff-ops (caller args pass through unchanged)
+#   grip-happiverse cutover      prerequisite-checked witness-cutover decision
+#     [--apply]                  if all checks pass: print export line; with --apply
+#                                also append it idempotently to ~/.zshrc
+#   <unknown>                    print map and exit 1
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+HAL_HOME="${HAL_HOME:-$HOME/.hal}"
+GRIP_BIN="$CLAUDE_DIR/bin"
+HAL_BIN="$HAL_HOME/bin"
+HAL_GW="${HAL_GW:-http://127.0.0.1:4010}"
+
+# ── probe helpers ────────────────────────────────────────────────────────────
+
+_bin_grip()  { echo "$GRIP_BIN/$1"; }
+_bin_hal()   { echo "$HAL_BIN/$1"; }
+
+_live_bin() {
+    local p="$1"
+    [[ -x "$p" ]] && return 0 || return 1
+}
+
+_probe_hal_gw() {
+    # Probe /v1/models — 401 or 200 = gateway up; 000/timeout = down.
+    # /health does NOT exist on the HAL gateway; using it produces false-negatives.
+    local _s
+    _s="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$HAL_GW/v1/models" 2>/dev/null)"
+    [[ "$_s" == "200" || "$_s" == "401" ]] && return 0 || return 1
+}
+
+# _witness_row_count: number of gateway.chat.witness rows in the audit log.
+_witness_row_count() {
+    local log="${HAL_HOME:-$HOME/.hal}/logs/gateway-audit.jsonl"
+    [[ -f "$log" ]] || { echo 0; return; }
+    # grep | wc -l: always exits 0; emits 0 when no matches (unlike grep -c).
+    grep '"event"[[:space:]]*:[[:space:]]*"gateway\.chat\.witness"' "$log" 2>/dev/null | wc -l | tr -d ' '
+}
+
+# _probe_witness: POST a cheap real call; confirm a NEW witness row appears.
+# Prints "ok", "no-witness", or "auth-fail:<status>" to stdout.
+_probe_witness() {
+    local before after _status _out _body
+    before="$(_witness_row_count)"
+
+    _json_body='{"model":"deepseek-chat","max_tokens":4,"messages":[{"role":"user","content":"ping"}]}'
+    _out="$(mktemp)"
+    _status="$(curl -s -w '%{http_code}' --max-time 10 -X POST "$HAL_GW/v1/messages" \
+        -H "Content-Type: application/json" \
+        -H "x-api-key: grip-happiverse" \
+        -d "$_json_body" \
+        -o "$_out" 2>/dev/null)"
+    _body="$(cat "$_out" 2>/dev/null || true)"
+    rm -f "$_out"
+
+    if [[ "$_status" == "401" || "$_status" == "403" ]]; then
+        echo "auth-fail:$_status"
+        return
+    fi
+
+    after="$(_witness_row_count)"
+    if [[ "$after" -gt "$before" ]]; then
+        echo "ok"
+    else
+        echo "no-witness"
+    fi
+}
+
+# ── door map ─────────────────────────────────────────────────────────────────
+
+_door_map() {
+    local status_bin council_bin harness_bin verify_bin gw_up
+
+    status_bin="$(_bin_hal grip-happiverse-status)"
+    council_bin="$(_bin_grip grip-council)"
+    harness_bin="$(_bin_grip grip-harness)"
+    verify_bin="$(_bin_hal grip-verify-spine)"
+
+    _probe_hal_gw && gw_up=1 || gw_up=0
+
+    echo "HAPPIVERSE DOOR MAP"
+    echo "-------------------"
+
+    if _live_bin "$status_bin"; then
+        echo "  status   -> $status_bin  [LIVE]"
+    else
+        echo "  status   -> grip-happiverse-status (HAL bin: $status_bin)  [NOT-LIVE — not present in the live HAL tree yet]"
+    fi
+
+    if [[ "$gw_up" -eq 1 ]]; then
+        echo "  ask      -> HAL gateway $HAL_GW  [LIVE]  (model: ${GRIP_HAPPIVERSE_MODEL:-claude-sonnet-4-6})"
+    else
+        echo "  ask      -> HAL gateway $HAL_GW  [NOT-LIVE — gateway not responding (start HAL server)]"
+    fi
+
+    if _live_bin "$council_bin"; then
+        echo "  council  -> $council_bin  [LIVE]"
+    else
+        echo "  council  -> $council_bin  [NOT-LIVE — bin/grip-council not found]"
+    fi
+
+    if _live_bin "$harness_bin"; then
+        echo "  harness  -> $harness_bin  [LIVE]"
+    else
+        echo "  harness  -> $harness_bin  [NOT-LIVE — bin/grip-harness not found]"
+    fi
+
+    if _live_bin "$verify_bin"; then
+        echo "  verify   -> $verify_bin  [LIVE]"
+    elif _live_bin "$(_bin_grip ff-ops)"; then
+        echo "  verify   -> grip-verify-spine (HAL bin: $verify_bin)  [NOT-LIVE — fallback: bin/ff-ops available]"
+    else
+        echo "  verify   -> grip-verify-spine (HAL bin: $verify_bin)  [NOT-LIVE — not in live HAL tree; bin/ff-ops also absent]"
+    fi
+
+    if [[ "$gw_up" -eq 1 ]]; then
+        echo "  cutover  -> HAL gateway $HAL_GW  [LIVE — run 'grip-happiverse cutover' to check witness + auth]"
+    else
+        echo "  cutover  -> HAL gateway $HAL_GW  [NOT-LIVE — gateway not responding; cutover would refuse]"
+    fi
+}
+
+# ── subcommand routing ───────────────────────────────────────────────────────
+
+SUB="${1:-}"
+
+case "$SUB" in
+status)
+    _t="$(_bin_hal grip-happiverse-status)"
+    if _live_bin "$_t"; then
+        exec "$_t" "${@:2}"
+    else
+        echo "grip-happiverse status: grip-happiverse-status is on HAL origin/main but not in the live HAL tree yet (looked: $_t)" >&2
+        exit 1
+    fi
+    ;;
+
+ask)
+    shift
+    if [[ $# -eq 0 ]]; then
+        echo 'grip-happiverse ask: usage: grip-happiverse ask "<question>"' >&2; exit 1
+    fi
+    if ! _probe_hal_gw; then
+        echo "grip-happiverse ask: HAL gateway $HAL_GW is not responding — start the HAL server first" >&2
+        exit 1
+    fi
+
+    # Build JSON body safely: pass prompt and model as argv to python (never bash interpolation).
+    # Handles prompts containing quotes, braces, newlines without breaking the body.
+    _model="${GRIP_HAPPIVERSE_MODEL:-claude-sonnet-4-6}"
+    _json_body="$(python3 - "$*" "$_model" <<'PYEOF'
+import json, sys
+prompt, model = sys.argv[1], sys.argv[2]
+print(json.dumps({
+    "model": model,
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": prompt}],
+}))
+PYEOF
+)"
+
+    # Capture response body + HTTP status; report non-2xx honestly (never swallow errors).
+    _out="$(mktemp)"
+    _status="$(curl -s -w '%{http_code}' --max-time 30 -X POST "$HAL_GW/v1/messages" \
+        -H "Content-Type: application/json" \
+        -H "x-api-key: grip-happiverse" \
+        -d "$_json_body" \
+        -o "$_out" 2>/dev/null)"
+
+    if [[ "$_status" -lt 200 || "$_status" -ge 300 ]]; then
+        _body="$(cat "$_out" 2>/dev/null || true)"
+        rm -f "$_out"
+        echo "grip-happiverse ask: inference failed — HTTP $_status: $_body" >&2
+        exit 1
+    fi
+
+    # Parse response; exit nonzero on error key or missing text — never print hollow success.
+    python3 - "$_out" <<'PYEOF'
+import json, sys, os
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        d = json.load(f)
+finally:
+    os.unlink(path)
+if "error" in d:
+    print(f"grip-happiverse ask: inference error — {d['error']}", file=sys.stderr)
+    sys.exit(1)
+text = (d.get("content") or [{}])[0].get("text", "")
+if not text:
+    print("grip-happiverse ask: no text in response", file=sys.stderr)
+    sys.exit(1)
+print(text)
+PYEOF
+    ;;
+
+council)
+    _t="$(_bin_grip grip-council)"
+    if ! _live_bin "$_t"; then
+        echo "grip-happiverse council: bin/grip-council not found at $_t" >&2; exit 1
+    fi
+    exec "$_t" "${@:2}"
+    ;;
+
+harness)
+    _t="$(_bin_grip grip-harness)"
+    if ! _live_bin "$_t"; then
+        echo "grip-happiverse harness: bin/grip-harness not found at $_t" >&2; exit 1
+    fi
+    exec "$_t" "${@:2}"
+    ;;
+
+verify)
+    _vh="$(_bin_hal grip-verify-spine)"
+    if _live_bin "$_vh"; then
+        exec "$_vh" "${@:2}"
+    fi
+    _ff="$(_bin_grip ff-ops)"
+    if _live_bin "$_ff"; then
+        echo "grip-happiverse verify: grip-verify-spine not in live HAL tree; using bin/ff-ops as fallback" >&2
+        # Pass caller args through unchanged; only default to bare exec when no args given.
+        if [[ ${#@} -gt 1 ]]; then
+            exec "$_ff" "${@:2}"
+        else
+            exec "$_ff"
+        fi
+    fi
+    echo "grip-happiverse verify: grip-verify-spine not in live HAL tree (looked: $_vh); bin/ff-ops also absent" >&2
+    exit 1
+    ;;
+
+cutover)
+    _apply=0
+    [[ "${2:-}" == "--apply" ]] && _apply=1
+
+    _fail=0
+
+    # ── check 1: gateway up ──────────────────────────────────────────────────
+    if ! _probe_hal_gw; then
+        echo "FAIL gateway-up: HAL gateway $HAL_GW is not responding" >&2
+        echo "  consequence: cutover would route to a dead gateway — every call would fail" >&2
+        _fail=1
+    else
+        echo "OK   gateway-up: $HAL_GW responding"
+    fi
+
+    # ── check 2 + 3: witness + auth ──────────────────────────────────────────
+    if [[ "$_fail" -eq 0 ]]; then
+        _result="$(_probe_witness)"
+        case "$_result" in
+        ok)
+            echo "OK   gateway-witness: new gateway.chat.witness row confirmed in gateway-audit.jsonl"
+            echo "OK   auth: gateway accepted the probe call"
+            ;;
+        auth-fail:*)
+            _code="${_result#auth-fail:}"
+            echo "FAIL auth: gateway returned HTTP $_code — cutover would break your harness" >&2
+            echo "  consequence: every harness call would receive $_code auth errors" >&2
+            _fail=1
+            ;;
+        no-witness)
+            echo "FAIL gateway-witness: no new gateway.chat.witness row in gateway-audit.jsonl" >&2
+            echo "  consequence: the live gateway lacks the merged witness code — would sign nothing" >&2
+            _fail=1
+            ;;
+        esac
+    fi
+
+    # ── decision ─────────────────────────────────────────────────────────────
+    if [[ "$_fail" -ne 0 ]]; then
+        exit 1
+    fi
+
+    _export_line="export ANTHROPIC_BASE_URL=http://127.0.0.1:4010"
+    echo ""
+    echo "cutover GREEN — gateway is witnessing + authed — every call through this harness will now be signed."
+    echo ""
+    echo "  $_export_line"
+    echo ""
+
+    if [[ "$_apply" -eq 1 ]]; then
+        _profile="${ZDOTDIR:-$HOME}/.zshrc"
+        if ! grep -qF "$_export_line" "$_profile" 2>/dev/null; then
+            printf '\n# grip happiverse cutover\n%s\n' "$_export_line" >> "$_profile"
+            echo "  written to $_profile"
+        else
+            echo "  already present in $_profile (no duplicate written)"
+        fi
+    else
+        echo "  (run with --apply to set it permanently in ~/.zshrc)"
+    fi
+    ;;
+
+"")
+    _door_map
+    ;;
+
+*)
+    echo "grip-happiverse: unknown subcommand '$SUB'" >&2
+    echo "" >&2
+    _door_map >&2
+    exit 1
+    ;;
+esac

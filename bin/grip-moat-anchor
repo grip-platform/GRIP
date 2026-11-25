@@ -1,0 +1,12 @@
+#!/bin/bash
+# grip-moat-anchor — thin argv-passthrough shim for lib/moat_anchor.py:
+# continuous OpenTimestamps anchoring of the moat onto Bitcoin.
+# Subcommands: run (default) | status | upgrade
+set -euo pipefail
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+source "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib/venv-utils.sh"
+if ! PY="$(resolve_venv_python "$CLAUDE_DIR/venv")"; then
+    echo "[grip-moat-anchor] no Python interpreter found (searched $CLAUDE_DIR/venv, then PATH)" >&2
+    exit 1
+fi
+exec env PYTHONPATH="$CLAUDE_DIR/lib" "$PY" "$CLAUDE_DIR/lib/moat_anchor.py" "$@"

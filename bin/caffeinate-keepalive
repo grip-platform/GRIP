@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+# caffeinate-keepalive — One-shot tick that ensures macOS caffeinate stays
+# alive across its `-t` window expiry. V>>'s 2026-05-26 ultrathink ask:
+# "create a /loop to make sure caffeinate re-enables before it expires."
+#
+# DECISION CORE (pure, no I/O):  lib/caffeinate_keepalive.py
+# THIS WRAPPER (all the I/O):    ps, kill, PID file, env, RSI lock checks
+#
+# Same syscall-doctrine shape as bin/agora-convergence-tick (PR #3250).
+#
+# WHAT IT DOES (idempotent one-shot):
+#   1. Reads current state — PID file, RSI lock, autonomous-state.json, manual marker.
+#   2. If caffeinate is running, parses its etime to compute remaining-before-expiry.
+#   3. Feeds the state into route_action() for one of: NOOP / START / ROTATE / HEALTHY.
+#   4. Acts:
+#        NOOP    → nothing to protect, exit 0 silently
+#        START   → call caffeinate_start_for_rsi (from intelligent-caffeinate.sh)
+#        ROTATE  → caffeinate_stop, then caffeinate_start_for_rsi (gap ≈ ms)
+#        HEALTHY → log only, no kill/spawn
+#   5. Appends one line of telemetry to data/caffeinate-keepalive.jsonl.
+#
+# USAGE:
+#   bin/caffeinate-keepalive               # one-shot tick
+#   CAFFEINATE_KEEPALIVE_DRY_RUN=1 bin/caffeinate-keepalive  # decide-but-don't-act
+#
+# Schedule via launchd (durable across CC restart + machine reboot):
+#   bash bin/caffeinate-keepalive-launchd install   # every 1h on :17
+#
+# EXIT CODES:
+#   0 — tick completed (NOOP/START/ROTATE/HEALTHY all succeed at 0)
+#   1 — preflight failure (lib/intelligent-caffeinate.sh missing, etc.)
+#   2 — Python decision core failed (lib/caffeinate_keepalive.py broken)
+
+set -uo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+DRY_RUN="${CAFFEINATE_KEEPALIVE_DRY_RUN:-0}"
+TELEMETRY_FILE="${CAFFEINATE_KEEPALIVE_TELEMETRY:-$CLAUDE_DIR/data/caffeinate-keepalive.jsonl}"
+PYTHON="${CAFFEINATE_KEEPALIVE_PYTHON:-python3}"
+MANUAL_MARKER="${CAFFEINATE_KEEPALIVE_MARKER:-$CLAUDE_DIR/state/caffeinate-keepalive.lock}"
+NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# Override default 8h/1h on the command line if needed (for tests, short runs).
+MAX_S="${CAFFEINATE_KEEPALIVE_MAX_S:-$(( ${GRIP_CAFFEINATE_MAX_HOURS:-8} * 3600 ))}"
+MARGIN_S="${CAFFEINATE_KEEPALIVE_MARGIN_S:-3600}"
+
+log_info()  { echo "[caffeinate-keepalive] $*" >&2; }
+log_error() { echo "[caffeinate-keepalive] ERROR: $*" >&2; }
+
+# --- Preflight ---
+
+if [[ "$(uname -s)" != "Darwin" ]]; then
+    # caffeinate is macOS-only. Linux/Windows: no-op silently.
+    exit 0
+fi
+
+INTELLIGENT_CAFFEINATE="$CLAUDE_DIR/lib/intelligent-caffeinate.sh"
+if [[ ! -f "$INTELLIGENT_CAFFEINATE" ]]; then
+    log_error "missing $INTELLIGENT_CAFFEINATE — caffeinate primitives unavailable"
+    exit 1
+fi
+# Source intelligent-caffeinate.sh — gives us caffeinate_start_for_rsi,
+# caffeinate_stop, caffeinate_status, CAFFEINATE_PID_FILE.
+# shellcheck disable=SC1090
+source "$INTELLIGENT_CAFFEINATE"
+
+mkdir -p "$(dirname "$TELEMETRY_FILE")"
+
+# --- Gather observable state (the I/O the pure functions can't do) ---
+
+# (1) Is caffeinate running, and what's its PID + age?
+is_running=0
+pid=""
+etime_str=""
+age_seconds=""
+if _is_caffeinate_running 2>/dev/null; then
+    is_running=1
+    pid=$(< "$CAFFEINATE_PID_FILE")
+    # `ps -o etime= -p PID` strips header; format is [[DD-]hh:]mm:ss.
+    etime_str=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)
+fi
+
+# (2) RSI lock + autonomous-state level + manual marker. The lock counts only
+# while it names a live process, the rule lib/rsi/lock.py applies (GRIP#8989).
+rsi_lock_exists=0
+_caff_lock_owner_alive && rsi_lock_exists=1
+
+autonomous_level=0
+auto_state="$CLAUDE_DIR/.autonomous-state.json"
+if [[ -f "$auto_state" ]]; then
+    autonomous_level=$("$PYTHON" -c "
+import json, pathlib
+try:
+    s = json.loads(pathlib.Path('$auto_state').read_text())
+    print(int(s.get('level', 0)))
+except Exception:
+    print(0)
+" 2>/dev/null) || autonomous_level=0
+fi
+
+manual_marker_exists=0
+[[ -f "$MANUAL_MARKER" ]] && manual_marker_exists=1
+
+# --- Feed observable state into the pure decision core ---
+
+# Build JSON input for the Python module — keeps the wrapper / module
+# boundary clean (no positional-arg sprawl).
+decision=$(PYTHONPATH="$CLAUDE_DIR" "$PYTHON" - "$etime_str" "$is_running" "$rsi_lock_exists" "$autonomous_level" "$manual_marker_exists" "$MAX_S" "$MARGIN_S" <<'PYEOF' 2>/dev/null
+import json, sys
+from lib.caffeinate_keepalive import parse_etime_to_seconds, route_action
+
+etime_str, is_running, rsi_lock_exists, autonomous_level, manual_marker_exists, max_s, margin_s = sys.argv[1:8]
+age = parse_etime_to_seconds(etime_str)
+action = route_action(
+    is_running=(is_running == "1"),
+    rsi_lock_exists=(rsi_lock_exists == "1"),
+    autonomous_level=int(autonomous_level),
+    manual_marker_exists=(manual_marker_exists == "1"),
+    age_seconds=age,
+    max_seconds=int(max_s),
+    safety_margin_seconds=int(margin_s),
+)
+print(json.dumps({
+    "action": action,
+    "age_seconds": age,
+    "max_seconds": int(max_s),
+    "margin_seconds": int(margin_s),
+}))
+PYEOF
+) || {
+    log_error "Python decision core failed — verify lib/caffeinate_keepalive.py importable"
+    exit 2
+}
+
+# AGORA #3253 fix: single python invocation instead of two echo|python pipes.
+# Two pipes forked $PYTHON twice + risked interleaving on slow systems.
+_extracted=$("$PYTHON" -c "
+import json, sys
+d = json.loads(sys.argv[1])
+v = d.get('age_seconds')
+print(d.get('action') or 'error')
+print(v if v is not None else 'null')
+" "$decision")
+action=$(echo "$_extracted" | head -n1)
+age_reported=$(echo "$_extracted" | tail -n1)
+
+# --- Act on the routed action ---
+
+# caffeinate_start_for_rsi returns 0 on every path, so a fresh keep-awake is
+# judged by the PID it recorded. Wait a second first: one that fails at once
+# has then exited and been collected, and a zombie shows in ps as <defunct>,
+# not as a caffeinate. A live PID that ps does not show as another program is
+# the new keep-awake. The record is kept either way (GRIP#8991). Sets pid to
+# the recorded PID, and returns 0 when the new keep-awake runs.
+_new_keep_awake_runs() {
+    local kind=1
+    sleep 1
+    pid=$(_caff_recorded_pid) || pid=""
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        kind=0
+        _caff_is_ours "$pid" || kind=$?
+    fi
+    [[ "$kind" -ne 1 ]]
+}
+
+action_outcome="$action"
+case "$action" in
+    noop)
+        log_info "no signals active (rsi=$rsi_lock_exists auto=$autonomous_level manual=$manual_marker_exists running=$is_running) — nothing to protect"
+        ;;
+    start)
+        if [[ "$DRY_RUN" == "1" ]]; then
+            log_info "DRY_RUN would start caffeinate (rsi=$rsi_lock_exists auto=$autonomous_level manual=$manual_marker_exists)"
+        else
+            log_info "starting caffeinate (rsi=$rsi_lock_exists auto=$autonomous_level manual=$manual_marker_exists)"
+            if caffeinate_start_for_rsi; then
+                action_outcome="started"
+            else
+                action_outcome="start_failed"
+            fi
+        fi
+        ;;
+    rotate)
+        if [[ "$DRY_RUN" == "1" ]]; then
+            log_info "DRY_RUN would rotate caffeinate (PID=$pid age=${age_reported}s of ${MAX_S}s, ${MARGIN_S}s margin)"
+        else
+            log_info "rotating caffeinate (PID=$pid age=${age_reported}s of ${MAX_S}s, ${MARGIN_S}s margin)"
+            # Stop the old process, then start a fresh one. caffeinate_stop
+            # is the safe variant — it uses PID file, NOT _if_safe (which
+            # would refuse while RSI lock held — but we WANT to rotate
+            # exactly when the lock is held). It signals the old process only
+            # when ps confirms it is GRIP's. When ps cannot say, the old one
+            # keeps its record and runs to its own -t limit, so the rotation
+            # failed (GRIP#8991).
+            caffeinate_stop
+            if [[ -n "$pid" && "$(_caff_recorded_pid)" == "$pid" ]]; then
+                action_outcome="rotate_failed"
+                log_info "left PID=$pid running: ps could not confirm it is GRIP's keep-awake"
+            else
+                old_pid="$pid"
+                caffeinate_start_for_rsi
+                if _new_keep_awake_runs; then
+                    action_outcome="rotated"
+                else
+                    action_outcome="rotate_failed"
+                fi
+                # The age fields described the stopped process, not the new one.
+                etime_str=""
+                age_reported="null"
+                log_info "rotated out PID=$old_pid: $action_outcome (PID=${pid:-none})"
+            fi
+        fi
+        ;;
+    healthy)
+        # A recorded keep-awake with GRIP's old flags holds the screen on, and
+        # its rotation can be hours away, so replace it on this tick instead.
+        if [[ "$DRY_RUN" == "1" ]] && _caff_recorded_is_legacy; then
+            action_outcome="would_replace"
+            log_info "DRY_RUN would replace a keep-awake that holds the screen on (PID=$pid)"
+        elif [[ "$DRY_RUN" != "1" ]] && _caff_retire_legacy; then
+            old_pid="$pid"
+            caffeinate_start_for_rsi
+            if _new_keep_awake_runs; then
+                action_outcome="replaced"
+            else
+                action_outcome="replace_failed"
+            fi
+            # The age fields described the retired process, not the new one.
+            etime_str=""
+            age_reported="null"
+            log_info "retired a keep-awake that held the screen on (PID=$old_pid): $action_outcome (PID=${pid:-none})"
+        # remaining = MAX_S - age_reported (best-effort)
+        elif [[ "$age_reported" != "null" ]]; then
+            remaining=$(( MAX_S - age_reported ))
+            log_info "healthy (PID=$pid age=${age_reported}s, ${remaining}s remaining of ${MAX_S}s)"
+        else
+            log_info "healthy (PID=$pid, age unknown)"
+        fi
+        ;;
+    *)
+        log_error "unknown action: $action (decision=$decision)"
+        action_outcome="error"
+        ;;
+esac
+
+# --- Telemetry ---
+
+# AGORA #3253 fix: route telemetry write through Python json.dumps so any
+# `"`/backslash/control-char in $etime_str / $action_outcome / $pid cannot
+# corrupt downstream jq consumers. age_reported is "null" (literal) when
+# Python emitted null — converted to actual None for json.dumps below.
+"$PYTHON" -c "
+import json, sys
+age = sys.argv[7]
+age_val = None if age == 'null' else int(age)
+row = {
+    'ts': sys.argv[2],
+    'action': sys.argv[3],
+    'outcome': sys.argv[4],
+    'pid': sys.argv[5],
+    'etime': sys.argv[6],
+    'age_s': age_val,
+    'max_s': int(sys.argv[8]),
+    'margin_s': int(sys.argv[9]),
+    'rsi_lock': sys.argv[10],
+    'auto_level': sys.argv[11],
+    'manual': sys.argv[12],
+    'dry_run': sys.argv[13],
+}
+with open(sys.argv[1], 'a', encoding='utf-8') as f:
+    f.write(json.dumps(row, ensure_ascii=True) + '\n')
+" "$TELEMETRY_FILE" "$NOW_ISO" "$action" "$action_outcome" "$pid" "$etime_str" "$age_reported" "$MAX_S" "$MARGIN_S" "$rsi_lock_exists" "$autonomous_level" "$manual_marker_exists" "$DRY_RUN"
+
+exit 0

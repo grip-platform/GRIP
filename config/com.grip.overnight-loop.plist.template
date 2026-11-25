@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Overnight loop — launchd agent TEMPLATE.
+
+  Install (substitute __GRIP_HOME__ with $HOME/.claude):
+      sed "s|__GRIP_HOME__|$HOME/.claude|g" \
+        config/com.grip.overnight-loop.plist.template \
+        > ~/Library/LaunchAgents/com.grip.overnight-loop.plist
+      launchctl load ~/Library/LaunchAgents/com.grip.overnight-loop.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.grip.overnight-loop</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__GRIP_HOME__/venv/bin/python3</string>
+        <string>__GRIP_HOME__/bin/grip-overnight-wave</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardErrorPath</key>
+    <string>__GRIP_HOME__/logs/overnight-loop.err</string>
+    <key>StandardOutPath</key>
+    <string>__GRIP_HOME__/logs/overnight-loop.out</string>
+    <key>StartInterval</key>
+    <integer>1200</integer>
+</dict>
+</plist>

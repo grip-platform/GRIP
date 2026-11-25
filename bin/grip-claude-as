@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""grip-claude-as -- run ONE `claude` process as one stored account.
+
+  grip-claude-as <label> [--check] [--] [claude arguments...]
+
+The label is a name from the token store (``grip-relay-bill list``). The token
+stored under it goes into the environment of the one `claude` process this
+starts, and nowhere else: not into the shell, a profile, an argument or any
+output. Everything that would outrank the token, or send it somewhere other
+than the vendor, is left out of that environment, and a run that would not use
+the token (``--bare``, an ``apiKeyHelper`` in a settings file) is refused with
+the reason.
+
+``--check`` prints what would be run and what would be left out, then stops.
+
+What it covers and what it does not: ``lib/claude_as.py``.
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+import claude_as  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(claude_as.main(sys.argv[1:]))

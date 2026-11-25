@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""grip-backup -- copy something important somewhere it will survive.
+
+Backs a file up into PARAMOUNT_BACKUPS: a folder deliberately outside every repo,
+so its contents survive a branch switch, a worktree removal, a reset or a machine
+rebuild. Where that folder lives differs per machine, so it is resolved rather than
+hardcoded -- see ``lib/paramount_backups.py``.
+
+Usage:
+    bin/grip-backup <file> [<file> ...] [--label NAME]
+    bin/grip-backup --where          show the resolved root and how it was chosen
+
+Exit codes: 0 copied · 1 nothing copied (bad input, or an unusable root) ·
+2 some copied, some failed.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+from paramount_backups import (  # noqa: E402
+    ParamountBackupError, back_up, backups_root, resolve_root,
+)
+
+
+def _show_where() -> int:
+    try:
+        root = backups_root()
+    except ParamountBackupError as exc:
+        print(f"[grip-backup] {exc}", file=sys.stderr)
+        return 1
+    print(f"[grip-backup] root   : {root}")
+    # Ask the resolver which rung answered, never re-derive it: the old local
+    # copy reported the config rung on is_file() alone, while resolution only
+    # uses that file when its JSON parses AND yields a root -- so a malformed
+    # config printed "chosen: config/..." while the default had actually answered.
+    _, source = resolve_root()
+    print(f"[grip-backup] chosen : {source}")
+    print(f"[grip-backup] exists : {'yes' if root.is_dir() else 'no (created on first backup)'}")
+    return 0
+
+
+def _copy_all(files: list[str], label: str | None, summary: str | None) -> int:
+    copied = failed = 0
+    for name in files:
+        try:
+            dest = back_up(
+                Path(name),
+                label=label if len(files) == 1 else None,
+                summary=summary,
+            )
+        except ParamountBackupError as exc:
+            print(f"[grip-backup] FAILED {name}: {exc}", file=sys.stderr)
+            failed += 1
+            continue
+        print(f"[grip-backup] {name} -> {dest}")
+        copied += 1
+    if copied and failed:
+        return 2
+    return 0 if copied else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(add_help=True, description=__doc__)
+    ap.add_argument("files", nargs="*", help="file(s) to back up")
+    ap.add_argument("--label", default=None,
+                    help="store under this name instead of the file's own, keeping its extension (single file only)")
+    ap.add_argument("--summary", default=None,
+                    help="a short description folded into the folder name (YYYY-MM-DD--<slug>)")
+    ap.add_argument("--where", action="store_true", help="print the resolved root and exit")
+    args = ap.parse_args(argv)
+
+    if args.where:
+        return _show_where()
+    if not args.files:
+        ap.print_usage(sys.stderr)
+        print("[grip-backup] nothing to back up", file=sys.stderr)
+        return 1
+    return _copy_all(args.files, args.label, args.summary)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

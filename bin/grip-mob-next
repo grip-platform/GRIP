@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""grip-mob-next -- guarded wrapper over `mob next`.
+
+Refuses if mob is not on PATH, if the current branch is main/master, or if
+the repo's own test script (package.json "scripts.test") fails. A repo with
+no configured test script is not blocked. Otherwise execs the real
+`mob next <args>`.
+
+Usage: bin/grip-mob-next [mob next args]
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+from mob_guards import preflight_next, run_guarded  # noqa: E402
+
+if __name__ == "__main__":
+    cwd = Path.cwd()
+    sys.exit(run_guarded("next", preflight_next(cwd), ["next", *sys.argv[1:]]))

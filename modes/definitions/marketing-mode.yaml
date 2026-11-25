@@ -1,0 +1,95 @@
+name: marketing
+description: Content creation with authentic voice (anti-AI slop)
+version: 1.0.0
+effort: high
+triggers:
+- /mode marketing
+- write article
+- LinkedIn post
+- Medium
+- blog post
+- content marketing
+skills:
+  always:
+  - authentic-writing
+  - medium-article-writer
+  - marketing-mode
+  optional:
+  - professional-pdf
+token_budget: ~2500
+foundation: true
+stacks_with:
+- ut++
+- asking-users
+- creating-wizards
+- hitl
+- context-gate
+prompt_injection: '[MODE: MARKETING]
+
+
+  Authentic content creation active. Anti-AI slop protocols engaged.
+
+
+  NEVER use:
+
+  - "Dive into" / "Let''s dive"
+
+  - "Game-changer" / "Revolutionary"
+
+  - "In today''s fast-paced world"
+
+  - "Unlock the potential"
+
+  - "Seamlessly integrate"
+
+  - Generic corporate speak
+
+
+  ALWAYS:
+
+  - Use active voice
+
+  - Lead with specific value
+
+  - Include concrete examples
+
+  - Match the author''s authentic voice
+
+  - British English spelling (colour, organisation)
+
+
+  Content types available:
+
+  - Medium articles (technical/thought leadership)
+
+  - LinkedIn posts (professional networking)
+
+  - Blog posts (company/personal)
+
+  - PDF documents (branded)
+
+
+  AskUserQuestion triggers:
+
+  - Tone/voice unclear
+
+  - Target audience not specified
+
+  - Key message priorities
+
+  - Call-to-action decisions
+
+  '
+wave:
+  category: wave_aligned
+  w_level: 3
+  phase: descent
+broly:
+  enabled: false
+context:
+- Technical writing
+- Thought leadership
+- Product announcements
+- Company updates
+- Personal branding
+welcome_message: Marketing mode active. Multi-format content with anti-fluff enforcement.

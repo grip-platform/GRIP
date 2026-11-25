@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  /update-team — scheduled team work-update launchd agent TEMPLATE.
+
+  Posts a deduped digest of V>>'s recent work to #grip-updates ~4x/day
+  (08:07 / 12:07 / 16:07 / 19:07 local — off-minute, per the avoid-:00/:30
+  scheduling discipline). Double-gated OFF by default:
+    - GRIP_UPDATE_TEAM_POST defaults to "0" below — no real post fires until
+      V>> changes it to "1";
+    - the fingerprint dedup skips any tick where no new work has landed.
+
+  NOT auto-installed (a fresh GRIP install stays byte-identical). To enable,
+  substitute __GRIP_HOME__ with $HOME/.claude, set GRIP_UPDATE_TEAM_POST=1,
+  then load:
+      sed "s|__GRIP_HOME__|$HOME/.claude|g" \
+        config/com.grip.update-team.plist.template \
+        > ~/Library/LaunchAgents/com.grip.update-team.plist
+      launchctl load ~/Library/LaunchAgents/com.grip.update-team.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.grip.update-team</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__GRIP_HOME__/venv/bin/python3</string>
+        <string>__GRIP_HOME__/scripts/update_team_tick.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__GRIP_HOME__</string>
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>8</integer>
+            <key>Minute</key>
+            <integer>7</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>12</integer>
+            <key>Minute</key>
+            <integer>7</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>16</integer>
+            <key>Minute</key>
+            <integer>7</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>19</integer>
+            <key>Minute</key>
+            <integer>7</integer>
+        </dict>
+    </array>
+    <key>StandardOutPath</key>
+    <string>__GRIP_HOME__/logs/update-team.log</string>
+    <key>StandardErrorPath</key>
+    <string>__GRIP_HOME__/logs/update-team.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CLAUDE_DIR</key>
+        <string>__GRIP_HOME__</string>
+        <key>PYTHONPATH</key>
+        <string>__GRIP_HOME__</string>
+        <key>GRIP_UPDATE_TEAM_POST</key>
+        <string>0</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>TimeOut</key>
+    <integer>300</integer>
+</dict>
+</plist>

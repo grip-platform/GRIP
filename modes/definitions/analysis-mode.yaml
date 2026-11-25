@@ -1,0 +1,134 @@
+name: analysis
+description: Structured analysis with RIPER phases (Research/Innovate/Plan/Execute/Review)
+version: 1.0.0
+effort: high
+triggers:
+- /mode analysis
+- analyze
+- RIPER
+- structured analysis
+- deep dive
+- investigate systematically
+skills:
+  always:
+  - riper-workflow
+  - reasoning-with-ai
+  optional:
+  - hypothesis-validation
+  - pre-mortem-facilitation
+  - decision-locking
+token_budget: ~4000
+foundation: true
+stacks_with:
+- ut++
+- asking-users
+- creating-wizards
+- hitl
+- context-gate
+prompt_injection: '[MODE: ANALYSIS]
+
+
+  RIPER workflow active. Structured analysis through five phases.
+
+
+  Phases:
+
+  1. RESEARCH (read-only) - Understand current state
+
+  2. INNOVATE (read-only) - Brainstorm approaches (optional)
+
+  3. PLAN (limited write) - Create specifications
+
+  4. EXECUTE (full access) - Implement the plan
+
+  5. REVIEW (read + test) - Validate implementation
+
+
+  Commands:
+
+  - /riper:research [topic] - Enter Research phase
+
+  - /riper:plan [feature] - Enter Plan phase
+
+  - /riper:execute - Enter Execute phase
+
+  - /riper:review - Enter Review phase
+
+  - /riper:status - Show current phase
+
+
+  MANDATORY AskUserQuestion at phase transitions:
+
+  - After Research: Confirm understanding before planning
+
+  - After Plan: Get approval before executing
+
+  - After Execute: Confirm review findings
+
+
+  Key principle: No premature implementation. Research → Plan → Execute → Review.
+
+
+  ## Broly Auto-Activation
+
+
+  Broly is AUTO-ACTIVE in this mode at CLUSTER level.
+
+  No /broly command needed -- UNLESS the operator has set the trigger to manual (check with `mode-loader.sh broly status`), in which case fan out ONLY on an explicit /broly. Assess task complexity and invoke automatically.
+
+
+  Default: CLUSTER (Agent Team swarm, up to 7 agents)
+
+  Team pattern: swarm | Reasoning: beam-of-thought (bot)
+
+
+  ### Escalation to PIPELINE
+
+  - Analysis requires multiple RIPER phases in parallel
+
+  - Root cause investigation spans multiple systems
+
+  - Comparative analysis across multiple architectures
+
+
+  ### De-escalation to THREAD
+
+  - Single variable investigation
+
+  - Quick diagnostic check
+
+  - Simple data lookup
+
+
+  ### Budget
+
+  CLUSTER uses ~5x tokens. De-escalate to THREAD for simple tasks.
+
+  AskUserQuestion if scope is unclear.
+
+  '
+wave:
+  category: wave_aligned
+  w_level: 2
+  phase: ascent
+broly:
+  enabled: true
+  default_level: cluster
+  team_pattern: swarm
+  reasoning_hint: bot
+  escalation:
+    to: pipeline
+    signals:
+    - analysis requires multiple RIPER phases in parallel
+    - root cause investigation spans multiple systems
+    - comparative analysis across multiple architectures
+  context:
+    recommended: 1000000
+    auto_extend: true
+context:
+- Complex problem analysis
+- System investigation
+- Root cause analysis
+- Feature planning
+- Refactoring analysis
+welcome_message: Analysis mode active. RIPER phases with systematic investigation framework.

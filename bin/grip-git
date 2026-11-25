@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""grip-git -- git, with every working-tree-mutating op stamped to its session.
+
+Usage is exactly git's:  grip-git [global options] <command> [args]
+(and `alias git=grip-git` is the intended deployment).
+
+For the commands that can change the working tree, the index or the stash
+stack (MUTATING below) grip-git:
+  1. exports GRIP_SESSION_ID to the real git, so its hooks can see the owner;
+  2. snapshots the dirty set before and after, and records in this session's
+     Clean Ledger manifest (lib/grip_dirty_snapshot.py) which paths the op
+     dirtied or changed -- those are now this session's -- and which it made
+     clean;
+  3. rewrites `stash` / `stash push` / `stash save` so the message carries
+     grip-stash:<sid>:<branch>:<reason> (the reason is your -m, else
+     'unlabelled').
+
+Every other command runs untouched. The exit code is always git's own. With no
+session id (Claude Code sets CLAUDE_CODE_SESSION_ID; elsewhere export
+GRIP_SESSION_ID), grip-git still runs git and says, once on stderr, that the op
+was not attributed: refusing would only push work back onto bare git, whose
+dirt is exactly what the ledger cannot see.
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Optional, Sequence
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+import grip_dirty_snapshot as ledger  # noqa: E402
+
+MUTATING = frozenset({
+    "add", "rm", "mv", "restore", "checkout", "switch", "reset", "commit",
+    "merge", "rebase", "cherry-pick", "revert", "pull", "stash", "apply", "am",
+    "clean", "mergetool", "update-index", "read-tree", "checkout-index",
+})
+# stash verbs that change nothing a ledger attributes.
+READ_ONLY_STASH = frozenset({"list", "show", "create"})
+
+
+def _warn(message: str) -> None:
+    print(f"[grip-git] {message}", file=sys.stderr)
+
+
+def needs_stamp(sub: Optional[str], rest: Sequence[str]) -> bool:
+    if sub not in MUTATING:
+        return False
+    return not (sub == "stash" and rest and rest[0] in READ_ONLY_STASH)
+
+
+def session_or_none() -> Optional[str]:
+    try:
+        sid = ledger.resolve_session_id()
+    except ledger.InvalidSessionId as exc:
+        _warn(f"{exc}; op not attributed")
+        return None
+    if sid is None:
+        _warn("no session id; op not attributed (export GRIP_SESSION_ID=<id>)")
+    return sid
+
+
+def main(argv: Sequence[str]) -> int:
+    git = ledger.real_git(self_path=Path(__file__))
+    plain = ledger.GitCtx([git], os.getcwd())
+    globals_, sub, rest = ledger.split_global_options(argv)
+    if not needs_stamp(sub, rest):
+        return ledger.run_git(plain, argv, None, subprocess.call, _warn)
+    sid = session_or_none()
+    if sid is None:
+        return ledger.run_git(plain, argv, None, subprocess.call, _warn)
+    ctx = ledger.GitCtx([git, *globals_], os.getcwd())
+    args = [sub, *rest]
+    if sub == "stash":
+        try:
+            args = ledger.rewrite_stash_args(rest, sid, ctx.branch_label())
+        except ledger.LedgerError as exc:
+            _warn(f"stash not relabelled: {exc}")
+    return ledger.stamped_call(ctx, args, sid, op=sub, warn=_warn)
+
+
+if __name__ == "__main__":
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(errors="backslashreplace")
+    raise SystemExit(main(sys.argv[1:]))

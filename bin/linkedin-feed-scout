@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# linkedin-feed-scout — thin bash shim that runs the Python CLI under the
+# GRIP venv (so playwright + HAL adapter both resolve).
+#
+# All real logic lives in lib/linkedin_scout_cli.py — see that module
+# for flag documentation. This wrapper exists per the syscall-shim
+# pattern (rules/syscall-doctrine.md) so future runtime/venv changes
+# don't touch every invocation.
+
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+source "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib/venv-utils.sh"
+# The venv is required (playwright + the HAL adapter live there). resolve_venv_python
+# falls back to system python, so accept its answer only from inside the venv.
+VENV_PY="$(resolve_venv_python "${CLAUDE_DIR}/venv" || true)"
+
+if [[ "${VENV_PY}" != "${CLAUDE_DIR}/venv/"* ]]; then
+  echo "[linkedin-feed-scout] ERROR: GRIP venv missing at ${CLAUDE_DIR}/venv" >&2
+  echo "                       (looked for Scripts/python.exe, bin/python3, bin/python)" >&2
+  echo "                       Run scripts/bootstrap-semantic-rl.sh first." >&2
+  exit 1
+fi
+
+# Add lib/ to PYTHONPATH so the CLI can import linkedin_* modules + the
+# canonical HAL adapter (lib/hal_llm_adapter.py).
+export PYTHONPATH="${CLAUDE_DIR}/lib:${PYTHONPATH:-}"
+
+exec "${VENV_PY}" "${CLAUDE_DIR}/lib/linkedin_scout_cli.py" "$@"

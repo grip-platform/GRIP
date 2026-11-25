@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# grip-isolate-me — onboard a GRIP power-user to their own protected isolation branch.
+#
+# Creates `isolation/<user>-personal` from current main, pushes it to origin,
+# and registers the user in state/users/isolated-users.yaml so the leak-check
+# workflow + roster-aware tooling can see them.
+#
+# The branch is then protected by ruleset 15803953 ("GRIP Isolation Branching"):
+#   - cannot be deleted
+#   - cannot be force-pushed
+#   - requires signed commits
+#   - requires linear history (rebase-only)
+#   - creation gated to org admins
+#
+# Usage
+#   grip-isolate-me --user jane                   # onboard 'jane' (creates isolation/jane-personal)
+#   grip-isolate-me --user jane --sig "J>>"       # with signature letter
+#   grip-isolate-me --user jane --name "Jane Example" --role "Legal AI Architect"
+#   grip-isolate-me --user jane --dry-run         # show steps, mutate nothing
+#   grip-isolate-me --help
+#
+# Idempotency: if isolation/<user>-personal already exists (locally or on origin),
+# the script exits 0 with a "branch already exists" message and does NOT
+# duplicate the YAML entry. Safe to re-run.
+#
+# Requires: gh CLI authenticated with admin:org scope (the user must be an
+# org admin to create branches matching the protected pattern).
+
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+ROSTER="${CLAUDE_DIR}/state/users/isolated-users.yaml"
+LOG="${CLAUDE_DIR}/logs/isolate-me.log"
+
+DRY_RUN=0
+USER_NAME=""
+FULL_NAME=""
+SIG=""
+ROLE=""
+GITHUB_USER=""
+
+usage() {
+    sed -n '2,28p' "$0"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --user)        USER_NAME="$2"; shift 2 ;;
+        --github)      GITHUB_USER="$2"; shift 2 ;;
+        --name)        FULL_NAME="$2"; shift 2 ;;
+        --sig)         SIG="$2"; shift 2 ;;
+        --role)        ROLE="$2"; shift 2 ;;
+        --dry-run)     DRY_RUN=1; shift ;;
+        --help|-h)     usage; exit 0 ;;
+        *)             echo "grip-isolate-me: unknown arg '$1'" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+if [[ -z "$USER_NAME" ]]; then
+    echo "grip-isolate-me: --user is required" >&2
+    usage >&2
+    exit 2
+fi
+
+# Sanitise: lowercase, strip non-alphanum
+SLUG="$(echo "$USER_NAME" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')"
+if [[ -z "$SLUG" ]]; then
+    echo "grip-isolate-me: --user '$USER_NAME' resolved to empty slug after sanitisation" >&2
+    exit 2
+fi
+
+BRANCH="isolation/${SLUG}-personal"
+GITHUB_USER="${GITHUB_USER:-$SLUG}"
+FULL_NAME="${FULL_NAME:-$USER_NAME}"
+SIG="${SIG:-${SLUG:0:1}>>}"
+ROLE="${ROLE:-GRIP Power-User}"
+TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+cd "$CLAUDE_DIR"
+
+# Pre-flight
+git fetch origin --quiet 2>/dev/null || true
+
+# git-crypt pre-flight: if the roster exists but is still ciphertext (the
+# git-crypt key is not unlocked on this host), fail LOUD with the remedy rather
+# than grep/append against an encrypted blob. Stdlib-only guard; exit 3 = ciphertext.
+if [[ -f "$ROSTER" ]]; then
+    python3 "${CLAUDE_DIR}/lib/gitcrypt_preflight.py" assert "$ROSTER" || exit 1
+fi
+
+CURRENT_BRANCH="$(git symbolic-ref --short HEAD 2>/dev/null || echo 'detached')"
+if [[ "$CURRENT_BRANCH" != "main" ]]; then
+    echo "grip-isolate-me: must be on main (currently '$CURRENT_BRANCH'). Run 'git checkout main' first." >&2
+    exit 1
+fi
+
+DIRTY_TREE=0
+if [[ -n "$(git status --porcelain)" ]]; then
+    DIRTY_TREE=1
+    if [[ $DRY_RUN -eq 0 ]]; then
+        echo "grip-isolate-me: working tree is dirty. Commit, stash, or clean before onboarding." >&2
+        git status --short >&2
+        exit 1
+    fi
+    echo "grip-isolate-me: tree is dirty — but --dry-run is set, so continuing for inspection." >&2
+fi
+
+# Idempotency check — local OR remote
+LOCAL_EXISTS=0
+REMOTE_EXISTS=0
+git show-ref --verify --quiet "refs/heads/${BRANCH}" && LOCAL_EXISTS=1
+git ls-remote --exit-code --heads origin "${BRANCH}" >/dev/null 2>&1 && REMOTE_EXISTS=1
+
+if [[ $LOCAL_EXISTS -eq 1 || $REMOTE_EXISTS -eq 1 ]]; then
+    echo "grip-isolate-me: branch '${BRANCH}' already exists (local=$LOCAL_EXISTS remote=$REMOTE_EXISTS) — doing nothing"
+    # Still update roster if user not present (idempotent ensure)
+    if ! grep -q "github: ${GITHUB_USER}$" "$ROSTER" 2>/dev/null; then
+        echo "grip-isolate-me: NOTE — roster entry for '${GITHUB_USER}' is missing. Add manually if needed."
+    fi
+    exit 0
+fi
+
+cat <<PLAN
+grip-isolate-me — plan
+  user:        $USER_NAME
+  github:      $GITHUB_USER
+  name:        $FULL_NAME
+  sig:         $SIG
+  role:        $ROLE
+  branch:      $BRANCH
+  timestamp:   $TIMESTAMP
+  roster:      $ROSTER
+  dry-run:     $DRY_RUN
+
+steps:
+  1. git checkout -b ${BRANCH} main
+  2. git push -u origin ${BRANCH}
+  3. append entry to ${ROSTER}
+  4. git add ${ROSTER} && git commit -m "feat(isolation): onboard ${GITHUB_USER}"
+  5. git push origin main
+  6. git checkout main
+PLAN
+
+if [[ $DRY_RUN -eq 1 ]]; then
+    echo "grip-isolate-me: --dry-run — exiting without mutation"
+    exit 0
+fi
+
+mkdir -p "$(dirname "$LOG")"
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) onboard user=${USER_NAME} github=${GITHUB_USER} branch=${BRANCH}" >> "$LOG"
+
+# 1. create the branch
+git checkout -b "${BRANCH}" main
+
+# 2. push with upstream
+git push -u origin "${BRANCH}"
+
+# 3. switch back to main and update roster
+git checkout main
+
+python3 - <<PYUPDATE
+import yaml, sys
+from pathlib import Path
+
+roster_path = Path("$ROSTER")
+roster_path.parent.mkdir(parents=True, exist_ok=True)
+if roster_path.exists():
+    data = yaml.safe_load(roster_path.read_text()) or {}
+else:
+    data = {"schema_version": 1, "users": []}
+
+users = data.setdefault("users", [])
+if any(u.get("github") == "$GITHUB_USER" for u in users):
+    print("grip-isolate-me: roster already has $GITHUB_USER — skipping append")
+    sys.exit(0)
+
+users.append({
+    "github": "$GITHUB_USER",
+    "sig": "$SIG",
+    "name": "$FULL_NAME",
+    "branch": "$BRANCH",
+    "joined_at": "$TIMESTAMP",
+    "active": True,
+    "role": "$ROLE",
+})
+
+roster_path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True))
+print(f"grip-isolate-me: roster updated → {roster_path}")
+PYUPDATE
+
+# 4. commit roster update
+git add "$ROSTER"
+git commit -m "feat(isolation): onboard ${GITHUB_USER} to ${BRANCH}"
+
+# 5. push main
+git push origin main
+
+echo ""
+echo "─── Onboarding complete ─────────────────────────────────"
+echo "  ${GITHUB_USER} is now isolated to: ${BRANCH}"
+echo ""
+echo "  Activation snippet for ${USER_NAME}'s local GRIP install:"
+echo ""
+echo "    cd ~/.claude"
+echo "    git fetch origin"
+echo "    git checkout ${BRANCH}"
+echo "    git config user.signingkey <their-key>"
+echo "    git config commit.gpgsign true"
+echo ""
+echo "  To upstream a generic enhancement to main from this branch:"
+echo "    bin/grip-promote <path-or-commit-range>"
+echo ""
+echo "  To pull latest main into this branch:"
+echo "    bin/grip-sync-from-main"
+echo "─────────────────────────────────────────────────────────"

@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""grip-defer-status — surface the deferred-concern queue.
+
+`rules/deferred-followups-complete-or-surface.md` allows a deferred follow-up
+three exits: COMPLETE, SURFACE, or STALE as a recorded won't-do. Nothing
+surfaced them, so exit (b) was unavailable. This is exit (b).
+
+    grip-defer-status            # total, this week's flow, the 5 oldest
+    grip-defer-status --days 30  # a wider window
+    grip-defer-status --json     # for a report to embed
+
+Read-only by construction: it closes nothing and files nothing. Draining 448
+real findings is a decision, not a cleanup a status tool may perform.
+
+Exit status is 0 whenever the PROBE worked, whatever the queue looks like — a
+diverging queue is a finding to report, not a build to fail. Exit 2 means the
+probe itself failed, which is deliberately distinct from a clean queue.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+import defer_queue as dq  # noqa: E402
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Surface the deferred-concern queue")
+    ap.add_argument("--days", type=int, default=7, help="flow window (default: 7)")
+    ap.add_argument("--limit", type=int, default=5, help="oldest items to list")
+    ap.add_argument("--json", action="store_true", help="machine-readable")
+    ns = ap.parse_args()
+
+    today = _dt.datetime.now(_dt.timezone.utc).date()
+    start = (today - _dt.timedelta(days=ns.days)).isoformat()
+    total = dq.open_count()
+    flow = dq.window_flow(start, today.isoformat())
+    items = dq.oldest(ns.limit) if total > 0 else []
+
+    if ns.json:
+        print(json.dumps({"open": total, "flow": flow, "oldest": items}, indent=1))
+    else:
+        print(dq.render(total, flow, items))
+    return 2 if total < 0 else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,78 @@
+{
+  "markdown-linting-violations": {
+    "name": "markdown-linting-violations",
+    "signature": "```\\n[^`]|\\*\\*[A-Z][^*]+:\\*\\*|^###[^\\n]*\\n[^\\n]|[^\\n]\\n---\\n|---\\n[^\\n]",
+    "description": "Missing code language tags, emphasis as headings, missing blank lines around structures and horizontal rules",
+    "minOccurrences": 3,
+    "severity": "major",
+    "tokenImpact": "1000-3000",
+    "remediation": "Add language tags (bash/text/json), use proper # headings, add blank lines around structures (headings, lists, code blocks, horizontal rules)",
+    "autoFix": true,
+    "examples": [
+      {
+        "violation": "```\\nnpm install\\n```",
+        "fix": "```bash\\nnpm install\\n```",
+        "type": "MD040"
+      },
+      {
+        "violation": "**Date:** 2025-01-14",
+        "fix": "Date: 2025-01-14",
+        "type": "MD036"
+      },
+      {
+        "violation": "### Heading\\nContent",
+        "fix": "### Heading\\n\\nContent",
+        "type": "MD022"
+      },
+      {
+        "violation": "Content\\n---\\n**Status**: Active",
+        "fix": "Content\\n\\n---\\n\\nStatus: Active",
+        "type": "MD022-HR"
+      }
+    ],
+    "detectionRules": {
+      "MD040": "An OPENING code fence (``` followed by newline) with no language tag. A closing fence is always bare and is never tagged: CommonMark forbids an info string on it, and a tagged closer never closes its block (GRIP#7905)",
+      "MD036": "Lines starting with ** or * containing : or structural content",
+      "MD022": "Headings not surrounded by blank lines",
+      "MD022-HR": "Horizontal rules (---) not surrounded by blank lines",
+      "MD031": "Code fences not surrounded by blank lines",
+      "MD032": "Lists not surrounded by blank lines"
+    }
+  },
+  "markdown-underscore-identifier": {
+    "name": "markdown-underscore-identifier",
+    "signature": "[A-Za-z0-9]+_[A-Za-z0-9]+",
+    "description": "A snake_case identifier, a file name such as build_handcheck.py, or a key such as per_child, written bare outside code. CommonMark and GitHub never render this as italics, but some Markdown viewers do (the underscore opens emphasis mid-word), so GRIP wraps it in backticks regardless. markdownlint has no rule number for this: it is GRIP's own rule, named MD-US here so it has a name alongside the numbered rules it sits beside.",
+    "minOccurrences": 1,
+    "severity": "minor",
+    "tokenImpact": "n/a (a rendering defect for the operator, not a token-waste pattern)",
+    "remediation": "Wrap the whole identifier, extension included, in backticks: per_person_sharing -> `per_person_sharing`; build_handcheck.py -> `build_handcheck.py`",
+    "autoFix": true,
+    "implementation": "lib/markdown_underscore_check.py (find_identifiers, fix_text) -- the one implementation the skill, the agent and /markdown-lint all use",
+    "examples": [
+      {
+        "violation": "The config uses per_person_sharing as a key.",
+        "fix": "The config uses `per_person_sharing` as a key.",
+        "type": "MD-US"
+      },
+      {
+        "violation": "Run build_handcheck.py before you push.",
+        "fix": "Run `build_handcheck.py` before you push.",
+        "type": "MD-US"
+      }
+    ],
+    "neverTouched": [
+      "fenced code blocks",
+      "inline code spans (already-backticked text)",
+      "URLs",
+      "link targets and image paths -- the (...) part of [text](target) and ![alt](src)",
+      "HTML tags and autolinks -- <...>",
+      "YAML front matter",
+      "an already escaped underscore, e.g. per\\_person",
+      "_italic_ and __bold__ emphasis markers (no underscore join inside a plain word)"
+    ],
+    "detectionRules": {
+      "MD-US": "A run of word characters joined by one or more literal, unescaped underscores, outside any protected region, optionally followed by a dotted file extension. Not a markdownlint rule number -- markdownlint has no rule for this."
+    }
+  }
+}

@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""grip-idr-verify-external — verify a signed IDR ledger WITHOUT trusting GRIP.
+
+The in-house chain verifier (``idr_forest.verify_chain_integrity``) resolves its
+verifying keys from GRIP's own ``state/audit/keys/<tenant>/`` directory, located
+via the ``tenant_id`` written inside the record being checked. That is right for
+GRIP checking itself and worthless to a third party: whoever can forge a record
+can also swap the key sitting next to it.
+
+This command is the outside auditor's entry point. You supply the ledger AND the
+two verifying keys from your OWN copy of the publication, and nothing here reads
+GRIP state. The record, your keys, and this code are the whole trust base.
+
+    grip-idr-verify-external ledger.jsonl \\
+        --ed25519-key acme.pub --mldsa65-key acme-mldsa65.pub
+
+Both keys are required and both must verify: the dual scheme is an AND, so a
+record survives only if the classical Ed25519 signature AND the post-quantum
+ML-DSA-65 signature both check out under the keys you supplied, with fingerprints
+that bind the ones the record declares. One broken limb fails the record.
+
+Get the keys from the publisher's manifest — GRIP writes them with
+``python3 -m lib.aide.key_provisioning publish <tenant>``, which puts
+``<tenant>.pub`` (Ed25519) and ``<tenant>-mldsa65.pub`` (ML-DSA-65) in the
+published docroot. Fetch them over a channel you trust, once, and keep them.
+Fetching a key from the same place as the record proves nothing.
+
+Exit codes, deliberately three-valued:
+
+    0  VERIFIED  every record checked and sound
+    1  BROKEN    at least one record failed — tampered, or signed by another key
+    3  DEGRADED  could NOT be checked (records not dual-signed, or none loaded)
+    2  usage error (argparse)
+
+DEGRADED is never folded into VERIFIED. "I could not check this" is a different
+answer from "I checked this and it is sound", and a tool that blurs them is
+worse than no tool. An HMAC-signed record lands here: verifying one needs a
+shared secret an outside auditor must never hold, so it is unverifiable by you
+BY DESIGN, not broken.
+
+HONEST LIMIT: this attests that a record is authentic and unmodified under the
+supplied keys. It does not attest that the decision the record describes was
+correct, nor that the inputs fed to the model beforehand were sound. Evidence of
+record, not a guarantee of judgement.
+"""
+import argparse
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from lib.audit_chain import Verdict  # noqa: E402
+from lib.idr_external_read import (  # noqa: E402
+    load_external_ledger,
+    verify_idr_external,
+)
+from lib.idr_forest import IdrForestError  # noqa: E402
+from lib.pq_dual_sign import public_key_raw_from_pem  # noqa: E402
+
+_MARK = {Verdict.VERIFIED: "PASS", Verdict.BROKEN: "FAIL", Verdict.DEGRADED: "----"}
+_EXIT = {Verdict.VERIFIED: 0, Verdict.BROKEN: 1, Verdict.DEGRADED: 3}
+
+
+def _read_key(path: str, label: str) -> bytes:
+    """Load one published PEM verifying key as raw bytes, or exit with a clear why."""
+    try:
+        return public_key_raw_from_pem(Path(path).read_bytes())
+    except FileNotFoundError:
+        print(f"error: {label} key not found: {path}", file=sys.stderr)
+        raise SystemExit(2)
+    except ValueError as exc:
+        print(f"error: {label} key at {path} is unusable — {exc}", file=sys.stderr)
+        raise SystemExit(2)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="grip-idr-verify-external",
+        description="Verify a signed IDR ledger against externally-held keys.",
+    )
+    ap.add_argument("ledger", help="IDR ledger JSONL (HAPPI/1.x envelopes)")
+    ap.add_argument("--ed25519-key", required=True,
+                    help="published Ed25519 verifying key, PEM (<tenant>.pub)")
+    ap.add_argument("--mldsa65-key", required=True,
+                    help="published ML-DSA-65 verifying key, PEM (<tenant>-mldsa65.pub)")
+    ap.add_argument("--anchor", default="ci:external-read-p4",
+                    help="exogenous anchor id for the forest root")
+    a = ap.parse_args(argv)
+
+    ed_raw = _read_key(a.ed25519_key, "Ed25519")
+    mldsa_raw = _read_key(a.mldsa65_key, "ML-DSA-65")
+
+    try:
+        forest = load_external_ledger(a.ledger, anchor=a.anchor)
+    except (FileNotFoundError, OSError) as exc:
+        print(f"error: cannot read ledger {a.ledger} — {exc}", file=sys.stderr)
+        return 2
+    except IdrForestError as exc:
+        # A ledger that will not assemble is UNCHECKED, not forged.
+        #
+        # This escaped uncaught until 2026-09-13, and the consequence was the
+        # worst one this tool can produce. An unhandled exception exits 1, and
+        # 1 is this command's code for BROKEN — documented above as "tampered,
+        # or signed by another key". So an outside auditor who ran the exact
+        # published command against a GENUINE record, with the correct keys,
+        # was shown a Python traceback and a status meaning forgery. The real
+        # cause is mundane: the record's predecessor names an anchor that was
+        # not supplied, and the default anchor does not match it.
+        #
+        # Exit 2 (usage), never 1. Accusing an honest record of tampering
+        # because the caller omitted a flag is precisely the conflation the
+        # three-valued design exists to prevent.
+        print(f"error: cannot assemble ledger {a.ledger} — {exc}", file=sys.stderr)
+        print(
+            "hint: this is an anchor mismatch, NOT a failed signature. Pass "
+            "--anchor <the predecessor_idr the ledger is rooted at>; the "
+            "default only fits ledgers rooted at 'ci:external-read-p4'.",
+            file=sys.stderr,
+        )
+        return 2
+
+    verdicts = []
+    for node in forest.nodes.values():
+        verdict = verify_idr_external(node.idr, ed_raw, mldsa_raw)
+        verdicts.append(verdict)
+        print(f"  {_MARK[verdict]}  {node.idr.id}  ({node.idr.kind})")
+
+    # Same fold as lib.idr_external_read.verify_forest_external, printed rather
+    # than returned. An EMPTY ledger is DEGRADED, never VERIFIED — a clean pass
+    # over zero records is the exact false assurance this command exists to
+    # refuse. Verifying nothing is not verification.
+    if not verdicts:
+        overall = Verdict.DEGRADED
+        print(f"\nDEGRADED — no records loaded from {a.ledger}; nothing was verified.")
+    elif Verdict.BROKEN in verdicts:
+        overall = Verdict.BROKEN
+        print(f"\nBROKEN — {verdicts.count(Verdict.BROKEN)} of {len(verdicts)} "
+              f"record(s) do NOT verify under the supplied keys.")
+    elif Verdict.DEGRADED in verdicts:
+        overall = Verdict.DEGRADED
+        print(f"\nDEGRADED — {verdicts.count(Verdict.DEGRADED)} of {len(verdicts)} "
+              f"record(s) are not dual-signed, so an outsider cannot check them. "
+              f"This is NOT a pass.")
+    else:
+        overall = Verdict.VERIFIED
+        print(f"\nVERIFIED — all {len(verdicts)} record(s) authentic and unmodified "
+              f"under the keys you supplied (Ed25519 AND ML-DSA-65).")
+    return _EXIT[overall]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

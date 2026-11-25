@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""grip-security-heal — cheap mechanical trigger for the security-healer agent.
+
+Counts open Dependabot alerts across the configured repo set, logs the result,
+and — only when there is work — notifies the operator and (when enabled)
+dispatches the security-healer agent headlessly to open AGORA-gated remediation
+PRs.
+
+Designed for unattended launchd invocation (config/com.grip.security-heal.plist).
+The heavy agent runs ONLY when alerts > 0 (llm-augmentation floor +
+dispatch-economics: never pay the agent floor on a clean scan).
+
+It also skips the agent when the open alert set is exactly the one the last
+successful dispatch already handled, within RECHECK_AFTER_DAYS. An alert that
+opens, closes or gains a patched version changes the set's fingerprint, so such
+a change always dispatches. The weekly re-check covers what the fingerprint
+cannot see, such as a parent package dropping a vulnerable dependency. The
+agent's final report is kept in the log instead of being discarded (GRIP#8218).
+
+Never merges anything: the agent opens PRs; AGORA council + required CI are the
+ratifier (exogenous-anchor-law).
+
+Auto-dispatch is gated by GRIP_SECURITY_HEAL_AUTODISPATCH=1 (set in the plist
+once the remediation path is dogfood-proven). Default without the flag is
+notify-only, so the script is safe to run manually at any time.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+import claude_signin  # noqa: E402  -- shared sign-in resolver (GRIP#8918/#9388)
+
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR") or (Path.home() / ".claude"))
+REPO_CFG = CLAUDE_DIR / "config" / "security-heal-repos.txt"
+LOG = CLAUDE_DIR / "logs" / "security-heal.jsonl"
+DEFAULT_REPOS = ["grip-platform/GRIP", "grip-platform/HAL"]
+GH_TIMEOUT_S = 60
+DISPATCH_TIMEOUT_S = 1800  # 30-minute ceiling on a headless heal run
+RECHECK_AFTER_DAYS = 7  # an unchanged alert set is still re-dispatched weekly
+REPORT_TAIL_CHARS = 4000  # how much of the agent's final report the log keeps
+AUTH_PROBE_TIMEOUT_S = 60  # one `claude auth status` question
+# The paid Anthropic key is used only when this is exactly "1"
+# (rules/claude-cap-moves-to-the-next-subscription.md, GRIP#9393).
+PAID_OPT_IN_ENV = "GRIP_CLAUDE_ALLOW_PAID"
+_TS_FORMAT = "%Y-%m-%dT%H:%M:%S%z"  # the timestamp _log writes
+# One line per open alert: "<number>:<ghsa>:<first patched version or none>".
+_ALERT_KEY_JQ = (
+    '.[] | "\\(.number):\\(.security_advisory.ghsa_id):'
+    '\\(.security_vulnerability.first_patched_version.identifier // "none")"'
+)
+# launchd runs with a minimal PATH; gh/claude/npm live in Homebrew, so prepend
+# their dir — otherwise both the detect phase (gh) and the dispatch phase
+# (claude) fail to resolve their binaries when run unattended.
+_EXTRA_PATH_DIRS = (
+    "/opt/homebrew/bin", "/usr/local/bin",
+    str(Path.home() / ".claude" / "local"),
+    str(Path.home() / ".local" / "bin"),
+)
+
+
+def _ensure_path() -> None:
+    """Prepend common bin dirs so gh/claude/npm resolve under launchd's minimal PATH."""
+    parts = [p for p in os.environ.get("PATH", "").split(":") if p]
+    for d in reversed(_EXTRA_PATH_DIRS):
+        if d and d not in parts:
+            parts.insert(0, d)
+    os.environ["PATH"] = ":".join(parts)
+
+
+def _keychain(service: str) -> str | None:
+    """Read a macOS keychain generic-password value, or None (fail-open)."""
+    try:
+        cp = subprocess.run(
+            ["security", "find-generic-password", "-s", service, "-w"],
+            timeout=10, capture_output=True, text=True,
+        )
+        out = (cp.stdout or "").strip()
+        return out if cp.returncode == 0 and out else None
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+
+def _repos() -> list[str]:
+    """Repo set from config (one owner/repo per line), else the default pair."""
+    if REPO_CFG.exists():
+        rows = [ln.strip() for ln in REPO_CFG.read_text().splitlines()]
+        repos = [r for r in rows if r and not r.startswith("#")]
+        if repos:
+            return repos
+    return DEFAULT_REPOS
+
+
+def _open_alerts(repo: str) -> list[str] | None:
+    """Keys of repo's open Dependabot alerts, or None on error (fail-open).
+
+    Each key is "<repo>#<number>:<ghsa>:<first patched version or none>", so the
+    set changes when an alert opens, closes or gains a patched version.
+    """
+    try:
+        cp = subprocess.run(
+            ["gh", "api", "--paginate",
+             f"repos/{repo}/dependabot/alerts?state=open&per_page=100",
+             "--jq", _ALERT_KEY_JQ],
+            timeout=GH_TIMEOUT_S, capture_output=True, text=True,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if cp.returncode != 0:
+        return None
+    return [f"{repo}#{key}" for key in (cp.stdout or "").split()]
+
+
+def _fingerprint(keys: list[str]) -> str:
+    """Order-independent digest of an alert key set."""
+    return hashlib.sha256("\n".join(sorted(keys)).encode()).hexdigest()[:16]
+
+
+def _log(payload: dict) -> None:
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    payload["ts"] = time.strftime(_TS_FORMAT)
+    with LOG.open("a") as f:
+        f.write(json.dumps(payload) + "\n")
+
+
+def _is_clean_scan(row: dict) -> bool:
+    """A scan that every repo answered and that found no open alert."""
+    counts = row.get("counts")
+    return (row.get("event") == "scan" and isinstance(counts, dict) and bool(counts)
+            and all(c == 0 for c in counts.values()))
+
+
+def _last_dispatch(log: Path) -> dict | None:
+    """The newest successful dispatch_done row that recorded a fingerprint, or None.
+
+    A clean scan after it clears it, so alerts that reappear later count as new work.
+    """
+    if not log.exists():
+        return None
+    last = None
+    for line in log.read_text().splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        if _is_clean_scan(row):
+            last = None
+        elif (row.get("event") == "dispatch_done" and row.get("rc") == 0
+                and row.get("fingerprint")):
+            last = row
+    return last
+
+
+def _already_handled(fp: str, now: datetime | None = None) -> bool:
+    """True when the last successful dispatch saw this exact alert set within RECHECK_AFTER_DAYS."""
+    last = _last_dispatch(LOG)
+    if last is None or last.get("fingerprint") != fp:
+        return False
+    try:
+        when = datetime.strptime(str(last.get("ts", "")), _TS_FORMAT)
+    except ValueError:
+        return False
+    return (now or datetime.now(timezone.utc)) - when < timedelta(days=RECHECK_AFTER_DAYS)
+
+
+def _notify(msg: str) -> None:
+    """Best-effort operator notify; fail-open to stdout (the durable record is the log)."""
+    print(msg)
+    try:
+        sys.path.insert(0, str(CLAUDE_DIR / "lib"))
+        from grip_notify import notify  # type: ignore
+
+        notify(msg, title="security-healer")
+    except Exception:
+        pass
+
+
+def _signed_in(env: dict) -> bool:
+    """Whether `claude auth status` reports a sign-in under this environment.
+
+    Thin wrapper over the shared `lib/claude_signin.py` (GRIP#8918/#9388), kept
+    under this name so this module's own callers and tests are unchanged.
+    """
+    return claude_signin.signed_in(env, timeout=AUTH_PROBE_TIMEOUT_S)
+
+
+def _signin_folder(env: dict) -> tuple[str | None, str]:
+    """The Claude folder (CLAUDE_CONFIG_DIR) to give the child, and why.
+
+    Delegates to the shared `lib/claude_signin.py` (GRIP#8918/#9388), passing
+    this module's own CLAUDE_DIR -- the GRIP folder is asked about only when
+    the inherited environment has no working sign-in. See that module's
+    docstring for the full rule.
+    """
+    return claude_signin.signin_folder(env, CLAUDE_DIR)
+
+
+def _paid_key_fallback(env: dict) -> None:
+    """Add the paid API key from the keychain, only with the operator's opt-in.
+
+    rules/claude-cap-moves-to-the-next-subscription.md: the paid Anthropic key is
+    used only when the operator set GRIP_CLAUDE_ALLOW_PAID=1 (GRIP#9393). Without
+    it the refusal is logged with how to opt in, the key is not read, and the
+    child runs with no credential, so its own sign-in error reaches the report.
+    A run that adds the key logs that too, so paid use is never silent (AGORA
+    on GRIP#9840).
+    """
+    if env.get(PAID_OPT_IN_ENV) != "1":
+        _log({"event": "dispatch_paid_key_refused",
+              "reason": f"no sign-in was found, and {PAID_OPT_IN_ENV} is not 1",
+              "to_allow": f"set {PAID_OPT_IN_ENV}=1 in the job's environment "
+                          "(EnvironmentVariables in its launchd plist)"})
+        return
+    key = _keychain("grip-anthropic-external")
+    if key:
+        env["ANTHROPIC_API_KEY"] = key
+        _log({"event": "dispatch_paid_key_used", "opt_in": PAID_OPT_IN_ENV})
+
+
+def _dispatch_env() -> dict:
+    """Child env for the headless claude -p: the operator's sign-in, else the keychain fallback.
+
+    The operator's Claude sign-in comes first (_signin_folder). When it is found
+    in the GRIP folder, no API key is added, because claude -p uses a key
+    whenever one is present and the key would replace that sign-in.
+
+    Otherwise the paid key from the keychain is the last resort, only with the
+    operator's opt-in (_paid_key_fallback), and only when no sign-in works
+    anywhere: _signin_folder reports "none" (no caller's own choice, no working
+    inherited sign-in, none in the GRIP folder), and there is no unsuffixed
+    Claude Code-credentials item. So a working sign-in is never replaced by
+    the key, even with the opt-in set (AGORA on GRIP#9840).
+    """
+    env = dict(os.environ)
+    folder, source = _signin_folder(env)
+    _log({"event": "dispatch_signin", "source": source, "config_dir": folder})
+    if folder:
+        env["CLAUDE_CONFIG_DIR"] = folder
+        return env
+    if source == "none" and _keychain("Claude Code-credentials") is None:
+        _paid_key_fallback(env)
+    return env
+
+
+def _text(out: str | bytes | None) -> str:
+    """A child's output as text (a timeout hands back bytes)."""
+    if isinstance(out, bytes):
+        return out.decode("utf-8", "replace")
+    return out or ""
+
+
+def _tail(out: str | bytes | None, err: str | bytes | None = None) -> str:
+    """The last REPORT_TAIL_CHARS of a child's report, with its stderr when there is any."""
+    text = _text(out)
+    if _text(err).strip():
+        text += "\n[stderr]\n" + _text(err)
+    return text[-REPORT_TAIL_CHARS:]
+
+
+def _dispatch() -> tuple[int, str]:
+    """Headlessly dispatch the security-healer agent.
+
+    Returns the child's exit code and the tail of its final report, which used
+    to be captured and then thrown away (GRIP#8218).
+    """
+    prompt = (
+        "Use the security-healer agent to scan and remediate open Dependabot "
+        "alerts across GRIP and HAL. Open one AGORA-gated PR per manifest. "
+        "Reuse an open security/heal-* pull request for the same manifest; "
+        "never open a second one (GRIP#9817). "
+        "NEVER merge without AGORA PASS + required CI green."
+    )
+    try:
+        cp = subprocess.run(
+            ["claude", "-p", prompt],
+            timeout=DISPATCH_TIMEOUT_S, capture_output=True, text=True,
+            cwd=str(CLAUDE_DIR), env=_dispatch_env(),
+        )
+        return cp.returncode, _tail(cp.stdout, cp.stderr if cp.returncode else None)
+    except subprocess.TimeoutExpired as exc:
+        _log({"event": "dispatch_timeout", "deadline_s": DISPATCH_TIMEOUT_S})
+        return 124, _tail(exc.stdout, exc.stderr)
+    except FileNotFoundError:
+        _log({"event": "dispatch_error", "error": "claude CLI not found"})
+        return 127, ""
+
+
+def _maybe_dispatch(fp: str, scan_complete: bool) -> int:
+    """Dispatch the agent unless the last successful run already handled this alert set."""
+    if scan_complete and _already_handled(fp):
+        _log({"event": "dispatch_skipped", "fingerprint": fp,
+              "reason": "open alert set unchanged since the last successful dispatch"})
+        print("[security-heal] alert set unchanged since the last dispatch — not dispatching")
+        return 0
+    print("[security-heal] autodispatch enabled — dispatching agent")
+    rc, report = _dispatch()
+    _log({"event": "dispatch_done", "rc": rc, "fingerprint": fp, "report_tail": report})
+    _notify(f"security-healer run ended (rc={rc}); report in logs/security-heal.jsonl: "
+            f"{report.strip()[-120:] or 'no output'}")
+    return rc
+
+
+def main() -> int:
+    _ensure_path()
+    repos = _repos()
+    alerts = {r: _open_alerts(r) for r in repos}
+    counts = {r: (None if keys is None else len(keys)) for r, keys in alerts.items()}
+    total = sum(c for c in counts.values() if c)
+    complete = all(c is not None for c in counts.values())
+    fp = _fingerprint([k for keys in alerts.values() if keys for k in keys])
+    _log({"event": "scan", "counts": counts, "total": total, "fingerprint": fp})
+
+    if total == 0 and complete:
+        print(f"[security-heal] clean: 0 open alerts across {len(repos)} repos")
+        return 0
+
+    summary = ", ".join(
+        f"{r.split('/')[-1]}: {c if c is not None else '?'}"
+        for r, c in counts.items()
+    )
+    _notify(f"security-healer: {total} open vuln alert(s) — {summary}")
+
+    if os.environ.get("GRIP_SECURITY_HEAL_AUTODISPATCH") == "1":
+        return _maybe_dispatch(fp, complete)
+
+    print("[security-heal] notify-only "
+          "(set GRIP_SECURITY_HEAL_AUTODISPATCH=1 to auto-heal)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

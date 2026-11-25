@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""grip-overnight-wave — cron/launchd wrapper: dispatch ONE bounded overnight
+wave when the loop gate is open. Gate logic: lib/overnight_loop.py.
+
+    grip-overnight-wave [--runner opencode|claude] [--dry-run]
+
+Track A (opencode, DEFAULT):  --runner opencode  → non-Anthropic DeepSeek wave
+Track B (claude -p, Max):     --runner claude    → Max-subscription claude -p wave
+
+Per-track dir-locks (wave-opencode.lock / wave.lock) let both tracks run in
+parallel without collision. --runner defaults to ``claude`` for back-compat when
+called without the flag (e.g. by old cron lines that predate dual-track).
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+import overnight_loop as ol  # noqa: E402
+import throttle_flag  # noqa: E402  the tick's throttle flag, read-only: a Claude wave refuses while it is set
+from provider_secret import inject_provider_key  # noqa: E402
+
+WAVE_TIMEOUT_S = 900    # 15 min hard cap per wave (< 20 min interval)
+STALE_LOCK_S   = 3600   # lock older than 1 h → crashed wave → steal it
+
+PROMPT_A = ol.CLAUDE_DIR / "config" / "overnight-wave-prompt-opencode.md"
+PROMPT_B = ol.CLAUDE_DIR / "config" / "overnight-wave-prompt.md"
+
+_RUNNER_LOCKS   = {"opencode": ol.WAVE_LOCK_A, "claude": ol.WAVE_LOCK}
+_RUNNER_PROMPTS = {"opencode": PROMPT_A,        "claude": PROMPT_B}
+
+
+# ── lock helpers (per-track) ──────────────────────────────────────────────────
+
+def _lock_is_stale(runner: str) -> bool:
+    try:
+        return (time.time() - _RUNNER_LOCKS[runner].stat().st_mtime) > STALE_LOCK_S
+    except OSError:
+        return False
+
+
+def _acquire_lock(runner: str) -> bool:
+    lock = _RUNNER_LOCKS[runner]
+    if _lock_is_stale(runner):
+        try:
+            lock.rmdir()
+        except OSError:
+            pass
+    try:
+        lock.mkdir(parents=True)
+        return True
+    except FileExistsError:
+        return False
+
+
+def _release_lock(runner: str) -> None:
+    try:
+        _RUNNER_LOCKS[runner].rmdir()
+    except OSError:
+        pass
+
+
+# ── env helpers ───────────────────────────────────────────────────────────────
+
+def _opencode_env(env: dict) -> dict:
+    """Inject DEEPSEEK_API_KEY for the opencode runner.
+
+    Delegates to lib/provider_secret.inject_provider_key — the shared env ->
+    GRIP_<P>_API_KEY -> macOS Keychain -> Linux /proc ladder. This function was
+    the inline pattern that resolver was extracted from (DRY / YSH: proven 3x).
+    The /proc rung is opt-in, for the deliberate VPS pm2 case where the key
+    lives in the hal-server process env. Key never printed.
+    """
+    return inject_provider_key(env, "grip-deepseek", allow_proc_scan=True)
+
+
+def _wave_env(runner: str) -> dict:
+    env = os.environ.copy()
+    opencode_dir = str(Path.home() / ".opencode" / "bin")
+    if sys.platform == "darwin":
+        extra = f"{opencode_dir}:/opt/homebrew/bin"
+    else:
+        extra = f"{opencode_dir}:/usr/local/bin:/usr/bin:/bin"
+    env["PATH"] = f"{extra}:{env.get('PATH', '')}"
+    if runner == "opencode":
+        env = _opencode_env(env)
+    return env
+
+
+# ── backlog drain ─────────────────────────────────────────────────────────────
+
+def _drain_backlog(runner: str) -> None:
+    """Run one backlog consumer drain pulse (idempotent, never auto-executes).
+
+    Calls ``lib/holistic_backlog_consumer.drain()`` which applies the critical-reasoning
+    gate to the top-3 backlog items, logs proposals to ``logs/backlog-consumer.jsonl``,
+    and persists the seen-set to ``state/backlog/consumer-seen.json``. Cross-pulse
+    idempotent: an item proposed ACT on one pulse is SKIPped on the next.
+
+    Never auto-executes: ACT is a *proposal*, recorded once so a human or downstream
+    trigger acts. Pure function of (reader, seen); drain() is a Banach fixed point.
+    """
+    _BACKLOG_LOG = ol.CLAUDE_DIR / "logs" / "overnight-backlog-drain.jsonl"
+    try:
+        import holistic_backlog_consumer as bc
+        proposals = bc.drain(k=3)
+        row = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "runner": runner,
+            "n_proposals": len(proposals),
+            "verdicts": {p.verdict: sum(1 for q in proposals if q.verdict == p.verdict)
+                         for p in proposals},
+        }
+        _BACKLOG_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _BACKLOG_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+    except ImportError:
+        ol.log_wave({"event": "backlog_drain_skip", "reason": "holistic_backlog_consumer not available"})
+    except Exception as exc:
+        ol.log_wave({"event": "backlog_drain_error", "error": str(exc)})
+
+
+# ── yolo + wave ───────────────────────────────────────────────────────────────
+
+def _refresh_yolo() -> None:
+    try:
+        if str(ol.CLAUDE_DIR) not in sys.path:
+            sys.path.insert(0, str(ol.CLAUDE_DIR))
+        from lib.gates.yolo_mode import activate_yolo
+        activate_yolo("/grip-overnight", ttl_seconds=14400,
+                      reason="overnight lean-wave loop")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _git_isolate_enabled() -> bool:
+    return os.environ.get("GRIP_OVERNIGHT_GIT_ISOLATE", "").strip().lower() \
+        not in ("", "off", "none", "false", "0")
+
+
+def _resolve_wave_cwd(runner: str, dry_run: bool) -> Path | None:
+    """The wave subprocess cwd, or None on a fail-closed isolation-setup error.
+
+    Phase 1 git-isolation (opt-in, GRIP_OVERNIGHT_GIT_ISOLATE): a setup
+    failure (e.g. lib/grip-worktree.sh errors) must SKIP the fire, never
+    silently fall back to the unsafe shared-tree cwd — see
+    lib/overnight_loop.py::ensure_isolated_workspace's fail-closed contract.
+    """
+    if not _git_isolate_enabled():
+        return ol.CLAUDE_DIR
+    try:
+        return ol.wave_cwd(isolate=True)
+    except Exception as exc:  # noqa: BLE001 -- fail-closed, must never crash the cron fire
+        ol.log_wave({"event": "skip", "reason": f"isolate-setup-failed: {exc}",
+                     "runner": runner, "dry_run": dry_run})
+        print(f"[overnight-wave/{runner}] skip: isolate-setup-failed: {exc}")
+        return None
+
+
+def run_wave(runner: str, dry_run: bool) -> int:
+    lock = _RUNNER_LOCKS[runner]
+    decision = ol.should_fire(
+        ol.load_cfg(), now_epoch=time.time(),
+        lock_held=lock.exists() and not _lock_is_stale(runner),
+        stop_present=ol.STOP_MARKER.exists(),
+        outbound_stop=ol.outbound_stop_engaged(),
+    )
+    if not decision.fire:
+        ol.log_wave({"event": "skip", "reason": decision.reason,
+                     "runner": runner, "dry_run": dry_run})
+        print(f"[overnight-wave/{runner}] skip: {decision.reason}")
+        return 0
+    # The tick's throttle flag (V>> 2026-10-29): a Claude wave is a headless
+    # GRIP-started run and refuses while the flag is set, before the lock is
+    # taken; an opencode wave draws on no Claude spend and runs.
+    throttled = "" if runner == "opencode" else throttle_flag.describe()
+    if throttled:
+        ol.log_wave({"event": "skip", "reason": f"throttled: {throttled}",
+                     "runner": runner, "dry_run": dry_run})
+        print(f"[overnight-wave/{runner}] skip: {throttled}")
+        return 0
+    if not _acquire_lock(runner):
+        ol.log_wave({"event": "skip", "reason": "lock-race", "runner": runner})
+        print(f"[overnight-wave/{runner}] skip: lock-race")
+        return 0
+    try:
+        wave_cwd = _resolve_wave_cwd(runner, dry_run)
+        if wave_cwd is None:
+            return 0
+        _refresh_yolo()
+        ol.log_wave({"event": "wave_start", "runner": runner, "dry_run": dry_run,
+                     "cwd": str(wave_cwd)})
+        t0 = time.time()
+        prompt = _RUNNER_PROMPTS[runner]
+        if runner == "opencode":
+            argv = ol.opencode_wave_argv(prompt, dry_run=dry_run)
+        else:
+            argv = ol.wave_argv(prompt, dry_run=dry_run)
+        try:
+            p = subprocess.run(
+                argv, cwd=str(wave_cwd), env=_wave_env(runner),
+                capture_output=True, text=True, timeout=WAVE_TIMEOUT_S)
+            rc, tail = p.returncode, (p.stdout or "")[-600:]
+        except subprocess.TimeoutExpired:
+            rc, tail = 124, f"wave exceeded WAVE_TIMEOUT_S={WAVE_TIMEOUT_S}s"
+        dur = round(time.time() - t0, 1)
+        ol.log_wave({"event": "wave_done", "rc": rc, "dur_s": dur,
+                     "runner": runner, "dry_run": dry_run, "tail": tail})
+        print(f"[overnight-wave/{runner}] wave done rc={rc} ({dur}s)")
+        _drain_backlog(runner)
+        return 0
+    finally:
+        _release_lock(runner)
+
+
+def main(argv: list[str]) -> int:
+    dry_run = "--dry-run" in argv
+    runner = "claude"   # default: back-compat with old cron lines
+    for i, arg in enumerate(argv):
+        if arg == "--runner" and i + 1 < len(argv):
+            runner = argv[i + 1]
+            break
+    if runner not in _RUNNER_LOCKS:
+        print(f"[overnight-wave] unknown runner {runner!r}; use opencode|claude",
+              file=sys.stderr)
+        return 1
+    return run_wave(runner, dry_run)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

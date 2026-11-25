@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""grip-service-reload -- reload a per-user service without leaving it down (thin CLI).
+
+A thin front door over ``lib/service_reload.py``. It passes the operator's argv
+straight through to ``service_reload.main`` (which owns the argparse surface)
+and propagates its exit code.
+
+Usage:
+    grip-service-reload reload {gateway|wire|<name>} [--definition FILE]
+                        [--platform launchd|systemd|schtasks] [--port N]
+                        [--health-service ID] [--legacy NAME] [--force]
+                        [--foreground | --no-wait | --dry-run] [--wait-timeout S]
+    grip-service-reload status <job-directory>
+
+It validates the new definition, refuses when this caller routes through the
+service (unless --force), waits until the service manager reports the old
+instance gone before starting the new one, checks /health for the expected
+identity, and restores the previous definition on failure. The work runs
+detached, so it finishes even if the caller dies. See the module docstring in
+lib/service_reload.py for the steps and the exit codes.
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+from service_reload import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

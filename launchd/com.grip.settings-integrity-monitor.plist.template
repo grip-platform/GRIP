@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.grip.settings-integrity-monitor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__HOME__/.claude/bin/settings-integrity-monitor.sh</string>
+    </array>
+
+    <!-- Daily at 06:30 SAST -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>6</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>CLAUDE_DIR</key>
+        <string>__HOME__/.claude</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>TZ</key>
+        <string>Africa/Johannesburg</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.claude</string>
+
+    <key>WakeFromSleep</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.claude/logs/security/settings-integrity-monitor.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.claude/logs/security/settings-integrity-monitor.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>Nice</key>
+    <integer>10</integer>
+
+    <key>TimeOut</key>
+    <integer>60</integer>
+</dict>
+</plist>

@@ -1,0 +1,86 @@
+name: teaching
+description: Educational content, curriculum design, explanatory frameworks
+version: 1.0.0
+effort: high
+triggers:
+- /mode teaching
+- teach
+- explain
+- curriculum
+- tutorial
+- lesson
+- learning path
+skills:
+  always:
+  - pedagogical-patterns
+  - reasoning-with-ai
+  optional:
+  - curriculum-design
+  - authentic-writing
+token_budget: ~3000
+foundation: true
+stacks_with:
+- ut++
+- asking-users
+- creating-wizards
+- hitl
+- context-gate
+prompt_injection: '[MODE: TEACHING]
+
+
+  Pedagogical protocols active. FASTER framework loaded.
+
+
+  Teaching principles (FASTER):
+
+  - Forget: Help learner adopt beginner''s mindset
+
+  - Act: Prioritize hands-on over passive
+
+  - State: Ensure focus before teaching
+
+  - Teach: Use teach-back to verify understanding
+
+  - Enter: Encourage consistent practice
+
+  - Review: Schedule spaced repetition
+
+
+  Key techniques:
+
+  - Scaffolded complexity (simple → complex)
+
+  - Worked examples before practice
+
+  - Interleaved practice (mix problem types)
+
+  - ADEPT explanations (Analogy, Diagram, Example, Plain English, Technical)
+
+
+  MANDATORY AskUserQuestion when:
+
+  - Starting session (assess learner level)
+
+  - After explanation (teach-back verification)
+
+  - Learner seems confused (adjust approach)
+
+  - Designing curriculum (clarify objectives)
+
+
+  Always verify understanding, never assume it.
+
+  '
+wave:
+  category: wave_aligned
+  w_level: 2
+  phase: descent
+broly:
+  enabled: false
+context:
+- Creating tutorials and guides
+- Explaining technical concepts
+- Designing learning paths
+- Teaching programming concepts
+- Onboarding documentation
+welcome_message: Teaching mode active. Pedagogical frameworks with teach-back verification.

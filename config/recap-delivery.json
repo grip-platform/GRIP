@@ -1,0 +1,6 @@
+{
+  "_comment": "Delivery preferences for /recap. Recipients are signatures (V>>, A>>), resolved against config/channel-allowlist.json -- never raw phone numbers, which do not belong in this repo. An empty default_recipients means /recap never sends unless --send is passed explicitly.",
+  "default_recipients": [],
+  "auto_pdf": false,
+  "pdf_variant": null
+}

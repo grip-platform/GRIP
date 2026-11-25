@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Mac relay self-deploy — launchd agent TEMPLATE.
+
+  Install (substitute __GRIP_HOME__ with $HOME/.claude):
+      sed "s|__GRIP_HOME__|$HOME/.claude|g" \
+        config/com.grip.relay-mac-selfdeploy.plist.template \
+        > ~/Library/LaunchAgents/com.grip.relay-mac-selfdeploy.plist
+      launchctl load ~/Library/LaunchAgents/com.grip.relay-mac-selfdeploy.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.grip.relay-mac-selfdeploy</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__GRIP_HOME__/venv/bin/python3</string>
+        <string>__GRIP_HOME__/lib/relay_mac_selfdeploy.py</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>WorkingDirectory</key>
+    <string>__GRIP_HOME__</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>PYTHONPATH</key>
+        <string>__GRIP_HOME__</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__GRIP_HOME__/logs/relay-mac-selfdeploy.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__GRIP_HOME__/logs/relay-mac-selfdeploy.err.log</string>
+</dict>
+</plist>

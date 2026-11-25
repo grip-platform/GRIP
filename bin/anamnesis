@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# anamnesis - surface the most-forgotten memory entry.
+# Thin shim into lib/anamnesis.py so the tool feels like a first-class CLI.
+set -euo pipefail
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+source "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib/venv-utils.sh"
+# The venv is required (lib/anamnesis.py needs GRIP's deps). resolve_venv_python
+# falls back to system python, so accept it only from inside the venv.
+PY="$(resolve_venv_python "$CLAUDE_DIR/venv" || true)"
+if [[ "$PY" != "$CLAUDE_DIR/venv/"* ]]; then
+    echo "[anamnesis] no GRIP venv Python at $CLAUDE_DIR/venv (looked for Scripts/python.exe, bin/python3, bin/python)" >&2
+    exit 1
+fi
+exec "$PY" "${CLAUDE_DIR}/lib/anamnesis.py" "$@"

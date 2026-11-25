@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""grip-der-verify — independently re-verify a Decision Evidence Receipt.
+
+Give a skeptic (a General Counsel, opposing counsel, a regulator) ONE command
+that re-checks a DER against Bitcoin with ZERO vendor trust — cryptography + the
+ots CLI + Python stdlib, no GRIP runtime:
+
+  1. FIXITY          recompute sha256 of the decision -> must equal the receipt's.
+  2. AUTHENTICITY    Ed25519 signature valid under the receipt's PUBLIC key.
+  3. JOINT-CAUSATION the belief-state (which models decided) is bound in — a swap
+                     breaks it even with a valid timestamp.
+  4. TIMESTAMP       OpenTimestamps Bitcoin attestation (confirmed block / pending).
+
+Exit 0 = PASS (legs 1-3 hold), 1 = FAIL. Task #546.
+"""
+
+# Windows consoles default to cp1252, which cannot encode the glyphs below.
+# Located from __file__, not sys.path[0]: the tests load these commands with
+# SourceFileLoader, which does not put bin/ on the path.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from _grip_console import ensure_utf8_stdio  # noqa: E402
+
+ensure_utf8_stdio()
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+from lib.der_receipt import verify_receipt  # noqa: E402
+
+_LABEL = {
+    "fixity": "FIXITY (decision hash)",
+    "authenticity": "AUTHENTICITY (ed25519, zero-trust)",
+    "joint_causation": "JOINT-CAUSATION (belief binding)",
+    "timestamp": "TIMESTAMP (bitcoin / opentimestamps)",
+}
+_MARK = {True: "✓", False: "✗", "confirmed": "✓",
+         "pending": "…", "absent": "—", "error": "✗"}
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="Verify a Decision Evidence Receipt")
+    ap.add_argument("receipt", help="DER receipt JSON")
+    ap.add_argument("--no-anchor", action="store_true",
+                    help="skip the OpenTimestamps check (offline)")
+    a = ap.parse_args(argv)
+    v = verify_receipt(json.loads(Path(a.receipt).read_text()),
+                       check_anchor=not a.no_anchor)
+    for leg in ("fixity", "authenticity", "joint_causation", "timestamp"):
+        val = v["checks"][leg]
+        print(f"  {_MARK.get(val, '?')} {_LABEL[leg]}: {val}")
+    if v["ok"]:
+        ts = v["checks"]["timestamp"]
+        extra = ", Bitcoin-timestamped" if ts == "confirmed" else (
+            ", anchor pending confirmation" if ts == "pending" else "")
+        print(f"PASS ✓ — authentic, fixed, belief-bound{extra}")
+    else:
+        print("FAIL ✗ — receipt does NOT verify (see failing leg above)")
+    return 0 if v["ok"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

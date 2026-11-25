@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""agora-demo — run a 2-agent AGORA conversation against the real Claude API.
+
+Usage:
+    bin/agora-demo                              # default question (2+2)
+    bin/agora-demo "What is the capital of SA?"  # custom question
+    bin/agora-demo --turns 6 "..."               # cap at 6 turns
+
+Auth fallback chain (first that works wins):
+    1. Anthropic API key from the environment (set in claude code sessions)
+    2. macOS Keychain entry 'grip-anthropic'
+
+Prints the auth path used + full 2-agent conversation transcript.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+# AGORA lives in ~/.claude/lib/agora — straightforward path insert.
+_HOME = Path.home()
+_CLAUDE = _HOME / ".claude"
+if str(_CLAUDE) not in sys.path:
+    sys.path.insert(0, str(_CLAUDE))
+
+from lib.agora import (
+    AgoraAgent,
+    ConversationRunner,
+    Message,
+    MessageBus,
+    RunnerLimits,
+)
+
+
+def _load_hal_runtime():
+    """Load HAL's tool_runtime via file path to bypass the lib/ namespace collision.
+
+    Both ~/.claude/lib/ (with agora/) and ~/.hal/lib/ (with hal/) are top-level
+    'lib' packages. Python's import system can only see one 'lib' at a time.
+    importlib.util sidesteps the collision: load the file directly under a
+    non-colliding synthetic module name. tool_runtime.py is stdlib-only
+    (urllib, json, typing — no internal lib.hal imports), so this is safe.
+    """
+    path = _HOME / ".hal" / "lib" / "hal" / "tool_runtime.py"
+    if not path.exists():
+        raise RuntimeError(f"HAL not found at {path.parent} — clone CodeTonight-SA/hal to ~/.hal")
+    spec = importlib.util.spec_from_file_location("hal_tool_runtime", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load HAL tool_runtime from {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+# Name of the env var that holds the Anthropic API key, read by _from_env().
+# Only the name lives in source; the value is read from the environment.
+_ENV_VAR = "ANTHROPIC_API_KEY"
+
+
+def _from_env() -> tuple[str | None, str]:
+    val = os.environ.get(_ENV_VAR)
+    return (val.strip(), f"env:{_ENV_VAR}") if val else (None, "")
+
+
+def _from_keychain() -> tuple[str | None, str]:
+    try:
+        out = subprocess.run(
+            ["security", "find-generic-password", "-s", "grip-anthropic", "-w"],
+            capture_output=True, text=True, check=False, timeout=2,
+        )
+        val = out.stdout.strip() if out.returncode == 0 else ""
+        return (val, "keychain:grip-anthropic") if val else (None, "")
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return (None, "")
+
+
+# The default --model resolves from HAL's canonical model catalogue
+# (single source of truth) at runtime, so it never silently goes stale
+# on a model release — syscall-doctrine: model selection routes through
+# HAL, not a baked literal. Fail-safe to a sane current id if the
+# catalogue is absent (e.g. HAL not cloned) so the demo still runs.
+_MODEL_FALLBACK = "claude-opus-4-7"
+_MODEL_CATALOGUE = _HOME / ".hal" / "config" / "model_catalog.yaml"
+
+
+def _default_model() -> str:
+    """Primary Anthropic Opus id from HAL's model_catalog.yaml.
+
+    Returns the first ``anthropic/claude-opus-*`` catalogue address
+    (the catalogue lists the primary tier first). Falls back to a
+    current literal only when the catalogue is unreadable — never
+    raises, so a missing HAL clone degrades to a working default
+    instead of a crash.
+    """
+    try:
+        for line in _MODEL_CATALOGUE.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if s.startswith("- address:") and "anthropic/claude-opus-" in s:
+                return s.split("anthropic/", 1)[1].strip()
+    except OSError:
+        pass
+    return _MODEL_FALLBACK
+
+
+def _resolve_chat_fn(model: str, max_tokens: int):
+    for fn in (_from_env, _from_keychain):
+        bearer, label = fn()
+        if bearer:
+            hal_runtime = _load_hal_runtime()
+            chat_fn = hal_runtime.make_anthropic_chat_fn(
+                api_key=bearer, model=model, max_tokens=max_tokens,
+            )
+            return chat_fn, label
+    raise RuntimeError(
+        f"No Anthropic auth available. Set {_ENV_VAR} env var OR "
+        "run: security add-generic-password -s grip-anthropic -a $USER -w sk-ant-..."
+    )
+
+
+def _build_grounded_question(question: str, ground_paths: list[str] | None) -> str:
+    """Prepend canonical grounding excerpts to the seed question.
+
+    Each path's content is read verbatim and concatenated in argument order
+    under a ``## Canonical Grounding`` header. Returns the unchanged question
+    when ``ground_paths`` is empty/None. Raises FileNotFoundError on missing
+    files (fail-loud — silent grounding loss is the bug Rule 21-bis prevents).
+    """
+    if not ground_paths:
+        return question
+    sections = []
+    for path in ground_paths:
+        text = Path(path).read_text(encoding="utf-8")
+        sections.append(f"### Source: {path}\n{text}")
+    grounding = "## Canonical Grounding\n\n" + "\n\n".join(sections)
+    return f"{grounding}\n\n## Question\n\n{question}"
+
+
+def _print_conversation(result) -> None:
+    print(f"\n# Conversation {result.convo_id}")
+    print(f"# Terminated: {result.terminated_reason}")
+    print(f"# Turns: {result.turns}, Elapsed: {result.elapsed_sec:.2f}s")
+    if result.interventions:
+        print(f"# Supervisor interventions: {len(result.interventions)}")
+    print()
+    for m in result.final_messages:
+        print(f"--- {m.sender_id} ---")
+        print(m.content)
+        print()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run a 2-agent AGORA conversation against real Claude API.")
+    parser.add_argument("question", nargs="?", default="What is 2+2? Answer in one word.")
+    parser.add_argument("--model", default=_default_model())
+    parser.add_argument("--turns", type=int, default=6)
+    parser.add_argument("--max-tokens", type=int, default=512)
+    parser.add_argument(
+        "--ground-with",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="Prepend file contents as canonical grounding (Rule 21-bis). Repeatable; preserves order.",
+    )
+    args = parser.parse_args()
+    args.question = _build_grounded_question(args.question, args.ground_with)
+
+    try:
+        chat_fn, label = _resolve_chat_fn(args.model, args.max_tokens)
+    except RuntimeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    print(f"# Auth: {label} | Model: {args.model} | Turn cap: {args.turns}", file=sys.stderr)
+
+    bus = MessageBus()
+    agents = [
+        AgoraAgent(agent_id="claude_a", chat_fn=chat_fn),
+        AgoraAgent(agent_id="claude_b", chat_fn=chat_fn),
+    ]
+    runner = ConversationRunner(bus, RunnerLimits(turn_cap=args.turns))
+    opening = Message(sender_id="user", recipients=["*"], content=args.question)
+    result = runner.run(agents, opening)
+    _print_conversation(result)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

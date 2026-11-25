@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# grip-spend -- model spend over the last ten days, against the cap V>> set and
+# its allocations (config/spend-allocations.json). Reports; never enforces
+# (V>> 2026-10-02). Reads AGORA's per-sitting cost markers through gh and the
+# local usage chain. See lib/spend_ledger.py.
+set -euo pipefail
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+source "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib/venv-utils.sh"
+if ! PY="$(resolve_venv_python "$CLAUDE_DIR/venv")"; then
+  echo "[grip-spend] no Python interpreter found (searched $CLAUDE_DIR/venv, then PATH)" >&2
+  exit 1
+fi
+exec env PYTHONPATH="$CLAUDE_DIR" "$PY" -m lib.spend_ledger "$@"

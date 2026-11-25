@@ -1,0 +1,861 @@
+#!/usr/bin/env bash
+# grip-codex-ladder — billing fallback ladder for OpenAI models via Codex.
+#
+# Operator requirement (V>> 2026-08-18):
+#   1. Codex SUBSCRIPTION first (rotating across the ChatGPT Business accounts).
+#   2. If the subscription cap is hit -> the OpenAI API key.
+#   3. If the API key has no credits -> a fallback model via HAL
+#      (Anthropic subscription first, then DeepSeek).
+# Hard constraints: NEVER OpenRouter. Prefer subscription-funded tokens.
+#
+# Every mechanism below was verified on codex 0.147.0 on 2026-08-18:
+#   * CODEX_HOME isolates auth per account (each home carries its own auth.json).
+#   * -p/--profile layers "$CODEX_HOME/<name>.config.toml" over the base config.
+#   * forced_login_method accepts "chatgpt" | "apikey" (serde enum LoginMethod).
+#   * codex doctor --json emits checks["auth.credentials"].status — a FREE,
+#     zero-inference preflight, so a dead rung is skipped without spending a token.
+#   * A run's rollout JSONL carries rate_limits.rate_limit_reached_type, a 5-value
+#     enum, plus credits.has_credits — the machine-readable cap signal.
+#
+# Exit codes: 0 a rung served the request; 3 every rung was exhausted;
+# 2 a usage error; 4 a rung stopped on an ordinary codex error that exited 1
+# (never passed through as 1, which inside the ladder means "exhausted, try the
+# next rung"). Any other code is passed through verbatim from codex.
+
+set -uo pipefail
+
+GRIP_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+# GRIP_CODEX_BIN wins; else the codex on PATH; else Homebrew's usual place. A
+# recipient who installed codex with npm has it on PATH and nowhere else
+# (the gift-kit review, 2026-10-16).
+CODEX_BIN="${GRIP_CODEX_BIN:-$(command -v codex 2>/dev/null || echo /opt/homebrew/bin/codex)}"
+ACCOUNTS_FILE="${GRIP_CODEX_ACCOUNTS:-$GRIP_DIR/config/codex-accounts.json}"
+STATE_DIR="${GRIP_CODEX_LADDER_STATE:-$GRIP_DIR/state/codex-ladder}"
+COOLDOWN_FILE="$STATE_DIR/cooldowns.json"
+LOG_FILE="$STATE_DIR/ladder.jsonl"
+
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+
+log() { printf '[ladder] %s\n' "$*" >&2; }
+
+# Append one audit record. Never fatal — telemetry must not break a launch.
+audit() {
+    local rung="$1" account="$2" outcome="$3" detail="${4:-}"
+    python3 - "$LOG_FILE" "$rung" "$account" "$outcome" "$detail" <<'PY' 2>/dev/null || true
+import json, sys, time, pathlib
+path, rung, account, outcome, detail = sys.argv[1:6]
+rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+       "rung": rung, "account": account, "outcome": outcome, "detail": detail}
+p = pathlib.Path(path)
+p.parent.mkdir(parents=True, exist_ok=True)
+with p.open("a") as fh:
+    fh.write(json.dumps(rec) + "\n")
+PY
+}
+
+usage() {
+    cat >&2 <<'EOF'
+Usage: grip-codex-ladder [--dry-run] [--status] [--subscription-only] [--] <codex args...>
+
+  --status     Show each rung's readiness (free; runs no inference) and exit.
+  --dry-run    Print the rung that would serve the request, run nothing.
+  --subscription-only  Stop after rung 1; never try paid or HAL fallbacks.
+
+Everything after -- is passed verbatim to codex. With no codex args the ladder
+launches interactive codex on the first healthy rung.
+
+Accounts registry (JSON):  $GRIP_CODEX_ACCOUNTS  (default
+$CLAUDE_DIR/config/codex-accounts.json)
+  {"accounts": [{"slug": "codetonight", "codex_home": "~/.codex-codetonight",
+                 "label": "CODETONIGHT"}, ...]}
+Register accounts with:  grip-codex-account add <slug> [label]
+EOF
+}
+
+# ---------------------------------------------------------------- accounts ---
+# Rung 1 rotates over these. An absent or malformed registry degrades to the
+# single default home rather than failing — a missing registry must never make
+# codex unlaunchable.
+read_accounts() {
+    python3 - "$ACCOUNTS_FILE" <<'PY'
+import json, os, re, sys, pathlib
+path = pathlib.Path(os.path.expanduser(sys.argv[1]))
+rows = []
+
+def one_line(value):
+    # Each row goes to bash as one line of tab-separated fields, so a tab or a
+    # line break inside a field is a field or row break: every later field, the
+    # pin included, moves out of its place. Each becomes a space.
+    return re.sub(r"[\t\r\n]+", " ", str(value))
+
+if path.exists():
+    try:
+        data = json.loads(path.read_text())
+        for a in data.get("accounts", []):
+            slug = one_line(a.get("slug", "")).strip()
+            home = os.path.expanduser(one_line(a.get("codex_home", "")).strip())
+            if slug and home:
+                # A null or empty pin means "not pinned"; str(None) is the text
+                # "None", which read as a pin no home matches. A label with
+                # nothing in it becomes the slug: `read` folds an empty field
+                # away, which moved the pin into the label's place.
+                label = one_line(a.get("label") or "").strip() or slug
+                rows.append((slug, home, label, one_line(a.get("workspace_id") or "")))
+    except Exception:
+        rows = []
+if not rows:
+    rows = [("default", os.path.expanduser(os.environ.get("CODEX_HOME", "~/.codex")), "default", "")]
+for slug, home, label, workspace in rows:
+    print(f"{slug}\t{home}\t{label}\t{workspace}")
+PY
+}
+
+workspace_matches() {
+    python3 - "$1/auth.json" "$2" <<'PY'
+import json, pathlib, sys
+try:
+    actual = json.loads(pathlib.Path(sys.argv[1]).read_text()).get("tokens", {}).get("account_id")
+except (OSError, ValueError, AttributeError):
+    actual = None
+sys.exit(0 if actual == sys.argv[2] else 1)
+PY
+}
+
+# ------------------------------------------------------------- cooldowns -----
+# A rung that reported a cap is parked until its reset time, so the ladder does
+# not re-probe a known-capped account on every launch.
+in_cooldown() {
+    local key="$1"
+    python3 - "$COOLDOWN_FILE" "$key" <<'PY' 2>/dev/null
+import json, sys, time, pathlib
+path, key = sys.argv[1], sys.argv[2]
+p = pathlib.Path(path)
+if not p.exists():
+    sys.exit(1)
+try:
+    states = json.loads(p.read_text())
+except Exception:
+    sys.exit(1)
+until = states.get(key, 0)
+sys.exit(0 if float(until) > time.time() else 1)
+PY
+}
+
+set_cooldown() {
+    local key="$1" until_epoch="$2"
+    python3 - "$COOLDOWN_FILE" "$key" "$until_epoch" <<'PY' 2>/dev/null || true
+import json, sys, pathlib
+path, key, until = sys.argv[1], sys.argv[2], float(sys.argv[3])
+p = pathlib.Path(path)
+p.parent.mkdir(parents=True, exist_ok=True)
+try:
+    states = json.loads(p.read_text()) if p.exists() else {}
+except Exception:
+    states = {}
+states[key] = until
+p.write_text(json.dumps(states, indent=1))
+PY
+}
+
+# ------------------------------------------------------------- preflight -----
+# FREE readiness probe: `codex doctor` performs no inference, so a rung whose
+# credentials plainly do not resolve is skipped for nothing.
+#
+# Two traps, both measured on 0.147.0, both avoided here:
+#
+#   * doctor's EXIT CODE is not an auth verdict. It exits 1 when any check fails
+#     — including network.provider_reachability — while auth.credentials is
+#     perfectly "ok". Gating on it would skip a healthy SUBSCRIPTION during a
+#     network blip and drop to the paid rung, which is the single most expensive
+#     mistake this ladder could make. So the exit code is ignored and only the
+#     auth.credentials verdict is read.
+#   * doctor is NOT a liveness check. It reports a garbage credential as
+#     "present", so a pass here means "credentials resolve", never "this rung
+#     will serve". Actual exhaustion is detected after the run, from the
+#     structured signals in classify_last_run.
+#
+# Unreadable output is therefore treated as READY, not as broken: a preflight
+# that cannot speak must not be the thing that demotes a working rung.
+rung_ready() {
+    local home="$1"; shift
+    local out
+    out="$(CODEX_HOME="$home" "$CODEX_BIN" doctor --json "$@" 2>/dev/null < /dev/null)"
+    [[ -z "$out" ]] && return 0
+    printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)          # unparseable -> do not demote on our own blindness
+c = d.get("checks", {}).get("auth.credentials")
+if not isinstance(c, dict):
+    sys.exit(0)          # check absent -> same reasoning
+sys.exit(0 if c.get("status") in ("ok", "pass") else 1)
+' 2>/dev/null
+}
+
+# Read the newest rollout for a CODEX_HOME and classify the billing outcome.
+# Prints one of: ok | cap | credits | unknown  (plus an optional reset epoch).
+#
+# The enum is codex_protocol::protocol::RateLimitReachedType, verified in the
+# 0.147.0 binary:
+#   rate_limit_reached, workspace_owner_credits_depleted,
+#   workspace_member_credits_depleted, workspace_owner_usage_limit_reached,
+#   workspace_member_usage_limit_reached
+#
+# ABSENCE of a snapshot is reported as "unknown", never as "ok" — only a request
+# that actually reached the ChatGPT backend emits one, so treating a missing
+# snapshot as healthy would be a confident false negative.
+#
+# On reading a file that may still be written (AGORA concern): no lock is taken,
+# deliberately. Two reasons. The rollout is an append-only JSONL and each line is
+# parsed inside its own try/except, so a torn final line is SKIPPED rather than
+# crashing or half-parsing — the loop keeps the last COMPLETE snapshot it saw.
+# And in the sequential ladder this runs after the codex process has exited, so
+# there is no concurrent writer to race. flock would add a failure mode (a stale
+# lock parks a healthy account) to protect against one the parser already absorbs.
+# The caveat worth stating: a future FAN-OUT that classifies while a sibling run
+# is still writing would need this revisited — the newest-by-mtime pick could then
+# select a file with no complete snapshot yet, which lands as "unknown", not as a
+# false "ok". Unknown is the safe direction, so even that degrades correctly.
+classify_last_run() {
+    local home="$1"
+    python3 - "$home" <<'PY' 2>/dev/null || echo "unknown 0"
+import json, os, sys, pathlib
+home = pathlib.Path(os.path.expanduser(sys.argv[1]))
+sessions = home / "sessions"
+if not sessions.exists():
+    print("unknown 0"); raise SystemExit
+files = sorted(sessions.rglob("rollout-*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+if not files:
+    print("unknown 0"); raise SystemExit
+snap = None
+for line in files[0].read_text(errors="replace").splitlines():
+    try:
+        obj = json.loads(line)
+    except Exception:
+        continue
+    found = None
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            if "rate_limit_reached_type" in cur:
+                found = cur
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+    if found:
+        snap = found
+if not snap:
+    print("unknown 0"); raise SystemExit
+reached = snap.get("rate_limit_reached_type")
+primary = snap.get("primary") or {}
+reset = primary.get("resets_at") or 0
+if reached:
+    kind = "credits" if "credits_depleted" in str(reached) else "cap"
+    print(f"{kind} {reset}"); raise SystemExit
+# DELETED, and the deletion is the fix. This used to read:
+#
+#   if credits and not credits.get("has_credits") and not credits.get("unlimited"):
+#       print(f"credits {reset}")
+#
+# on the theory that a zero balance is a stop "even when the enum has not flipped
+# yet". It is not. Measured 2026-08-18 on three healthy team accounts that had each
+# just answered correctly: every one reports
+#   credits {has_credits: false, unlimited: false, balance: null}
+# because that is the ordinary steady state of a FLAT-FEE plan — there is no credit
+# balance to have. So the heuristic classified health as depletion.
+#
+# The consequence was the exact inverse of fail-closed. In run_rung1 the cap|credits
+# case sits BEFORE the rc==0 success check, so a successful run never returned
+# served: it parked the account for seven days, moved to the next, parked that one
+# too, then fell out of rung 1 entirely and onto the metered API key. Three healthy
+# flat-fee subscriptions would have caused real per-token spend.
+#
+# rate_limit_reached_type above is the authoritative signal, and run_rung2's prose
+# backstop covers a cap that never reaches the rollout.
+print(f"ok {reset}")
+PY
+}
+
+# ------------------------------------------------------- config overrides ----
+# Codex reads -c overrides at one level only. Measured on codex-cli 0.156.1 on
+# 2026-10-05 with CODEX_HOME=~/.codex-ct, whose config.toml defaults
+# model_provider to hal-gateway:
+#
+#   codex -c model_provider=openai exec ... 'Reply ok'                        -> provider: openai
+#   codex -c model_provider=openai exec ... -c model_reasoning_effort=low ... -> provider: hal-gateway
+#   codex exec ... -c model_provider=openai -c model_reasoning_effort=low ... -> provider: openai
+#
+# Once the subcommand carries a -c of its own, the root-level ones are dropped and
+# the config default takes over. HAL's gateway maps "openai" to api.openai.com with
+# the keychain key grip-openai (~/.hal/lib/hal/gateway_egress.py), and that call
+# came back "Quota exceeded" -- the metered API key, reached from the rung that is
+# meant to be the subscription, without rung 2's opt-in.
+#
+# Two more rules, measured the same day against a provider that cannot connect:
+# a repeated -c key resolves to the LAST one, and -m/--model beats -c model= in
+# either order. So placing the overrides is not enough. The ladder owns the keys it
+# sets: it puts its overrides right after the subcommand (or first, with no
+# subcommand) and drops the caller's -c for those keys, plus the caller's -m when
+# the rung sets the model. Codex also accepts the glued spellings -cKEY=V, -c=KEY=V
+# and -mNAME (measured the same way), so those are dropped too.
+CONFIG_SUBCOMMANDS=" exec e review resume fork "
+
+# config_key <KEY=VALUE>: the key a -c value sets, spaces removed.
+config_key() {
+    local k="${1%%=*}"
+    printf '%s' "${k// /}"
+}
+
+# owned_arg_width <owned keys> <arg> [next arg]
+# Prints how many argv entries to drop for a -c or -m whose key the ladder owns: 2
+# when the value is the next entry, 1 when it is glued on (--config=, -c=, -cKEY=V,
+# --model=, -mNAME), and 0 to keep the argument.
+owned_arg_width() {
+    local owned="$1" arg="$2" next="${3-}" value width=1
+    case "$arg" in
+        -m|--model)     [[ "$owned" == *" model "* ]] && echo 2 || echo 0; return ;;
+        --model=*|-m?*) [[ "$owned" == *" model "* ]] && echo 1 || echo 0; return ;;
+        -c|--config)    value="$next"; width=2 ;;
+        --config=*)     value="${arg#--config=}" ;;
+        -c=*)           value="${arg#-c=}" ;;
+        -c?*)           value="${arg#-c}" ;;
+        *)              echo 0; return ;;
+    esac
+    [[ "$owned" == *" $(config_key "$value") "* ]] && echo "$width" || echo 0
+}
+
+# place_overrides <override...> -- <codex arg...>
+# Sets PLACED to the codex argv with the overrides where codex reads them and the
+# caller's competing values for the same keys removed. Everything after a "--" in
+# the codex args is kept verbatim.
+place_overrides() {
+    local -a overrides=() rest=()
+    local owned=" " sub="" n
+    while [[ $# -gt 0 && "$1" != "--" ]]; do
+        overrides+=("$1")
+        [[ "$1" == *=* ]] && owned+="$(config_key "$1") "
+        shift
+    done
+    [[ $# -gt 0 ]] && shift
+    if [[ $# -gt 0 && "$CONFIG_SUBCOMMANDS" == *" $1 "* ]]; then
+        sub="$1"
+        shift
+    fi
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "--" ]]; then
+            rest+=("$@")
+            break
+        fi
+        n="$(owned_arg_width "$owned" "$@")"
+        [[ "$n" -gt $# ]] && n=$#
+        if [[ "$n" -gt 0 ]]; then
+            shift "$n"
+            continue
+        fi
+        rest+=("$1")
+        shift
+    done
+    if [[ -n "$sub" ]]; then
+        PLACED=("$sub" "${overrides[@]}" ${rest[@]+"${rest[@]}"})
+    else
+        PLACED=("${overrides[@]}" ${rest[@]+"${rest[@]}"})
+    fi
+}
+
+# ------------------------------------------------------------------ rungs ----
+# The code a rung returns when it stops on an ordinary error. main() reads a 1
+# from a rung as "exhausted, try the next", and codex itself exits 1 on most
+# ordinary errors, so passing that through re-ran a failed task on the HAL rung
+# while the log said "stopping" (measured 2026-10-08). A 1 becomes 4.
+stop_code() {
+    if [[ "$1" -eq 1 ]]; then echo 4; else echo "$1"; fi
+}
+
+run_rung1() {
+    local slug home label workspace rc
+    RUNG1_UNRESETTABLE=0
+    RUNG1_ROOM_SKIPPED=0
+    # fd 9 keeps account rows away from codex exec - on stdin.
+    while IFS=$'\t' read -r -u 9 slug home label workspace; do
+        [[ -z "$slug" ]] && continue
+        if [[ -n "${GRIP_CODEX_RESET_RETRY_SLUG:-}" && "$slug" != "$GRIP_CODEX_RESET_RETRY_SLUG" ]]; then
+            continue
+        fi
+        _rung1_eligible "$slug" "$home" "$label" "$workspace" || continue
+        log "rung 1 [$label] — ChatGPT subscription"
+        audit rung1 "$slug" attempt ""
+        [[ -n "${LADDER_DRY_RUN:-}" ]] && { echo "would run: rung 1 [$label] CODEX_HOME=$home"; return 0; }
+        _rung1_launch "$home" "$@"
+        _rung1_outcome "$slug" "$home" "$label" && return 0
+        rc=$?
+        [[ $rc -ne 1 ]] && return $rc
+    done 9< <(read_accounts)
+    if [[ -z "${GRIP_CODEX_RESET_RETRY_SLUG:-}" && -z "${LADDER_DRY_RUN:-}" && "${GRIP_CODEX_AUTO_RESET:-1}" != "0" && $RUNG1_UNRESETTABLE -eq 0 ]]; then
+        _rung1_auto_retry "$@" && return 0
+        rc=$?
+        [[ $rc -ne 1 ]] && return $rc
+    fi
+    # Every seat that was skipped only for room may still have had some: the reset
+    # spends a credit only on a seat that has run out, so without this pass the job
+    # would not start at all. Start it as the ladder did before the room check; if
+    # it caps, every seat then reads full and the reset fires as designed. One extra
+    # pass at most: inside it the check is off, so nothing is skipped for room.
+    if [[ $RUNG1_ROOM_SKIPPED -gt 0 && "${GRIP_CODEX_ROOM_CHECK:-1}" != "0" ]]; then
+        log "rung 1: no seat had room to finish this job -- starting it on the first ready seat anyway"
+        GRIP_CODEX_ROOM_CHECK=0 run_rung1 "$@" && return 0
+        rc=$?
+        [[ $rc -ne 1 ]] && return $rc
+    fi
+    return 1
+}
+
+_rung1_eligible() {
+    local slug="$1" home="$2" label="$3" workspace="$4"
+    if in_cooldown "rung1:$slug"; then
+        log "rung 1 [$label] parked until its cap resets — skipping"
+        audit rung1 "$slug" skipped "cooldown"
+        return 1
+    fi
+    if [[ ! -d "$home" ]]; then
+        RUNG1_UNRESETTABLE=1
+        log "rung 1 [$label] has no CODEX_HOME at $home — skipping"
+        audit rung1 "$slug" skipped "no home"
+        return 1
+    fi
+    if [[ -n "$workspace" ]] && ! workspace_matches "$home" "$workspace"; then
+        RUNG1_UNRESETTABLE=1
+        log "rung 1 [$label] workspace mismatch -- skipping"
+        audit rung1 "$slug" skipped "workspace mismatch"
+        return 1
+    fi
+    if ! rung_ready "$home" -c model_provider=openai -c forced_login_method=chatgpt; then
+        RUNG1_UNRESETTABLE=1
+        log "rung 1 [$label] auth does not resolve — skipping"
+        audit rung1 "$slug" skipped "auth unresolved"
+        return 1
+    fi
+    # Too little room is the one skip a reset can cure, so it never sets
+    # RUNG1_UNRESETTABLE: the automatic reset decides for itself whether to fire.
+    if ! seat_has_room "$home" "$label"; then
+        RUNG1_ROOM_SKIPPED=$(( ${RUNG1_ROOM_SKIPPED:-0} + 1 ))
+        audit rung1 "$slug" skipped "too little room"
+        return 1
+    fi
+    return 0
+}
+
+# A seat called ready can still be too full to finish the job: Codex then runs
+# out mid-job and falls into that workspace's credit pool (measured 2026-10-12, a
+# seat at 86% died after 44,669 tokens). lib/codex_seat_room.py reads the seat's
+# last rate-limit snapshot from its session files (the one classify_last_run
+# reads), so it spawns nothing, and exits 3 only on a known shortfall. Any other
+# code, a crash's 1 included, leaves the seat in, as does a seat with no snapshot.
+# The job declares its size in $GRIP_CODEX_JOB_SIZE.
+seat_has_room() {
+    local lib why rc=0
+    lib="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" 2>/dev/null && pwd)" || return 0
+    [[ -f "$lib/codex_seat_room.py" ]] || return 0
+    why="$(python3 "$lib/codex_seat_room.py" --home "$1" 2>/dev/null)" || rc=$?
+    if [[ $rc -eq 3 ]]; then
+        log "rung 1 [$2] has too little room to finish this job ($why) -- skipping"
+        return 1
+    fi
+    return 0
+}
+
+# A seat whose login the server rejects (HTTP 401) cannot serve until someone signs
+# it in again, and codex doctor cannot see that: it reads only the stored login
+# (GRIP#9071). `grip-resets probe` asks the server once. It reads the seat's
+# limits and runs no inference. Only its exit 4, the 401, counts, and exit 0 is any
+# other answer. Either way the seat is otherwise left as it was. Sets
+# SIGNED_OUT_CODE to the server's reason. Any other exit means the check did not
+# complete: the probe could not read the seat (exit 3) or could not run at all.
+# That would turn this check off without a word, so the log says so and prints the
+# command that shows why. The probe's own error text stays off the screen
+# (GRIP#9099, GRIP#9121).
+seat_signed_out() {
+    local out rc=0 probe
+    probe="${GRIP_RESETS_BIN:-$(dirname "${BASH_SOURCE[0]}")/grip-resets}"
+    SIGNED_OUT_CODE=""
+    out="$("$probe" probe "$1" 2>/dev/null < /dev/null)" || rc=$?
+    if [[ $rc -eq 4 ]]; then
+        SIGNED_OUT_CODE="${out#signed_out }"
+        return 0
+    fi
+    [[ $rc -eq 0 ]] || log "could not ask whether $1 is signed in: grip-resets probe exited $rc -- run: $(probe_rerun "$probe" "$1")"
+    return 1
+}
+
+# The command that reruns one probe as the ladder ran it: the Codex binary the
+# probe was given and both paths, shell-quoted so it pastes as one exact command
+# even when a path holds spaces or shell characters (Codex review, GRIP#9121).
+probe_rerun() {
+    local binary=""
+    [[ -n "${GRIP_CODEX_BIN:-}" ]] && binary="GRIP_CODEX_BIN=$(printf '%q' "$GRIP_CODEX_BIN") "
+    printf '%s%q probe %q' "$binary" "$1" "$2"
+}
+
+_rung1_launch() {
+    local home="$1"; shift
+    RUNG1_CAPTURE=""
+    rewind_stdin
+    place_overrides -c model_provider=openai -c forced_login_method=chatgpt -- "$@"
+    if [[ -t 1 ]]; then
+        CODEX_HOME="$home" OPENAI_API_KEY= CODEX_API_KEY= "$CODEX_BIN" "${PLACED[@]}"
+        RUNG1_RC=$?
+    else
+        RUNG1_CAPTURE="$(mktemp "${TMPDIR:-/tmp}/grip-ladder-r1.XXXXXX")"
+        CODEX_HOME="$home" OPENAI_API_KEY= CODEX_API_KEY= "$CODEX_BIN" "${PLACED[@]}" 2>&1 \
+            | tee "$RUNG1_CAPTURE"
+        RUNG1_RC=${PIPESTATUS[0]}
+    fi
+}
+
+# Prose backstop for a cap absent from the structured rollout: codex's OWN closing
+# error and nothing else. `codex exec` ends a failed run with a line that starts
+# "ERROR:", or under --json with an event line that starts {"type":"error" or
+# {"type":"turn.failed". Under --json the job's own text sits inside {"type":"item.
+# lines, which the anchor leaves out.
+# The match is the LAST line of a failed run, once blank lines and the "tokens used"
+# trailer with its count are set aside. Nothing the job printed can follow codex's
+# closing error, so a line the job printed earlier is never read, even when it starts
+# "ERROR:" and codex then fails for another reason. Six captured failed runs end this
+# way: the error line twice, then "tokens used" and a count.
+# Searching the whole capture matched the job's own output: on 2026-10-12 a worker
+# that read source saying "its own usage limit reached" finished normally, was
+# called capped twice, and its 135,000-token job ran on three seats.
+_closing_error_names_cap() {
+    local capture="$1" rc="$2" last
+    local own='^(ERROR:|\{"type":"(error|turn\.failed)")'
+    local cap='(hit your usage limit|usage limit reached|reached your usage limit)'
+    [[ "$rc" -ne 0 && -n "$capture" ]] || return 1
+    last="$(tail -n 8 "$capture" 2>/dev/null \
+        | grep -vE '^tokens used$|^[^[:alpha:]]*$' | tail -n 1)"
+    grep -qiE "${own}.*${cap}" <<<"$last"
+}
+
+_rung1_outcome() {
+    local slug="$1" home="$2" label="$3" verdict reset
+    read -r verdict reset < <(classify_last_run "$home")
+    if [[ "$verdict" != "cap" && "$verdict" != "credits" ]]; then
+        if _closing_error_names_cap "$RUNG1_CAPTURE" "$RUNG1_RC"; then
+            verdict="cap"
+            log "rung 1 [$label] cap detected in output (prose backstop)"
+        fi
+    fi
+    [[ -n "$RUNG1_CAPTURE" ]] && rm -f "$RUNG1_CAPTURE"
+    if [[ "$verdict" == "cap" || "$verdict" == "credits" ]]; then
+        log "rung 1 [$label] reported $verdict — advancing"
+        audit rung1 "$slug" "$verdict" "reset=$reset"
+        [[ "$reset" =~ ^[0-9]+$ && "$reset" -gt 0 ]] && set_cooldown "rung1:$slug" "$reset"
+        return 1
+    fi
+    if [[ $RUNG1_RC -eq 0 ]]; then
+        audit rung1 "$slug" served ""
+        return 0
+    fi
+    # A seat the server has signed out cannot finish any job, so the next seat is
+    # tried, as after a cap. It leaves RUNG1_UNRESETTABLE alone: a seat that cannot
+    # serve holds no room for a reset credit to protect (GRIP#9071).
+    if seat_signed_out "$home"; then
+        log "rung 1 [$label] is signed out ($SIGNED_OUT_CODE) -- sign in with: grip-codex-account login $slug -- advancing"
+        audit rung1 "$slug" signed_out "$SIGNED_OUT_CODE"
+        return 1
+    fi
+    log "rung 1 [$label] exited $RUNG1_RC with no cap signal — not a billing failure, stopping"
+    audit rung1 "$slug" error "rc=$RUNG1_RC"
+    return "$(stop_code "$RUNG1_RC")"
+}
+
+_rung1_auto_retry() {
+    local output slug
+    output="$("${GRIP_RESETS_BIN:-$(dirname "${BASH_SOURCE[0]}")/grip-resets}" spend --auto --json 2>/dev/null < /dev/null)" || return 1
+    slug="$(printf '%s' "$output" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("slug", "") if d.get("status") == "reset" else "")' 2>/dev/null)"
+    [[ -z "$slug" ]] && return 1
+    log "rung 1 [$slug] reset credit redeemed — retrying once"
+    set_cooldown "rung1:$slug" 0
+    GRIP_CODEX_RESET_RETRY_SLUG="$slug" run_rung1 "$@"
+}
+
+run_rung2() {
+    local -a args=("$@")
+    local key="rung2:openai"
+    # The OpenAI API key is paid, per-token spend. GPT runs on the ChatGPT
+    # subscription (rules/gpt-on-the-subscription-never-credits.md), so this rung
+    # runs only on an explicit opt-in; without it the ladder goes to rung 3.
+    if [[ "${GRIP_CODEX_ALLOW_PAID:-}" != "1" ]]; then
+        log "rung 2 skipped -- it bills the OpenAI API key; set GRIP_CODEX_ALLOW_PAID=1 to allow it"
+        audit rung2 openai skipped "no opt-in"
+        return 1
+    fi
+    if in_cooldown "$key"; then
+        log "rung 2 parked (no credits) — skipping to rung 3"
+        audit rung2 openai skipped "cooldown"
+        return 1
+    fi
+    local api_key
+    api_key="$(security find-generic-password -s grip-openai -w 2>/dev/null || true)"
+    if [[ -z "$api_key" ]]; then
+        log "rung 2 unavailable — keychain 'grip-openai' is empty"
+        audit rung2 openai skipped "no key"
+        return 1
+    fi
+    log "rung 2 — OpenAI API key"
+    audit rung2 openai attempt ""
+    [[ -n "${LADDER_DRY_RUN:-}" ]] && { echo "would run: rung 2 (OpenAI API key)"; return 0; }
+
+    local out rc
+    place_overrides -c model_provider=openai -c forced_login_method=api \
+        -- ${args[@]+"${args[@]}"}
+    rewind_stdin
+    out="$(OPENAI_API_KEY="$api_key" CODEX_API_KEY="$api_key" \
+        "$CODEX_BIN" "${PLACED[@]}" 2>&1)"
+    rc=$?
+    printf '%s\n' "$out"
+
+    # Verified verbatim from OpenAI on 2026-08-18 via this exact path.
+    if printf '%s' "$out" | grep -qE "You have no credits remaining|insufficient_quota|credit_balance_exhausted"; then
+        log "rung 2 has no credits — advancing to rung 3"
+        audit rung2 openai credits "no credits remaining"
+        set_cooldown "$key" "$(( $(date +%s) + 3600 ))"
+        return 1
+    fi
+    if [[ $rc -eq 0 ]]; then
+        audit rung2 openai served ""
+        return 0
+    fi
+    log "rung 2 exited $rc with no billing signal — stopping"
+    audit rung2 openai error "rc=$rc"
+    return "$(stop_code "$rc")"
+}
+
+run_rung3() {
+    local -a args=("$@")
+    # Order here is set by what was VERIFIED end to end on 2026-08-18, not by
+    # preference alone:
+    #
+    #   deepseek-v4-pro     -> answered correctly through the gateway.
+    #   claude-sonnet-4-6   -> FAILED: "Your credit balance is too low to access
+    #                          the Anthropic API."
+    #
+    # That failure is not the Anthropic subscription running out. HAL CAN bill a
+    # Claude subscription — CCH, the Claude Code Handshake (lib/hal/utils/cch.py),
+    # signs a request with an OAuth token plus an x-anthropic-billing-header so
+    # Anthropic charges the subscription rather than per-token credits. The
+    # capability is implemented — though note it has not been observed serving
+    # here: every live attempt returned HTTP 429 rate_limit_error. That is a
+    # quota answer, not an auth one (401 would mean the signing was rejected), so
+    # the handshake is accepted and the allowance is the blocker.
+    #
+    # It is simply not wired to THIS path. CCH is used by subscription.py,
+    # tool_runtime.py, tool_cli_integration.py and happi/providers/anthropic.py,
+    # and by none of gateway_responses.py / gateway_openai.py / gateway_egress.py
+    # — the modules serving the OpenAI wire Codex speaks (wire_api="responses").
+    # On that wire anthropic_upstream_headers rewrites `Authorization: Bearer`
+    # into `x-api-key` with no sk-ant-oat guard, unlike the raw relay which
+    # preserves an OAuth Bearer (gateway.py:251-252). So the request lands on the
+    # BILLED key, which has no credit. A wiring gap, not a capability gap.
+    #
+    # Two reasons the order stays this way even after that wiring lands, both from
+    # a sealed cross-provider council (seal 048b2fcb, IDR precog-1787076799-865cac9c,
+    # judged by a non-Anthropic model, verdict unanimous):
+    #
+    #   * A fallback rung exists to work UNATTENDED, once everything above it has
+    #     failed. Proven reliability therefore outranks zero marginal cost — a free
+    #     rung that does not answer is worth less than a cheap rung that does.
+    #   * CREDENTIAL ISOLATION. The CCH subscription is the same quota the
+    #     operator's own Claude Code session draws on; a 429 was observed on it
+    #     while that session was running. A fallback pointed there degrades the
+    #     operator's primary environment at exactly the moment it fires. DeepSeek
+    #     carries an isolated, non-expiring key with no refresh machinery.
+    #
+    # So promoting claude-sonnet-4-6 needs more than the gateway wiring: it needs
+    # quota isolation from the operator's own session, and a real health check
+    # (subscription.py:195 currently returns bool(token), which cannot see a 429).
+    # Until then this order is the honest one, and either target can be overridden.
+    local -a targets=(
+        "${GRIP_CODEX_FALLBACK_MODEL:-deepseek-v4-pro}"
+        "${GRIP_CODEX_FALLBACK_MODEL_2:-claude-sonnet-4-6}"
+    )
+    local gw_key
+    gw_key="$(security find-generic-password -s grip-anthropic-external -w 2>/dev/null || true)"
+
+    # Fail fast on a dead gateway. AGORA flagged that rung 3 can stall forever if
+    # HAL is unreachable, which is right — this is the LAST rung, so a hang there
+    # is the whole ladder hanging with nothing left to fall through to.
+    #
+    # Its suggested fix (`timeout 180`) would not have run: macOS ships no GNU
+    # timeout and gtimeout is not installed here either — both verified absent.
+    # Wrapping the call is also the wrong shape regardless, because rung 3 may be
+    # a legitimate long interactive session and a wall-clock kill would murder it.
+    #
+    # So the check goes on REACHABILITY instead of duration: one bounded probe of
+    # the gateway before dispatching. Portable, kills nothing that is working, and
+    # addresses the actual failure (gateway down or hung) rather than its symptom.
+    if ! curl -s --max-time 5 -o /dev/null "${GRIP_HAL_GATEWAY_URL:-http://127.0.0.1:4010}/v1/models"; then
+        log "rung 3 unavailable — HAL gateway did not answer within 5s"
+        audit rung3 gateway skipped "unreachable"
+        return 1
+    fi
+
+    for model in "${targets[@]}"; do
+        log "rung 3 — HAL fallback ($model)"
+        audit rung3 "$model" attempt ""
+        [[ -n "${LADDER_DRY_RUN:-}" ]] && { echo "would run: rung 3 ($model via HAL)"; return 0; }
+        place_overrides -c model_provider=hal-gateway -c "model=$model" \
+            -- ${args[@]+"${args[@]}"}
+        rewind_stdin
+        HAL_GATEWAY_KEY="${gw_key:-hal-local}" \
+            "$CODEX_BIN" "${PLACED[@]}"
+        local rc=$?
+        if [[ $rc -eq 0 ]]; then
+            audit rung3 "$model" served ""
+            return 0
+        fi
+        log "rung 3 target $model exited $rc — trying next fallback"
+        audit rung3 "$model" error "rc=$rc"
+    done
+    return 1
+}
+
+# ----------------------------------------------------------------- status ----
+show_status() {
+    echo "Codex billing ladder — rung readiness (free preflight, no inference)"
+    echo
+    echo "Rung 1 — ChatGPT subscription:"
+    # The sign-in probe asks the server and may wait out its timeout, so every seat
+    # is asked at once and the answers are read after: a hung server costs one
+    # timeout, not one per seat (Codex review, GRIP#9098).
+    local probes row mark n=0
+    local -a rows=()
+    probes="$(mktemp -d "${TMPDIR:-/tmp}/grip-ladder-status.XXXXXX")" || probes=""
+    while IFS=$'\t' read -r -u 9 slug home label workspace; do
+        n=$((n + 1))
+        mark="ready"
+        [[ -d "$home" ]] || mark="NO HOME ($home)"
+        if [[ "$mark" == "ready" && -n "$workspace" ]]; then
+            workspace_matches "$home" "$workspace" || mark="workspace mismatch"
+        fi
+        if [[ "$mark" == "ready" ]]; then
+            rung_ready "$home" -c model_provider=openai -c forced_login_method=chatgpt \
+                || mark="auth unresolved"
+        fi
+        in_cooldown "rung1:$slug" && mark="capped (cooling down)"
+        # A signed-out seat still cannot serve when its cooldown ends, so its sign-in
+        # problem is the mark to show, over a cooldown too (Codex review, GRIP#9098).
+        if [[ -n "$probes" && ( "$mark" == "ready" || "$mark" == "capped (cooling down)" ) ]]; then
+            ( exec 9<&-; seat_signed_out "$home" && printf '%s' "$SIGNED_OUT_CODE" > "$probes/$n" ) &
+        fi
+        rows+=("$(printf '  %-16s %-14s' "$slug" "$label")"$'\t'"$mark")
+    done 9< <(read_accounts)
+    wait
+    n=0
+    for row in "${rows[@]+"${rows[@]}"}"; do
+        n=$((n + 1))
+        mark="${row#*$'\t'}"
+        [[ -n "$probes" && -f "$probes/$n" ]] && mark="signed out ($(< "$probes/$n"))"
+        printf '%s %s\n' "${row%%$'\t'*}" "$mark"
+    done
+    [[ -n "$probes" ]] && rm -rf "$probes"
+    echo
+    printf 'Rung 2 — OpenAI API key: '
+    if [[ "${GRIP_CODEX_ALLOW_PAID:-}" != "1" ]]; then
+        echo "off (paid spend; GRIP_CODEX_ALLOW_PAID=1 allows it)"
+    elif security find-generic-password -s grip-openai -w >/dev/null 2>&1; then
+        in_cooldown "rung2:openai" && echo "key present, NO CREDITS (cooling down)" || echo "key present"
+    else
+        echo "no key in keychain 'grip-openai'"
+    fi
+    printf 'Rung 3 — HAL fallback:   '
+    if curl -s --max-time 3 -o /dev/null http://127.0.0.1:4010/v1/models; then
+        echo "gateway up on :4010 (${GRIP_CODEX_FALLBACK_MODEL:-deepseek-v4-pro}, then ${GRIP_CODEX_FALLBACK_MODEL_2:-claude-sonnet-4-6})"
+    else
+        echo "gateway NOT reachable on :4010"
+    fi
+}
+
+# ------------------------------------------------------------------ stdin ----
+# A prompt piped to `codex exec -` can be read only once. The first seat used to
+# use it up, so after a cap the next seat started with "No prompt provided via
+# stdin." and the ladder stopped (measured 2026-10-12). The prompt is read once
+# into a file, and every codex run reads that file from its start.
+LADDER_STDIN_FILE=""
+buffer_stdin_prompt() {
+    local arg
+    [[ -t 0 ]] && return 0
+    for arg in "$@"; do
+        [[ "$arg" == "-" ]] || continue
+        LADDER_STDIN_FILE="$(mktemp "${TMPDIR:-/tmp}/grip-ladder-prompt.XXXXXX")"
+        trap 'rm -f "$LADDER_STDIN_FILE"' EXIT
+        cat > "$LADDER_STDIN_FILE"
+        return 0
+    done
+    return 0
+}
+
+rewind_stdin() {
+    [[ -n "$LADDER_STDIN_FILE" ]] && exec 0< "$LADDER_STDIN_FILE"
+    return 0
+}
+
+# With a prompt argument, `codex exec` also reads stdin when stdin is not a
+# terminal, and waits for it to end. A socket never ends: a Claude Code tool shell
+# hands its commands one (measured 2026-11-25), so codex printed "Reading
+# additional input from stdin..." and gave no answer for 8.5 hours (GRIP#9181).
+# A socket or a device is therefore replaced by /dev/null, with a note on stderr,
+# so input that was meant for codex is never dropped in silence (AGORA on
+# GRIP#9750). A pipe, a file, a terminal or /dev/null itself is left alone, so
+# `git diff | grip-codex-ladder -- exec "review this"` still hands codex the diff.
+# bin/grip-codex applies the same test before it runs codex directly.
+close_idle_stdin() {
+    [[ -p /dev/stdin || -f /dev/stdin || -t 0 || /dev/stdin -ef /dev/null ]] && return 0
+    log "stdin is a socket or a device that may never end; codex gets an empty input instead (GRIP#9181)"
+    exec 0< /dev/null
+}
+
+# ------------------------------------------------------------------- main ----
+main() {
+    local subscription_only=0
+    local -a passthru=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --status)  show_status; return 0 ;;
+            --subscription-only) subscription_only=1; shift ;;
+            --dry-run) LADDER_DRY_RUN=1; shift ;;
+            -h|--help) usage; return 0 ;;
+            --)        shift; passthru+=("$@"); break ;;
+            *)         passthru+=("$1"); shift ;;
+        esac
+    done
+
+    if [[ ! -x "$CODEX_BIN" ]]; then
+        log "codex not found at $CODEX_BIN (set GRIP_CODEX_BIN)"
+        return 2
+    fi
+    buffer_stdin_prompt "${passthru[@]+"${passthru[@]}"}"
+    [[ -n "$LADDER_STDIN_FILE" ]] || close_idle_stdin
+
+    run_rung1 "${passthru[@]+"${passthru[@]}"}" && return 0
+    local rc=$?
+    [[ $rc -ne 1 ]] && return $rc
+
+    if [[ $subscription_only -eq 1 ]]; then
+        log "subscription accounts exhausted; no fallback permitted"
+        return 3
+    fi
+
+    run_rung2 "${passthru[@]+"${passthru[@]}"}" && return 0
+    rc=$?
+    [[ $rc -ne 1 ]] && return $rc
+
+    run_rung3 "${passthru[@]+"${passthru[@]}"}" && return 0
+
+    log "every rung is exhausted — no subscription, no credits, no HAL fallback"
+    audit ladder all exhausted ""
+    return 3
+}
+
+main "$@"

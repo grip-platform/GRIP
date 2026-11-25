@@ -1,0 +1,37 @@
+GRIP - General Reasoning & Intelligence Platform
+(begun as Claude Optim, grown through CIPS - the Claude Instance Preservation System)
+Copyright (C) 2024-2026 Lourens Cornelius Scheepers / CodeTonight (Pty) Ltd
+
+This product includes architectural patterns and concepts from:
+
+- Cortex by Tomas Hjertefolger
+  Copyright (c) 2025 Tomas Hjertefolger
+  Licensed under MIT License
+  https://github.com/hjertefolger/cortex
+
+  GRIP adapted the following patterns from Cortex:
+  * Hybrid search architecture (vector + keyword + recency)
+  * Reciprocal Rank Fusion (RRF) algorithm
+  * Auto-archival system design
+  * SQLite FTS5 integration patterns
+  * Backup rotation strategy
+
+  See LICENSES/MIT-Cortex.txt for full license text.
+  See ACKNOWLEDGMENTS.md for detailed attribution.
+
+- anthropics/claude-for-legal
+  Copyright (c) Anthropic PBC
+  Licensed under the Apache License, Version 2.0
+  https://github.com/anthropics/claude-for-legal
+
+  The skills/legal-ops workflow shapes and legal-domain content (practice
+  verticals, reviewer-note and privilege gates, tag vocabulary) are absorbed
+  from claude-for-legal, cloned 2026-07-02. GRIP's additions on top are
+  GRASP receipts, IDR-signed decisions, a deterministic citation floor,
+  HAL's model-agnostic routing, and the HAPPI protocol surface.
+
+  See LICENSES/Apache-2.0.txt for full license text.
+  See ACKNOWLEDGMENTS.md for detailed attribution.
+
+This product is distributed under the GNU Affero General Public License v3.0 only.
+See LICENSE for details. Commercial licences: licensing@codetonight.co.za

@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# grip-launch-permissions -- the one way to choose, per machine, whether the sessions
+# GRIP launches skip Claude Code's own permission prompts. Writes the gitignored
+# config/launch.local.json; bin/grip reads it at every launch through
+# lib/launch_permissions.py.
+#
+#   grip-launch-permissions skip     # this machine's launches add --dangerously-skip-permissions
+#   grip-launch-permissions prompt   # this machine's launches keep Claude Code's prompts (GRIP's gates stay on)
+#   grip-launch-permissions off      # remove the file, which means prompt
+#   grip-launch-permissions show     # print the mode in force: skip or prompt
+#
+# A fresh install has no file and launches with prompts. The operator's own machines
+# opt in once with `skip` (V>>'s ruling of 2026-10-18 on the one-folder product plan,
+# question 1: host prompts plus gates for every non-operator profile). A caller's own
+# --dangerously-skip-permissions on the grip command line is passed through regardless.
+#
+# Library: lib/launch_permissions.py, stdlib only. Runs under the GRIP venv
+# (rules/never-system-python-for-grip.md), the same way bin/grip-model-default does.
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+lib="$CLAUDE_DIR/lib/launch_permissions.py"
+
+case "${1:-}" in
+    ""|-h|--help) exec bash "$CLAUDE_DIR/lib/grip-python.sh" "$lib" --help ;;
+    show|off) exec bash "$CLAUDE_DIR/lib/grip-python.sh" "$lib" "$@" ;;
+    skip|prompt) exec bash "$CLAUDE_DIR/lib/grip-python.sh" "$lib" set "$1" ;;
+    *)
+        >&2 echo "grip-launch-permissions: unknown mode '$1' (skip | prompt | off | show)"
+        exit 2
+        ;;
+esac

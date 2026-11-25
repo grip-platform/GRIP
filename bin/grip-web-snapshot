@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""grip-web-snapshot — write the live GRIP state snapshot for the web dashboard.
+
+Pure stdlib. Reads the real GRIP substrate (genome, per-operator genomes, HAL
+provider limits, the signed witness rail) and probes the local services. Writes
+``apps/grip-web/public/snapshot.json`` which the dashboard polls — works on
+static hosting too (each deploy ships the latest snapshot).
+
+Honesty invariant: every field is either measured or absent. A service that
+cannot be probed is ``"unknown"``, never ``"up"``. A chain that cannot be
+verified is ``"unverified"``, never ``"ok"``.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+GRIP = Path(os.environ.get("GRIP_DIR", str(Path.home() / ".grip")))
+HAL = Path(os.environ.get("HAL_HOME", str(Path.home() / ".hal")))
+OUT = Path(os.environ.get(
+    "GRIP_WEB_SNAPSHOT_OUT",
+    str(GRIP / "apps" / "grip-web" / "public" / "snapshot.json")))
+
+
+def probe(url: str, timeout: float = 2.0) -> str:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return str(r.status)
+    except Exception:
+        return "down"
+
+
+def probe_gateway_health() -> dict:
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:4010/health", timeout=2.0) as r:
+            body = json.loads(r.read().decode("utf-8", "replace"))
+            return {"status": "up" if body.get("ok") else "down",
+                    "brake": bool(body.get("brake", {}).get("engaged"))}
+    except Exception:
+        return {"status": "down", "brake": False}
+
+
+def load_json(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
+
+
+def domain_means(genes: dict) -> dict:
+    doms = {"delight": [], "evo_calibration": [], "hypothesis_accuracy": []}
+    for g in genes.values():
+        df = g.get("domain_fitness") or {}
+        for k in doms:
+            v = df.get(k)
+            if isinstance(v, (int, float)):
+                doms[k].append(float(v))
+    return {k: (round(sum(v) / len(v), 4) if v else None) for k, v in doms.items()}
+
+
+def build() -> dict:
+    genome = load_json(GRIP / "data" / "genome-shared.json") or {}
+    genes = genome.get("genes") or {}
+    ranked = sorted(
+        genes.items(),
+        key=lambda kv: float(kv[1].get("fitness") or 0.0))
+    top = [{"name": n, "fitness": round(float(g.get("fitness") or 0), 4),
+            "component_type": g.get("component_type", "?")}
+           for n, g in reversed(ranked[-6:])]
+    bottom = [{"name": n, "fitness": round(float(g.get("fitness") or 0), 4),
+               "component_type": g.get("component_type", "?")}
+              for n, g in ranked[:5]]
+    fitnesses = [float(g.get("fitness") or 0) for _, g in ranked]
+
+    team = []
+    for p in sorted((GRIP / "data" / "genomes").glob("*.json")):
+        if p.name.startswith("_"):
+            continue
+        g = load_json(p) or {}
+        gs = g.get("genes") or {}
+        fits = [float(v.get("fitness") or 0) for v in gs.values()]
+        team.append({
+            "operator": g.get("operator", p.stem),
+            "name": g.get("operator_name", p.stem),
+            "generation": g.get("exported_from_gen"),
+            "exported_at": g.get("exported_at"),
+            "gene_count": g.get("gene_count", len(gs)),
+            "mean_fitness": round(sum(fits) / len(fits), 4) if fits else None,
+        })
+    team.sort(key=lambda t: t.get("exported_at") or "", reverse=True)
+
+    limits = load_json(HAL / "state" / "hal" / "limits.json") or {}
+    usage = {}
+    for prov, v in limits.items():
+        if isinstance(v, dict):
+            usage[prov] = {
+                "utilisation": round(float(v.get("utilisation") or 0), 3),
+                "status": v.get("status", "unknown"),
+            }
+
+    chain_verify, last_witness, recent = "unverified", None, []
+    sys.path.insert(0, str(HAL))
+    try:
+        from lib.hal.gateway_witness import signed_key_path, signed_log_path
+        from lib.hal.voice.audit import verify_chain
+        log_path = signed_log_path()
+        if log_path.exists() and log_path.stat().st_size > 0:
+            lines = log_path.read_text(errors="replace").strip().splitlines()
+            last_line = lines[-1]
+            try:
+                last_witness = json.loads(last_line)
+            except Exception:
+                last_witness = {"raw": last_line[:200]}
+            key = signed_key_path().read_bytes().strip() if signed_key_path().exists() else None
+            if key:
+                try:
+                    # Cross-file verification: the rail ROTATES (voice.audit.rotation
+                    # rows link each file to the previous archive's last hmac), so a
+                    # single-file verify from GENESIS false-flags line 1 of the current
+                    # file as TAMPERED (found 2026-08-26). Verify archives + current
+                    # in order, threading each file's last hmac into the next.
+                    prev = None  # None = verify_chain's GENESIS default
+                    chain_ok, chain_bad = True, None
+                    files = sorted(log_path.parent.glob(log_path.name + ".*")) + [log_path]
+                    for f in files:
+                        ok, bad = (verify_chain(f, key) if prev is None
+                                   else verify_chain(f, key, initial_prev_hmac=prev))
+                        if not ok:
+                            chain_ok, chain_bad = False, f"{f.name}:{bad}"
+                            break
+                        rows = [l for l in f.read_text(errors="replace").strip().splitlines() if l]
+                        if rows:
+                            prev = json.loads(rows[-1]).get("hmac", prev)
+                    chain_verify = "ok" if chain_ok else f"fail_{chain_bad}"
+                except UnicodeDecodeError:
+                    # The rail genuinely contains non-UTF8 bytes — say so,
+                    # never claim 'ok' and never fake a line number.
+                    chain_verify = "unreadable_utf8"
+            # Witness wall rows — ALLOWLISTED fields only (Claude council leg,
+            # leak gate): metadata + hashes, NEVER payload text (prompts /
+            # hostnames / client ids live in payload). Each row also carries a
+            # public content_hash so a visitor can re-verify the displayed
+            # bytes in their own browser (WebCrypto SHA-256) without the HMAC
+            # secret, which never leaves this machine.
+            import hashlib
+            for raw_line in reversed(lines[-12:]):
+                try:
+                    row = json.loads(raw_line)
+                except Exception:
+                    continue
+                pl = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+                allow = {
+                    "event": str(row.get("event", "")),
+                    "ts": str(row.get("ts", "")),
+                    "provider": str(pl.get("provider", "")),
+                    "model": str(pl.get("model", "")),
+                    "path": str(pl.get("path", "")),
+                    "latency_ms": pl.get("latency_ms"),
+                    "failed_over": bool(pl.get("failed_over", False)),
+                    "audit_id": str(row.get("audit_id", "")),
+                    "hmac": str(row.get("hmac", "")),
+                    "prev_hmac": str(row.get("prev_hmac", "")),
+                }
+                canonical = json.dumps(allow, sort_keys=True, separators=(",", ":"))
+                allow["content_hash"] = hashlib.sha256(canonical.encode()).hexdigest()
+                recent.append(allow)
+    except Exception as e:  # noqa: BLE001 — the panel must render without HAL
+        chain_verify = f"unverified ({type(e).__name__})"
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generation": genome.get("exported_from_gen"),
+        "exported_at": genome.get("exported_at"),
+        "gene_count": genome.get("gene_count", len(genes)),
+        "gene_fingerprint": genome.get("genome_fingerprint"),
+        "domain_means": domain_means(genes),
+        "mean_fitness": round(sum(fitnesses) / len(fitnesses), 4) if fitnesses else None,
+        "top_genes": top,
+        "weakest_genes": bottom,
+        "team": team,
+        "usage": {"providers": usage, "chain_verify": chain_verify,
+                  "last_witness": last_witness, "recent_witnesses": recent},
+        "services": {
+            "grip-web": {"status": probe("http://127.0.0.1:3000/")},
+            "hal-gateway": probe_gateway_health(),
+            "hal-server": {"status": probe("http://127.0.0.1:3850/")},
+            "grip-channel": {"status": probe("http://127.0.0.1:3101/health")},
+            "vps-council": {"status": probe("http://100.64.0.10:8791/")},
+        },
+    }
+
+
+def shielded_json(snap: dict, denylist=None) -> tuple[str, int]:
+    """The snapshot as JSON text after GRIP's public redaction shield has run over
+    it, and the number of spans it replaced. The file is served from a public site,
+    and per-operator genome names come from the encrypted per-operator genome
+    files, so a listed name reached the public snapshot once (2026-10-11); the
+    shield at the write is what stops that recurring. ``denylist`` defaults to the
+    machine's live denylist (the tracked file plus the private overlay); a test
+    passes its own. Returns the text unchanged with a count of -1 when the shield
+    cannot be imported, so a missing module is visible in the summary line rather
+    than silently writing unshielded text."""
+    text = json.dumps(snap, indent=2)
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+        from redaction_shield import Shield, load_denylist  # noqa: E402
+    except ImportError:
+        return text, -1
+    result = Shield(load_denylist() if denylist is None else denylist).redact(text)
+    return result.text, len(result.spans)
+
+
+def main() -> int:
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    snap = build()
+    text, replaced = shielded_json(snap)
+    if replaced < 0:
+        print("snapshot NOT written: the redaction shield could not be imported", file=sys.stderr)
+        return 2
+    OUT.write_text(text)
+    print(f"snapshot -> {OUT}  gen={snap['generation']}  "
+          f"genes={snap['gene_count']}  chain={snap['usage']['chain_verify']}  shield={replaced} replaced")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

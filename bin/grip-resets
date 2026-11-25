@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec "$here/bin/grip-py" "$here/lib/subscription_resets.py" "$@"

@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""grasp-bot — CodeTonight GRASP Google bot CLI (read-only, receipts always).
+
+Thin CLI over lib/grasp_google.py — the sovereign gog syscall shim. Every
+operation is capability-locked read-only (no send, no mutate) and every
+result prints its receipts (message ids + dates) so a skeptic can replay.
+
+Subcommands:
+  accounts                              known alias -> email registry
+  auth                                  accounts with a stored Google login
+  search <account> <query> [--max N]    Gmail search with receipts
+  thread <account> <thread_id>          one thread, per-message receipts
+  attach <account> <message_id> [--out DIR]   download attachments
+  brief  <account> <query> [question]   HAL summary + receipts (fail-soft)
+
+--raw prints the JSON payload instead of human-readable text.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
+from lib.grasp_google import (  # noqa: E402
+    GogError,
+    auth_status,
+    brief,
+    gmail_attachments,
+    gmail_search,
+    gmail_thread,
+    known_accounts,
+)
+
+
+# ---------------------------------------------------------------------------
+# Handlers: argparse Namespace -> JSON-able payload dict
+# ---------------------------------------------------------------------------
+def _cmd_accounts(_args: argparse.Namespace) -> dict:
+    return {"accounts": known_accounts()}
+
+
+def _cmd_auth(_args: argparse.Namespace) -> dict:
+    return {"accounts": auth_status()}
+
+
+def _cmd_search(args: argparse.Namespace) -> dict:
+    return {"receipts": gmail_search(args.account, args.query, args.max)}
+
+
+def _cmd_thread(args: argparse.Namespace) -> dict:
+    return gmail_thread(args.account, args.thread_id)
+
+
+def _cmd_attach(args: argparse.Namespace) -> dict:
+    paths = gmail_attachments(args.account, args.message_id, args.out)
+    return {"message_id": args.message_id, "files": paths}
+
+
+def _cmd_brief(args: argparse.Namespace) -> dict:
+    return brief(args.account, args.query, args.question)
+
+
+# ---------------------------------------------------------------------------
+# Human renderers (receipts always visible)
+# ---------------------------------------------------------------------------
+def _print_receipt_lines(receipts: list) -> None:
+    for r in receipts:
+        print(f"{r.get('message_id', '?')}  {r.get('date', '?')}  "
+              f"{r.get('from', '?')}  {r.get('subject', '')}")
+        if r.get("snippet"):
+            print(f"    {r['snippet']}")
+
+
+def _render_accounts(payload: dict) -> None:
+    for alias, email in sorted(payload["accounts"].items()):
+        print(f"{alias:10s} -> {email}")
+
+
+def _render_auth(payload: dict) -> None:
+    accounts = payload["accounts"]
+    if not accounts:
+        print("No Google logins stored. Run: gog auth add <email>")
+        return
+    for entry in accounts:
+        print(entry.get("email") or json.dumps(entry, ensure_ascii=False))
+
+
+def _render_search(payload: dict) -> None:
+    receipts = payload["receipts"]
+    print(f"{len(receipts)} result(s):")
+    _print_receipt_lines(receipts)
+
+
+def _render_thread(payload: dict) -> None:
+    print(f"Thread {payload['thread_id']} ({payload['account']}) — "
+          f"{len(payload['messages'])} message(s):")
+    _print_receipt_lines(payload["messages"])
+
+
+def _render_attach(payload: dict) -> None:
+    files = payload["files"]
+    print(f"{len(files)} attachment(s) from message {payload['message_id']}:")
+    for path in files:
+        print(f"  {path}")
+
+
+def _render_brief(payload: dict) -> None:
+    print(payload["answer"])
+    print(f"\nReceipts ({len(payload['receipts'])}):")
+    _print_receipt_lines(payload["receipts"])
+
+
+_RENDERERS = {
+    "accounts": _render_accounts,
+    "auth": _render_auth,
+    "search": _render_search,
+    "thread": _render_thread,
+    "attach": _render_attach,
+    "brief": _render_brief,
+}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="grasp-bot", description=__doc__.split("\n")[1]
+    )
+    parser.add_argument("--raw", action="store_true",
+                        help="Print raw JSON instead of human-readable output")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("accounts", help="Known alias -> email registry").set_defaults(func=_cmd_accounts)
+    sub.add_parser("auth", help="Accounts with a stored Google login").set_defaults(func=_cmd_auth)
+
+    p = sub.add_parser("search", help="Gmail search with receipts")
+    p.add_argument("account")
+    p.add_argument("query")
+    p.add_argument("--max", type=int, default=20, help="Max results (default 20)")
+    p.set_defaults(func=_cmd_search)
+
+    p = sub.add_parser("thread", help="One thread, per-message receipts")
+    p.add_argument("account")
+    p.add_argument("thread_id")
+    p.set_defaults(func=_cmd_thread)
+
+    p = sub.add_parser("attach", help="Download a message's attachments")
+    p.add_argument("account")
+    p.add_argument("message_id")
+    p.add_argument("--out", default="grasp-attachments",
+                   help="Output directory (default ./grasp-attachments)")
+    p.set_defaults(func=_cmd_attach)
+
+    p = sub.add_parser("brief", help="HAL summary + receipts (fail-soft)")
+    p.add_argument("account")
+    p.add_argument("query")
+    p.add_argument("question", nargs="?", default=None,
+                   help="Optional question to answer over the results")
+    p.set_defaults(func=_cmd_brief)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        payload = args.func(args)
+    except (GogError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if args.raw:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        _RENDERERS[args.command](payload)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

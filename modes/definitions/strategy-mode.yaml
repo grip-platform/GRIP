@@ -1,0 +1,122 @@
+name: strategy
+description: Strategic assessment, gap analysis, and decision-making
+version: 1.0.0
+effort: high
+triggers:
+- /mode strategy
+- strategic assessment
+- gap analysis
+- red team
+- pre-mortem
+- decision lock
+skills:
+  always:
+  - strat-ops
+  - leading-organisation
+  optional:
+  - pre-mortem-facilitation
+  - decision-locking
+  - red-teaming-strategic-decisions
+token_budget: ~3500
+foundation: true
+stacks_with:
+- ut++
+- asking-users
+- creating-wizards
+- hitl
+- hitl-decision-matrix
+- context-gate
+prompt_injection: '[MODE: STRATEGY]
+
+
+  Strategic thinking protocols active.
+
+
+  Available frameworks:
+
+  - Gap analysis (current vs desired state)
+
+  - Red-teaming (adversarial challenge of assumptions)
+
+  - Pre-mortem (prospective failure analysis)
+
+  - Decision locking (commit and document decisions)
+
+
+  Before strategic advice:
+
+  1. Clarify the decision context
+
+  2. Identify stakeholders and constraints
+
+  3. Surface hidden assumptions
+
+
+  During analysis:
+
+  - Challenge assumptions explicitly
+
+  - Consider second-order effects
+
+  - Map dependencies and risks
+
+
+  After analysis:
+
+  - Summarise decision criteria
+
+  - Lock decisions with /decision-lock if finalised
+
+  - Document rationale for future reference
+
+
+  ## Broly Auto-Activation
+
+
+  Broly is AUTO-ACTIVE in this mode at MESH level.
+
+  No /broly command needed -- UNLESS the operator has set the trigger to manual (check with `mode-loader.sh broly status`), in which case fan out ONLY on an explicit /broly. Assess task complexity and invoke automatically.
+
+
+  Default: MESH (Agent Team council, up to 15 agents)
+
+  Team pattern: council | Reasoning: tree-of-thought (tot)
+
+
+  MESH is the highest level. No further escalation available.
+
+
+  ### De-escalation to THREAD
+
+  - Single quick strategic question
+
+  - Clarifying a previous decision
+
+  - Simple status check
+
+
+  ### Budget
+
+  MESH uses ~5x tokens. De-escalate to THREAD for simple tasks.
+
+  AskUserQuestion if scope is unclear.
+
+  '
+wave:
+  category: domain_context
+broly:
+  enabled: true
+  default_level: mesh
+  team_pattern: council
+  reasoning_hint: tot
+  escalation: null
+  context:
+    recommended: 1000000
+    auto_extend: true
+context:
+- Business strategy
+- Technical architecture decisions
+- Team and resource allocation
+- Risk assessment
+- Competitive analysis
+welcome_message: Strategy mode active. Gap analysis, red-teaming, and decision locking available.

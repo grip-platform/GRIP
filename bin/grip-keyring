@@ -1,0 +1,174 @@
+#!/usr/bin/env sh
+# grip-keyring — canonical cross-platform secret-keystore installer for GRIP/HAL
+# provider API keys.  macOS · Linux · Windows.  Ratified V>>--<<V 2026-06-24.
+#
+#   Correct-by-construction · idempotent · value-blind.
+#
+# Banach-fold proof (idempotency):
+#   install() upserts each entry, so install(install(S)) = install(S).  The map
+#   contracts the keystore onto the fixed point F = { every manifest entry whose
+#   payload value is non-empty equals that value }.  Each entry converges in one
+#   step and re-application is a no-op — a fixed point of the install operator.
+#   `grip-keyring selftest` exercises put∘put=put and upsert-overwrites; if a
+#   future edit makes put non-idempotent (e.g. drops macOS -U), selftest FAILS.
+#
+# Secrets NEVER touch stdout — export/install report counts only.  The payload
+# file is plain text (NAME=VALUE, one per line); keep it private, chmod 600,
+# never commit it, transfer over trusted channels only.
+#
+# Usage:
+#   grip-keyring status            # present/missing per the manifest (no values)
+#   grip-keyring export [FILE]     # keystore  -> FILE  (NAME=VALUE; blanks for absent)
+#   grip-keyring install [FILE]    # FILE      -> keystore (idempotent upsert)
+#   grip-keyring selftest          # prove the Banach fold on a throwaway entry
+#
+# Default FILE: $HOME/Downloads/grip-keyring.SECRET.env
+set -u
+
+ACCOUNT="grip"
+DEFAULT_FILE="${HOME:-.}/Downloads/grip-keyring.SECRET.env"
+
+# Canonical GRIP/HAL LLM-provider keychain service names (one per line).
+# Derived from the HAL provider registry / the codex model picker.
+MANIFEST="grip-anthropic-external grip-openai grip-groq grip-gemini grip-xai grip-deepseek grip-dashscope grip-soruxgpt grip-zhipu grip-openrouter grip-mistral grip-moonshot grip-vulavula"
+
+OS="$(uname -s 2>/dev/null || echo unknown)"
+_die() { printf 'grip-keyring: %s\n' "$1" >&2; exit 1; }
+
+# --- platform backends -------------------------------------------------------
+# _kv_put NAME   (value read from stdin) — idempotent UPSERT
+# _kv_get NAME   (value written to stdout; non-zero if absent)
+case "$OS" in
+  Darwin)
+    # GET is service-keyed (matches GRIP's `find-generic-password -s NAME -w`,
+    # which ignores account). PUT purges every existing item for the service
+    # then adds one canonical (account=grip) — idempotent even when a prior
+    # entry used a different account, so the keystore converges to ONE entry.
+    _kv_put() { _v="$(cat)"; while security delete-generic-password -s "$1" >/dev/null 2>&1; do :; done; security add-generic-password -a "$ACCOUNT" -s "$1" -w "$_v" >/dev/null 2>&1; _v=''; }
+    _kv_get() { security find-generic-password -s "$1" -w 2>/dev/null; }
+    _kv_del() { while security delete-generic-password -s "$1" >/dev/null 2>&1; do :; done; }
+    # Runtime discovery of every grip-* service NAME present (svce/labl only —
+    # never -d, never values), so export/status capture the full set without a
+    # hardcoded inventory of sensitive entry names in this (mirror-synced) file.
+    _discover() { security dump-keychain 2>/dev/null | grep -oE '"(svce|labl)"<blob>="grip-[a-zA-Z0-9._-]+"' | grep -oE 'grip-[a-zA-Z0-9._-]+' | sort -u; }
+    ;;
+  Linux)
+    command -v secret-tool >/dev/null 2>&1 || _die "Linux backend needs 'secret-tool' (apt install libsecret-tools; a keyring daemon must be running)"
+    _kv_put() { secret-tool clear service "$1" >/dev/null 2>&1 || true; secret-tool store --label="$1" service "$1" account "$ACCOUNT"; }
+    _kv_get() { secret-tool lookup service "$1" 2>/dev/null; }
+    _kv_del() { secret-tool clear service "$1" >/dev/null 2>&1 || true; }
+    _discover() { :; }  # libsecret lacks a clean enumerate-all; the baseline manifest + the payload file cover Linux
+    ;;
+  MINGW*|MSYS*|CYGWIN*|Windows_NT)
+    # Windows Credential Vault via PowerShell. Implemented but untested on this
+    # host (this Mac); validate with `grip-keyring selftest` on the Windows box.
+    PS="$(command -v pwsh 2>/dev/null || command -v powershell 2>/dev/null)"
+    [ -n "$PS" ] || _die "Windows backend needs PowerShell (pwsh or powershell)"
+    _kv_put() {
+      GK_N="$1" GK_V="$(cat)" "$PS" -NoProfile -Command '
+        $v=[Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime]::new();
+        try { foreach($c in $v.FindAllByResource($env:GK_N)){ $v.Remove($c) } } catch {};
+        $v.Add([Windows.Security.Credentials.PasswordCredential]::new($env:GK_N,"grip",$env:GK_V))' >/dev/null 2>&1
+    }
+    _kv_get() {
+      GK_N="$1" "$PS" -NoProfile -Command '
+        $v=[Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime]::new();
+        try { $c=$v.Retrieve($env:GK_N,"grip"); $c.RetrievePassword(); [Console]::Out.Write($c.Password) } catch { exit 1 }' 2>/dev/null
+    }
+    _kv_del() {
+      GK_N="$1" "$PS" -NoProfile -Command '
+        $v=[Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime]::new();
+        try { foreach($c in $v.FindAllByResource($env:GK_N)){ $v.Remove($c) } } catch {}' >/dev/null 2>&1 || true
+    }
+    _discover() { "$PS" -NoProfile -Command '
+      $v=[Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime]::new();
+      try { $v.RetrieveAll() | ForEach-Object { $_.Resource } | Where-Object { $_ -like "grip-*" } | Sort-Object -Unique } catch {}' 2>/dev/null; }
+    ;;
+  *) _die "unsupported platform: $OS (need Darwin, Linux, or Windows)";;
+esac
+_kv_has() { _kv_get "$1" >/dev/null 2>&1; }
+
+# --- modes -------------------------------------------------------------------
+# union of the known baseline manifest + everything discovered in THIS keystore
+_all_names() { { printf '%s\n' $MANIFEST; _discover 2>/dev/null; } | grep -E '^grip-' | sort -u; }
+
+cmd_status() {
+  printf 'grip-keyring status — %s · account=%s\n' "$OS" "$ACCOUNT" >&2
+  p=0; a=0
+  for n in $(_all_names); do
+    if _kv_has "$n"; then printf '  [x] %s\n' "$n" >&2; p=$((p+1))
+    else printf '  [ ] %s  MISSING\n' "$n" >&2; a=$((a+1)); fi
+  done
+  printf '%d present · %d missing · %d total\n' "$p" "$a" "$((p+a))" >&2
+}
+
+cmd_export() {
+  out="${1:-$DEFAULT_FILE}"
+  # SAFETY (PARAMOUNT): never write secret VALUES where they could be committed
+  # or mirror-synced. Refuse any output path inside a git working tree.
+  od="$(dirname -- "$out")"; od="$(cd -- "$od" 2>/dev/null && pwd -P)" || _die "cannot resolve output directory for: $out"
+  if git -C "$od" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    _die "REFUSING to write secrets inside a git repo ($(git -C "$od" rev-parse --show-toplevel 2>/dev/null)). Pick a path OUTSIDE any repo, e.g. \$HOME/Downloads/grip-keyring.SECRET.env"
+  fi
+  umask 077
+  { printf '# GRIP secrets — SECRET. DO NOT COMMIT or share over untrusted channels. chmod 600.\n'
+    printf '# Generated %s on %s (%s).\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(hostname 2>/dev/null || echo host)" "$OS"
+    printf '# Install on the target machine:  grip-keyring install %s\n' "$out"
+    printf '# Format: one NAME=VALUE per line; no inline comments on value lines.\n\n'
+  } > "$out"
+  p=0; a=0
+  for n in $(_all_names); do
+    v="$(_kv_get "$n")"
+    if [ -n "${v:-}" ]; then
+      printf '%s=%s\n' "$n" "$v" >> "$out"; p=$((p+1))
+    else
+      printf '# NEEDS-VALUE: %s (absent on this machine)\n%s=\n' "$n" "$n" >> "$out"; a=$((a+1))
+    fi
+    v=''
+  done
+  chmod 600 "$out" 2>/dev/null || true
+  printf 'export: %d with values · %d need values -> %s (chmod 600)\n' "$p" "$a" "$out" >&2
+}
+
+cmd_install() {
+  in="${1:-$DEFAULT_FILE}"
+  [ -f "$in" ] || _die "payload file not found: $in (run 'grip-keyring export' first, or pass the path)"
+  ok=0; skip=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue;; esac
+    case "$line" in *=*) : ;; *) continue;; esac
+    name="${line%%=*}"; val="${line#*=}"
+    name="$(printf '%s' "$name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    val="$(printf '%s' "$val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    case "$name" in grip-*) : ;; *) continue;; esac
+    if [ -z "$val" ]; then printf '  skip %s (no value)\n' "$name" >&2; skip=$((skip+1)); continue; fi
+    if printf '%s' "$val" | _kv_put "$name"; then printf '  ok   %s\n' "$name" >&2; ok=$((ok+1))
+    else printf '  FAIL %s\n' "$name" >&2; fi
+    val=''
+  done < "$in"
+  printf 'install: %d installed · %d skipped -> %s keystore\n' "$ok" "$skip" "$OS" >&2
+}
+
+cmd_selftest() {
+  t="grip-keyring-selftest"
+  printf 'banach-fold selftest on %s (%s)\n' "$t" "$OS" >&2
+  printf 'v1' | _kv_put "$t"; a="$(_kv_get "$t")"
+  printf 'v1' | _kv_put "$t"; b="$(_kv_get "$t")"   # idempotent re-put: no change
+  printf 'v2' | _kv_put "$t"; c="$(_kv_get "$t")"   # upsert overwrites
+  _kv_del "$t"
+  [ "${a:-}" = v1 ] || _die "selftest FAIL: first put != v1 (got '${a:-}')"
+  [ "${b:-}" = v1 ] || _die "selftest FAIL: idempotent re-put changed state (got '${b:-}')"
+  [ "${c:-}" = v2 ] || _die "selftest FAIL: upsert did not overwrite (got '${c:-}')"
+  printf 'selftest PASS — put∘put=put (a=%s b=%s) · upsert overwrites (c=%s). Fixed point holds.\n' "$a" "$b" "$c" >&2
+}
+
+cmd="${1:-status}"
+[ "$#" -gt 0 ] && shift
+case "$cmd" in
+  status)   cmd_status ;;
+  export)   cmd_export "${1:-}" ;;
+  install)  cmd_install "${1:-}" ;;
+  selftest) cmd_selftest ;;
+  -h|--help|help) sed -n '2,32p' "$0" >&2 ;;
+  *) _die "usage: grip-keyring {status | export [FILE] | install [FILE] | selftest}" ;;
+esac

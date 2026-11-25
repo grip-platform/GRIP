@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+# grip-claude-dir-link — make ~/.claude point at the live GRIP repo (~/.grip).
+#
+# WHY THIS EXISTS
+#   On V>>'s Mac, ~/.claude is a symlink to ~/.grip, so "the GRIP directory"
+#   and "Claude Code's working state" are one directory. On A>> (Andre
+#   Theart)'s Windows 11 box they are two SEPARATE real directories: ~/.grip
+#   is the live repo, ~/.claude is a stale plain folder holding an older copy
+#   of Claude Code's working state. Two env vars in ~/.bashrc paper over the
+#   difference, so nothing LOOKS broken — but anything that reads ~/.claude
+#   directly gets weeks-old data (hooks/session-end.sh did exactly that).
+#
+#   V>> ratified Option A: archive the stale directory, then replace it with a
+#   real link to ~/.grip, matching the Mac.
+#
+# SAFETY DESIGN (the reason this is safe to run unattended)
+#   1. DRY-RUN BY DEFAULT. Nothing changes without --apply.
+#   2. ARCHIVE FIRST, VERIFY THE ARCHIVE, AND ONLY THEN TOUCH ANYTHING.
+#      The archive is a full copy outside both trees, verified by file count
+#      AND a per-file SHA-256 manifest re-hashed at the destination. A failed
+#      verification aborts the whole run before a single byte is moved.
+#   3. NOTHING IS EVER DELETED. The original directory is RENAMED aside
+#      (~/.claude.superseded-<timestamp>), so after a successful run TWO
+#      independent copies of the old data still exist on disk.
+#   4. IDEMPOTENT. A second run is a no-op, not damage.
+#   5. AUTO-ROLLBACK. If the post-link visibility probe fails, the link is
+#      removed and the original directory is renamed back, automatically.
+#
+# PLATFORM
+#   Windows/Git Bash uses a DIRECTORY JUNCTION (mklink /J, run through cmd), which
+#   needs no Developer Mode and no elevation. A plain `ln -s` under Git Bash
+#   may silently COPY instead of link unless MSYS=winsymlinks:nativestrict is
+#   set, which is why the junction is preferred. macOS/Linux use `ln -s`.
+#   cmd runs with MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*', so Git Bash leaves /c and /J alone.
+#
+#   NOTE the argument order inverts between the two:
+#       ln -s   <TARGET> <LINK>        (target first)
+#       mklink /J <LINK> <TARGET>      (link first)
+#   Getting that backwards creates a link pointing the wrong way. It is
+#   covered by tests/test_claude_dir_link.py.
+#
+# USAGE
+#   grip-claude-dir-link                 # dry run — prints the exact plan
+#   grip-claude-dir-link --apply         # do it
+#   grip-claude-dir-link --help
+#
+# OPTIONS
+#   --apply                 Make changes (default is dry-run).
+#   --claude-dir PATH       Override the link path      (default $HOME/.claude)
+#   --grip-dir PATH         Override the repo path      (default $HOME/.grip)
+#   --archive-root DIR      Where the archive is written
+#                           (default $HOME/grip-claude-archive)
+#   --log FILE              Append the run log here
+#                           (default <archive-root>/grip-claude-dir-link.log)
+#
+# TEST SEAM
+#   GRIP_LINK_PLATFORM overrides platform detection (e.g. MINGW64_NT-10.0) so
+#   the Windows plan can be rendered and asserted on a Mac. It only ever
+#   changes which command string is BUILT; --apply still refuses to execute a
+#   Windows plan on a non-Windows kernel.
+
+set -euo pipefail
+
+APPLY=0
+CLAUDE_DIR_ARG=""
+GRIP_DIR_ARG=""
+ARCHIVE_ROOT_ARG=""
+LOG_FILE_ARG=""
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+
+# --- tiny helpers -------------------------------------------------------------
+
+_log_line() { printf '%s\n' "$*"; [ -n "${LOG_FILE:-}" ] && printf '[%s] %s\n' "$TS" "$*" >>"$LOG_FILE" 2>/dev/null || true; }
+say()  { _log_line "$*"; }
+warn() { _log_line "WARN: $*" >&2; }
+die()  { _log_line "ERROR: $*" >&2; exit 1; }
+plan() { _log_line "  would: $*"; }
+
+usage() { sed -n '2,60p' "$0" >&2; exit 0; }
+
+# --- argument parsing ---------------------------------------------------------
+
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --apply)          APPLY=1; shift ;;
+            --claude-dir)     CLAUDE_DIR_ARG="${2:-}"; shift 2 ;;
+            --grip-dir)       GRIP_DIR_ARG="${2:-}"; shift 2 ;;
+            --archive-root)   ARCHIVE_ROOT_ARG="${2:-}"; shift 2 ;;
+            --log)            LOG_FILE_ARG="${2:-}"; shift 2 ;;
+            -h|--help)        usage ;;
+            *)                die "unknown argument: $1 (try --help)" ;;
+        esac
+    done
+}
+
+# --- platform -----------------------------------------------------------------
+
+platform() { printf '%s' "${GRIP_LINK_PLATFORM:-$(uname -s 2>/dev/null || echo unknown)}"; }
+
+is_windows() {
+    case "$(platform)" in MINGW*|MSYS*|CYGWIN*|Windows_NT) return 0 ;; *) return 1 ;; esac
+}
+
+# Convert a POSIX path to a Windows path. Uses cygpath when present (the real
+# Git Bash path); falls back to a pure-shell conversion so the Windows plan can
+# be rendered and tested on a Mac.
+winpath() {
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -w "$1"
+    else
+        printf '%s' "$1" | sed -E 's|^/([a-zA-Z])/|\1:/|' | tr '/' '\\'
+    fi
+}
+
+# Git Bash rewrites any argument that looks like a POSIX path before a native
+# Windows program sees it, and a lone switch such as "/J" looks like one. cmd
+# was handed "mklink J:/ <link> <target>", answered "Invalid switch", and
+# --apply rolled back (measured 2026-10-02 on git 2.50.1.windows.1; until then
+# no test had run the Windows branch). These two variables switch
+# the rewriting off for one command. MSYS_NO_PATHCONV is Git for Windows' own
+# switch and MSYS2_ARG_CONV_EXCL is MSYS2's; that build honoured each on its
+# own. With rewriting off, a switch is written once: "/c", not "//c".
+WIN_NO_PATHCONV="MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'"
+
+# The exact command that WOULD create the link, as a printable string.
+# Pure: builds a string, runs nothing. This is the mockable platform boundary.
+link_command() {
+    local target="$1" link="$2"
+    if is_windows; then
+        printf '%s cmd /c mklink /J "%s" "%s"' "$WIN_NO_PATHCONV" "$(winpath "$link")" "$(winpath "$target")"
+    else
+        printf 'ln -s "%s" "%s"' "$target" "$link"
+    fi
+}
+
+# The exact command that WOULD remove the link. On Windows that is cmd's rmdir,
+# which removes the junction and nothing it points at.
+unlink_command() {
+    local link="$1"
+    if is_windows; then printf '%s cmd /c rmdir "%s"' "$WIN_NO_PATHCONV" "$(winpath "$link")"
+    else printf 'rm "%s"' "$link"; fi
+}
+
+# --- checksum backend ---------------------------------------------------------
+
+sha_cmd() {
+    if command -v sha256sum >/dev/null 2>&1; then printf 'sha256sum'
+    elif command -v shasum >/dev/null 2>&1; then printf 'shasum -a 256'
+    else return 1; fi
+}
+
+# Write "<hash>  <relative-path>" for every regular file under $1, sorted.
+manifest_of() {
+    local root="$1" sha
+    sha="$(sha_cmd)" || die "no sha256sum or shasum on PATH — cannot verify the archive, refusing to continue"
+    ( cd "$root" && find . -type f -print0 | LC_ALL=C sort -z \
+        | xargs -0 -n 50 $sha 2>/dev/null ) | LC_ALL=C sort
+}
+
+count_files() { find "$1" -type f 2>/dev/null | wc -l | tr -d ' '; }
+
+# --- identity probe -----------------------------------------------------------
+#
+# The load-bearing check, and the reason this script is safe on Windows: it
+# asks the only question that matters — "is a file written under GRIP_DIR
+# visible under CLAUDE_DIR?" — instead of trusting `test -L`. Git Bash does
+# not reliably report an NTFS junction as a symlink, so a `-L` test alone
+# would fail to notice an already-linked directory and re-run the migration.
+# This probe is mechanism-independent and works identically on both platforms.
+same_directory() {
+    local grip="$1" claude="$2" probe rc=1
+    [ -d "$grip" ] || return 1
+    [ -e "$claude" ] || return 1
+    probe=".grip-link-probe-$TS-$$"
+    printf 'grip-claude-dir-link probe %s\n' "$TS" >"$grip/$probe" 2>/dev/null || return 1
+    if [ -f "$claude/$probe" ] && grep -q "$TS" "$claude/$probe" 2>/dev/null; then rc=0; fi
+    rm -f "$grip/$probe" 2>/dev/null || true
+    return $rc
+}
+
+# --- preflight ----------------------------------------------------------------
+
+preflight() {
+    [ -n "$GRIP_DIR" ] || die "grip dir is empty"
+    [ -d "$GRIP_DIR" ] || die "GRIP repo not found at $GRIP_DIR — nothing to link to"
+    git -C "$GRIP_DIR" rev-parse --git-dir >/dev/null 2>&1 \
+        || die "$GRIP_DIR is not a git repository — refusing to link ~/.claude at a non-repo"
+
+    if [ "$GRIP_DIR" = "$CLAUDE_DIR" ]; then
+        die "--claude-dir and --grip-dir are the same path ($GRIP_DIR) — refusing"
+    fi
+
+    if [ -L "$CLAUDE_DIR" ]; then
+        say "OK: $CLAUDE_DIR is already a symlink -> $(readlink "$CLAUDE_DIR" 2>/dev/null || echo '?')"
+        say "Nothing to do. (Idempotent: this run changed nothing.)"
+        exit 0
+    fi
+
+    if same_directory "$GRIP_DIR" "$CLAUDE_DIR"; then
+        say "OK: $CLAUDE_DIR already resolves to the same directory as $GRIP_DIR"
+        say "    (verified by writing a probe file under $GRIP_DIR and reading it back"
+        say "     under $CLAUDE_DIR — this is how an existing Windows junction is detected)"
+        say "Nothing to do. (Idempotent: this run changed nothing.)"
+        exit 0
+    fi
+
+    if [ -e "$CLAUDE_DIR" ] && [ ! -d "$CLAUDE_DIR" ]; then
+        die "$CLAUDE_DIR exists and is not a directory — refusing to touch it"
+    fi
+}
+
+# --- archive ------------------------------------------------------------------
+
+do_archive() {
+    local src="$1" dest="$2"
+    mkdir -p "$(dirname "$dest")" || die "cannot create archive root $(dirname "$dest")"
+    [ -e "$dest" ] && die "archive destination already exists: $dest"
+
+    say "Archiving $src -> $dest"
+    cp -R "$src" "$dest" || die "archive copy FAILED — nothing has been changed"
+
+    local n_src n_dest
+    n_src="$(count_files "$src")"
+    n_dest="$(count_files "$dest")"
+    say "  file count: source=$n_src archive=$n_dest"
+    [ "$n_src" = "$n_dest" ] \
+        || die "archive file-count MISMATCH (source=$n_src archive=$n_dest) — nothing has been changed"
+
+    say "  writing + verifying SHA-256 manifest"
+    manifest_of "$src"  >"$dest.MANIFEST.sha256"   || die "could not hash source — nothing has been changed"
+    manifest_of "$dest" >"$dest.MANIFEST.verify"   || die "could not hash archive — nothing has been changed"
+    if ! diff -q "$dest.MANIFEST.sha256" "$dest.MANIFEST.verify" >/dev/null 2>&1; then
+        die "archive CHECKSUM MISMATCH — see $dest.MANIFEST.sha256 vs .verify. Nothing has been changed."
+    fi
+    rm -f "$dest.MANIFEST.verify"
+    say "  archive verified: $n_src files, checksums match"
+}
+
+# --- rollback text ------------------------------------------------------------
+
+print_rollback() {
+    local link="$1" superseded="$2" archive="$3"
+    say ""
+    say "ROLLBACK (copy-paste to undo this run):"
+    say "  $(unlink_command "$link")"
+    say "  mv \"$superseded\" \"$link\""
+    say ""
+    say "If the superseded directory is gone, restore from the archive instead:"
+    say "  cp -R \"$archive\" \"$link\""
+    say ""
+}
+
+# --- main ---------------------------------------------------------------------
+
+main() {
+    parse_args "$@"
+
+    CLAUDE_DIR="${CLAUDE_DIR_ARG:-$HOME/.claude}"
+    GRIP_DIR="${GRIP_DIR_ARG:-$HOME/.grip}"
+    ARCHIVE_ROOT="${ARCHIVE_ROOT_ARG:-$HOME/grip-claude-archive}"
+    LOG_FILE="${LOG_FILE_ARG:-$ARCHIVE_ROOT/grip-claude-dir-link.log}"
+    mkdir -p "$ARCHIVE_ROOT" 2>/dev/null || true
+
+    local archive="$ARCHIVE_ROOT/claude-backup-$TS"
+    local superseded="$CLAUDE_DIR.superseded-$TS"
+
+    say "grip-claude-dir-link — platform=$(platform) apply=$APPLY"
+    say "  link path : $CLAUDE_DIR"
+    say "  repo path : $GRIP_DIR"
+    say "  archive   : $archive"
+
+    preflight
+
+    if [ ! -e "$CLAUDE_DIR" ]; then
+        say "$CLAUDE_DIR does not exist — no archive needed, only the link is required."
+        superseded=""
+    else
+        say "$CLAUDE_DIR is a real directory with $(count_files "$CLAUDE_DIR") files — it will be archived."
+    fi
+
+    if [ "$APPLY" -eq 0 ]; then
+        say ""
+        say "DRY RUN — no changes made. This is exactly what --apply would do:"
+        [ -n "$superseded" ] && plan "cp -R \"$CLAUDE_DIR\" \"$archive\"   (then verify count + SHA-256 manifest)"
+        [ -n "$superseded" ] && plan "mv \"$CLAUDE_DIR\" \"$superseded\"   (renamed aside, never deleted)"
+        plan "$(link_command "$GRIP_DIR" "$CLAUDE_DIR")"
+        plan "verify by writing a probe under $GRIP_DIR and reading it under $CLAUDE_DIR"
+        say ""
+        say "Re-run with --apply to perform it."
+        exit 0
+    fi
+
+    if is_windows; then
+        case "$(uname -s 2>/dev/null || echo unknown)" in
+            MINGW*|MSYS*|CYGWIN*|Windows_NT) : ;;
+            *) die "GRIP_LINK_PLATFORM says Windows but this kernel is $(uname -s) — refusing to execute a Windows plan here" ;;
+        esac
+    fi
+
+    [ -n "$superseded" ] && do_archive "$CLAUDE_DIR" "$archive"
+
+    if [ -n "$superseded" ]; then
+        say "Renaming $CLAUDE_DIR -> $superseded (not deleted)"
+        mv "$CLAUDE_DIR" "$superseded" || die "rename FAILED — archive is at $archive, original untouched"
+    fi
+
+    say "Creating link: $(link_command "$GRIP_DIR" "$CLAUDE_DIR")"
+    if ! eval "$(link_command "$GRIP_DIR" "$CLAUDE_DIR")"; then
+        warn "link creation FAILED — rolling back"
+        [ -n "$superseded" ] && mv "$superseded" "$CLAUDE_DIR" 2>/dev/null || true
+        die "could not create the link. Original restored. Archive kept at $archive"
+    fi
+
+    if ! same_directory "$GRIP_DIR" "$CLAUDE_DIR"; then
+        warn "POST-LINK VERIFICATION FAILED: a file written under $GRIP_DIR is NOT visible under $CLAUDE_DIR"
+        warn "rolling back automatically"
+        eval "$(unlink_command "$CLAUDE_DIR")" 2>/dev/null || true
+        [ -n "$superseded" ] && mv "$superseded" "$CLAUDE_DIR" 2>/dev/null || true
+        die "link did not work (on Git Bash this usually means ln -s copied instead of linking). Original restored. Archive kept at $archive"
+    fi
+
+    say ""
+    say "SUCCESS: $CLAUDE_DIR now resolves to $GRIP_DIR (verified by probe)."
+    [ -n "$superseded" ] && say "Old data kept in TWO places: $superseded and $archive"
+    print_rollback "$CLAUDE_DIR" "$superseded" "$archive"
+    say "Log: $LOG_FILE"
+}
+
+main "$@"

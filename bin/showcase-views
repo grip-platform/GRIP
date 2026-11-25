@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""showcase-views — view counts across one or all showcase projects.
+
+Usage:
+  showcase-views                          summary across all projects
+  showcase-views <project>                summary for one project
+  showcase-views <project> <recipient>    detailed events for one recipient
+  showcase-views --tail [<project>]       follow log live (all projects or one)
+"""
+from __future__ import annotations
+
+# Windows consoles default to cp1252, which cannot encode the glyphs below.
+# Located from __file__, not sys.path[0]: the tests load these commands with
+# SourceFileLoader, which does not put bin/ on the path.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from _grip_console import ensure_utf8_stdio  # noqa: E402
+
+ensure_utf8_stdio()
+
+import json
+import os
+import sys
+import time
+from collections import Counter, defaultdict
+from pathlib import Path
+
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR", Path.home() / ".claude"))
+SHOW = CLAUDE_DIR / "state" / "showcases"
+
+
+def _projects() -> list[str]:
+    if not SHOW.exists():
+        return []
+    return sorted(p.name for p in SHOW.iterdir() if p.is_dir() and not p.name.startswith("_"))
+
+
+def _read_log(project: str) -> list[dict]:
+    log = SHOW / project / "views.jsonl"
+    if not log.exists():
+        return []
+    out = []
+    with log.open() as f:
+        for line in f:
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                pass
+    return out
+
+
+def _genuine(events: list[dict]) -> bool:
+    s = {e.get("event") for e in events}
+    return ("page_view" in s or "pixel" in s) and "play" in s
+
+
+def _row(rid: str, events: list[dict]) -> str:
+    c = Counter(e.get("event") for e in events)
+    ts = sorted(e.get("ts", "") for e in events)
+    last = ts[-1][:19] if ts else "—"
+    g = "yes" if _genuine(events) else "no"
+    mp4 = c.get("video_first_byte", 0) + c.get("video_full_fetch", 0)
+    return (f"  {rid:<18} {c.get('page_view',0):>5} {c.get('pixel',0):>6} "
+            f"{c.get('play',0):>5} {c.get('ended',0):>4} {mp4:>4} {last:>20}  {g}")
+
+
+def _summary_project(project: str) -> None:
+    rows = _read_log(project)
+    if not rows:
+        print("  (no events)")
+        return
+    by_id: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        by_id[r.get("id", "?")].append(r)
+    print(f"  {'recipient':<18} {'page':>5} {'pixel':>6} {'play':>5} {'end':>4} {'mp4':>4} {'last':>20}  genuine")
+    print("  " + "─" * 80)
+    for rid in sorted(by_id):
+        print(_row(rid, by_id[rid]))
+
+
+def summary(project: str | None) -> int:
+    projects = [project] if project else _projects()
+    if not projects:
+        print("no projects yet — try showcase-init <project> ...")
+        return 0
+    for p in projects:
+        rows = _read_log(p)
+        print(f"\n{p} — {len(rows)} events")
+        _summary_project(p)
+    return 0
+
+
+def detail(project: str, rid: str) -> int:
+    rows = [r for r in _read_log(project) if r.get("id") == rid]
+    if not rows:
+        print(f"no events for {project}/{rid}")
+        return 1
+    print(f"{project}/{rid} — {len(rows)} events")
+    for r in rows:
+        ts = r.get("ts", "")[:19]
+        ev = r.get("event", "?")
+        t = r.get("t", "")
+        t_s = f" t={t}s" if isinstance(t, int) and t else ""
+        ip = r.get("ip_hash", "")
+        ua = r.get("ua", "")[:50]
+        print(f"  {ts}  {ev:<18}{t_s}  ip_hash={ip}  ua={ua!r}")
+    return 0
+
+
+def tail(project: str | None) -> int:
+    paths = [SHOW / p / "views.jsonl" for p in ([project] if project else _projects())]
+    paths = [p for p in paths if p.exists()]
+    if not paths:
+        print("no logs to tail")
+        return 0
+    handles = [p.open() for p in paths]
+    for h in handles:
+        h.seek(0, 2)
+    print(f"tail: {[p.parent.name for p in paths]}  (Ctrl-C)")
+    while True:
+        any_line = False
+        for h in handles:
+            line = h.readline()
+            if not line:
+                continue
+            any_line = True
+            try:
+                r = json.loads(line)
+                ts = r.get("ts", "")[:19]
+                proj = r.get("project", "?")
+                rid = r.get("id", "?")
+                ev = r.get("event", "?")
+                t = r.get("t", "")
+                print(f"  {ts}  {proj:<14}/{rid:<14}  {ev:<18}  t={t!s:<4}")
+            except Exception:
+                print(line.rstrip())
+        if not any_line:
+            time.sleep(0.5)
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args:
+        return summary(None)
+    if args[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    if args[0] in ("-t", "--tail"):
+        return tail(args[1] if len(args) > 1 else None)
+    if len(args) == 1:
+        return summary(args[0])
+    if len(args) == 2:
+        return detail(args[0], args[1])
+    print("usage: showcase-views [project] [recipient] | --tail [project]")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

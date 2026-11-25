@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# grip-can — answer "can GRIP/HAL already do X?" before you claim it cannot.
+#
+# Origin: 2026-08-18. Asked to build an OpenAI billing fallback, I asserted that
+# billing a Claude subscription was "not reachable". False — HAL has CCH, and the
+# fact was already in the always-loaded rules tier: the string appeared NINE times
+# in that session's own startup context. Not a retrieval miss more memory could
+# fix. A missing search.
+#
+# `rules/prove-it-claims-canonical.md` §"Negative CAPABILITY claims" states the
+# discipline. A discipline is a habit, and a habit is not externally checkable —
+# a sovereign council (seal 9b436ce8, non-Anthropic judge) called for an
+# EXECUTABLE check a skeptic could run instead. This is that check, kept to the
+# minimum honest scope: it searches, it does not invoke.
+#
+# Exit codes are the contract, so this composes into a gate:
+#   0  evidence found  -> a "cannot do X" claim is REFUTED; read the hits first
+#   1  nothing found   -> the negative claim is permitted, and must name these scopes
+#   2  usage error
+#   3  search failed   -> NOTHING is permitted; a failed search is not an empty one
+#
+# It reports EXISTENCE, never LIVENESS. Finding an implementation proves the code
+# is there; it never proves the path serves. Keep those claims apart — CCH itself
+# is implemented, and every live attempt during that session returned HTTP 429.
+
+set -uo pipefail
+
+GRIP_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+HAL_DIR="${HAL_HOME:-$HOME/.hal}"
+
+usage() {
+    cat >&2 <<'EOF'
+Usage: grip-can <capability keyword> [more keywords ...]
+
+Searches the three stores that answer different questions, and reports what each
+one holds. Give the CONCEPT and its synonyms, not just the one name you know:
+
+  grip-can cch subscription oauth billing
+  grip-can "rate limit" backoff
+  grip-can worktree isolation
+
+Exit 0 = evidence found, so "we cannot do this" is refuted.
+Exit 1 = all three stores empty; a negative claim is permitted and must say so.
+Exit 3 = a search failed; nothing is established and nothing is permitted.
+Keywords are matched as literal text, so "billing(" and "user [id]" mean what they say.
+EOF
+}
+
+[[ $# -lt 1 ]] && { usage; exit 2; }
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+
+# Search a concept and its synonyms together — the failure this exists to prevent
+# was searching for one name and stopping — and search each as a LITERAL: one -e
+# per keyword, under -F. They used to be joined into a single regex, so one
+# unbalanced parenthesis made rg fail; the error was discarded, and the empty
+# result printed "a negative capability claim is now permitted" while a valid
+# keyword beside it had matches (measured 2026-10-03, GRIP#4937).
+PATTERNS=()
+for kw in "$@"; do PATTERNS+=(-e "$kw"); done
+SHOWN="$(printf '%s\n' "$@" | paste -sd'|' -)"
+
+hits_total=0
+SEARCH_FAILED=0
+
+section() {
+    local title="$1"; shift
+    local -a paths=()
+    for p in "$@"; do [[ -e "$p" ]] && paths+=("$p"); done
+    printf '\n\033[1m%s\033[0m\n' "$title"
+    if [[ ${#paths[@]} -eq 0 ]]; then
+        printf '  (not present on this machine)\n'
+        return
+    fi
+    # rg exits 0 on a match, 1 on none and 2 on an error. The status is read here,
+    # not through a pipe: an error must never be mistaken for "no match".
+    local out rc err
+    err="$(mktemp)"
+    out="$(rg -ilF --no-ignore-vcs "${PATTERNS[@]}" -- "${paths[@]}" 2>"$err")"
+    rc=$?
+    if [[ $rc -ge 2 ]]; then
+        SEARCH_FAILED=1
+        printf '  SEARCH FAILED: %s\n' "$(head -1 "$err")"
+    fi
+    rm -f "$err"
+    out="$(printf '%s' "$out" | head -12)"
+    if [[ -z "$out" ]]; then
+        [[ $rc -lt 2 ]] && printf '  no match\n'
+        return
+    fi
+    local n
+    n="$(printf '%s\n' "$out" | rg -c . || echo 0)"
+    hits_total=$(( hits_total + n ))
+    printf '%s\n' "$out" | sed 's|^|  |'
+}
+
+printf 'grip-can: searching for \033[1m%s\033[0m\n' "$SHOWN"
+
+# 1. The implementation — is the code there at all?
+section "1. Implementation (lib/)" "$HAL_DIR/lib" "$GRIP_DIR/lib"
+
+# 2. The always-loaded rules tier — the answer is disproportionately often here,
+#    which is exactly why missing it stings. operational-context.md loads every
+#    session, so a hit here means the fact was already in context.
+section "2. Always-loaded rules tier" "$GRIP_DIR/rules" "$HAL_DIR/rules"
+
+# 3. The declared catalogue — a capability can be configured and declared before
+#    any caller uses it, so an implementation-only search misses it.
+section "3. Declared catalogue (config/)" \
+    "$HAL_DIR/config/providers.yaml" "$HAL_DIR/config/model_catalog.yaml" \
+    "$GRIP_DIR/config"
+
+printf '\n'
+if [[ $hits_total -gt 0 ]]; then
+    cat <<EOF
+VERDICT: evidence found in $hits_total file(s).
+
+A "we cannot do this" claim is REFUTED — read the hits before saying anything
+about this capability. The useful claim is almost always narrower and is a task
+rather than a dead end: "X is implemented but not wired to Y".
+
+Existence only. This says nothing about whether the path currently SERVES.
+EOF
+    exit 0
+fi
+
+if [[ $SEARCH_FAILED -eq 1 ]]; then
+    cat <<EOF
+VERDICT: the search FAILED, so nothing is established.
+
+A failed search is not an empty one, so no negative capability claim is permitted.
+Fix the error shown above and run grip-can again.
+EOF
+    exit 3
+fi
+
+cat <<EOF
+VERDICT: no evidence in any of the three stores.
+
+A negative capability claim is now permitted, and must name the scopes searched:
+implementation, always-loaded rules tier, declared catalogue. Widen the synonyms
+before trusting this — the search is only as good as the words you gave it.
+EOF
+exit 1

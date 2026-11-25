@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""grip-web-fetch -- read a public web page through another harness, locked to web search.
+
+Use this when Claude Code cannot fetch a page and curl is refused
+(rules/fetch-through-another-harness.md). It refuses a URL that looks private.
+
+Usage:
+    bin/grip-web-fetch <url> ["what to report from the page"]
+
+The exit codes are listed in lib/web_fetch_harness.py.
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+from web_fetch_harness import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

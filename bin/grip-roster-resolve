@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""grip-roster-resolve -- do the council's declared credentials actually resolve?
+
+A roster rung names where its credential comes from. Naming one is not having
+one, and nothing in GRIP checked the difference: an unset secret, a keychain
+entry that does not exist, or a missing pip package all leave the rung sitting
+in the roster looking healthy, then fail at dispatch as an empty answer that a
+fallback quietly covers.
+
+Four live instances of that on 2026-08-18 -- a repo secret that was never
+created, a keychain entry read under the wrong name, a config value the loader
+rejects, and the `xxhash` package missing in CI. This run would have caught all
+four in one go.
+
+Usage:
+    grip-roster-resolve                 # AGORA speakers + judge
+    grip-roster-resolve --json          # machine-readable
+    grip-roster-resolve --strict        # exit 1 if any rung is BROKEN
+
+Exit codes:
+    0  nothing broken (or broken but --strict not passed)
+    1  --strict and at least one rung declares a source that yields nothing
+    2  the roster could not be imported at all
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import os
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[1]
+for _p in (str(_ROOT), str(_ROOT / "lib")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from roster_resolve import (  # noqa: E402
+    BROKEN,
+    render,
+    resolve_roster,
+    tally,
+)
+
+
+def _load_roster() -> list[tuple]:
+    """Speaker ladder plus the judge -- the judge fails the same way."""
+    from lib.hal_council_dispatch import _AGORA_SPEAKER_ROSTER, _JUDGE_PROVIDER
+
+    return list(_AGORA_SPEAKER_ROSTER) + [_JUDGE_PROVIDER]
+
+
+def _where() -> str:
+    if os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true":
+        return "in CI (no macOS keychain here -- env vars only)"
+    return "on this machine (keychain reachable)"
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="grip-roster-resolve", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("--json", action="store_true", help="emit machine-readable results")
+    ap.add_argument(
+        "--strict", action="store_true",
+        help="exit 1 when any rung declares a credential source that yields nothing",
+    )
+    args = ap.parse_args(argv)
+
+    try:
+        roster = _load_roster()
+    except Exception as exc:  # noqa: BLE001
+        print(f"grip-roster-resolve: could not load the roster: {exc}", file=sys.stderr)
+        return 2
+
+    results = resolve_roster(roster)
+
+    if args.json:
+        print(json.dumps(
+            {
+                "environment": _where(),
+                "counts": tally(results),
+                "rungs": [dataclasses.asdict(r) for r in results],
+            },
+            indent=2,
+        ))
+    else:
+        print(render(results, where=_where()))
+
+    return 1 if (args.strict and tally(results)[BROKEN]) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

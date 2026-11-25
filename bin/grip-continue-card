@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# grip-continue-card -- thin wrapper over lib/continue_card.py (the engine
+# behind the /continue skill). Resolves ITS OWN repo root the way scripts/grip-stats.sh
+# does, so a worktree's bin runs that worktree's lib rather than whatever
+# ~/.claude happens to point at, then execs bin/grip-py (never system python,
+# per rules/never-system-python-for-grip.md) with argv passed straight
+# through (no `python -c`, so there is nothing here for a shell to inject).
+#
+# ROOT RESOLUTION mirrors scripts/grip-stats.sh exactly: an explicit
+# CLAUDE_DIR still wins (it names a whole GRIP install on purpose), but with
+# none set the default is this script's OWN repo, not ~/.claude.
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo="$(dirname -- "$script_dir")"
+
+if [ -n "${CLAUDE_DIR:-}" ] && [ -f "${CLAUDE_DIR}/lib/continue_card.py" ]; then
+  root="$CLAUDE_DIR"
+elif [ -f "${repo}/lib/continue_card.py" ]; then
+  root="$repo"
+else
+  root="${CLAUDE_DIR:-$HOME/.claude}"
+fi
+
+exec "${root}/bin/grip-py" "${root}/lib/continue_card.py" "$@"

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- grip-cos stable Chief-of-Staff endpoint + named tunnel. Installed by
+     scripts/grip-cos-tunnel-setup.sh, which fills __PYTHON__ and __CLAUDE_DIR__.
+     KeepAlive restarts it if it dies; RunAtLoad starts it at login.
+     EnvironmentVariables.PATH is LOAD-BEARING: launchd's default PATH omits the
+     Homebrew prefixes, so without it `grip-cos serve` cannot find `cloudflared`
+     and crash-loops (the 530-origin-down bug, 2026-06-26). -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.grip.cos</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__PYTHON__</string>
+		<string>__CLAUDE_DIR__/bin/grip-cos</string>
+		<string>serve</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>CLAUDE_DIR</key>
+		<string>__CLAUDE_DIR__</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>__CLAUDE_DIR__/logs/grip-cos.log</string>
+	<key>StandardErrorPath</key>
+	<string>__CLAUDE_DIR__/logs/grip-cos.err</string>
+</dict>
+</plist>

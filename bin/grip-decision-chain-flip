@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""Put the public decision-chain site online ONLY IF redactions are in place.
+
+Fetches the chain the site repository currently holds on main, runs the
+redaction shield over every free-text field (the same check the emitter and
+the publisher use), verifies every published anchor still recomputes, and
+only when both pass makes the repository public. Any finding, any anchor
+mismatch, or any fetch failure leaves the repository as it is and exits
+non-zero. Never flips to private on its own: that is the operator's call.
+
+    grip-decision-chain-flip            # check, and flip public if clean
+    grip-decision-chain-flip --check    # check only, never flip
+
+Origin: 2026-09-22. A manual flip made an unredacted chain public for about
+four minutes because the chain sync on the VPS overwrote the redacted file
+15 minutes later than expected — so the gate reads the REMOTE file, not a
+local copy, and reads it immediately before flipping.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REPO = os.environ.get("GRIP_DECISION_CHAIN_REPO", "CodeTonight-SA/grip-decision-chain")
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR") or Path.home() / ".claude")
+sys.path.insert(0, str(CLAUDE_DIR))
+
+
+def main(argv: list[str]) -> int:
+    check_only = "--check" in argv
+    from lib import idr_public_emitter as em  # noqa: PLC0415  (needs CLAUDE_DIR on sys.path)
+
+    state = em.redaction_state()
+    if state != "ok":
+        print(f"[flip] redaction denylist unusable ({state}); not flipping", file=sys.stderr)
+        return 2
+    with tempfile.TemporaryDirectory() as tmp:
+        clone = Path(tmp) / "site"
+        r = subprocess.run(["git", "clone", "-q", "--depth", "1", f"https://github.com/{REPO}", str(clone)],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"[flip] clone failed: {r.stderr.strip()[:200]}", file=sys.stderr)
+            return 2
+        ledger = clone / "idr-public.jsonl"
+        findings = em.subjects_with_leaks(ledger)
+        rows = sum(1 for _ in ledger.open())
+        print(f"[flip] remote chain: {rows} rows, {len(findings)} shield finding(s)")
+        if findings:
+            for f in findings[:10]:
+                print(f"[flip]   {f}")
+            print("[flip] redactions NOT in place; repository left as it is", file=sys.stderr)
+            return 1
+        v = subprocess.run(["node", "verify-anchors.js"], cwd=clone, capture_output=True, text=True)
+        tail = (v.stdout + v.stderr).strip().splitlines()[-1:] or [""]
+        print(f"[flip] verify-anchors.js: exit {v.returncode} — {tail[0][:120]}")
+        if v.returncode != 0:
+            print("[flip] anchors do not verify; repository left as it is", file=sys.stderr)
+            return 1
+    if check_only:
+        print("[flip] CLEAN (check only; no flip)")
+        return 0
+    r = subprocess.run(["gh", "repo", "edit", REPO, "--visibility", "public",
+                        "--accept-visibility-change-consequences"], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"[flip] gh repo edit failed: {r.stderr.strip()[:200]}", file=sys.stderr)
+        return 2
+    vis = subprocess.run(["gh", "repo", "view", REPO, "--json", "visibility", "--jq", ".visibility"],
+                         capture_output=True, text=True).stdout.strip()
+    print(f"[flip] {REPO} is now {vis}")
+    return 0 if vis == "PUBLIC" else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

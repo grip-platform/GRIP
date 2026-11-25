@@ -1,0 +1,26 @@
+# GRIP Deployment Configuration
+# Used by scripts/deploy-grip.sh
+#
+# Override via environment variables where noted.
+
+deployment:
+  # Instance file retention in days (env: GRIP_INSTANCE_RETENTION_DAYS)
+  instance_retention_days: 30
+
+  # Audit log retention in days
+  audit_log_retention_days: 90
+
+  # Network egress whitelist
+  # Only these domains should be reachable for production deployments
+  egress_whitelist:
+    - api.anthropic.com      # Claude API
+    - registry.npmjs.org     # npm packages
+    - pypi.org               # Python packages
+    - github.com             # Git operations
+    - huggingface.co         # Model downloads
+
+  # Critical secrets check patterns
+  # Files matching these are flagged during verification
+  secrets_patterns:
+    - "sk-[a-zA-Z0-9]{20,}"   # Anthropic API keys
+    - "pk_[a-zA-Z0-9]{20,}"   # Public keys (various services)

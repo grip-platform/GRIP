@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""Tell every running GRIP session, on any harness, that it is out of date.
+
+    grip-harness-signal raise "rules/foo.md changed" --severity reload --notify
+    grip-harness-signal check --my-generation 3
+    grip-harness-signal status
+
+WHY THIS IS NOT REDUNDANT WITH A SHARED TREE
+
+All twelve launchable harnesses read the same directory, so a change is on disk
+for all of them immediately. But a session loads its rules ONCE at SessionStart
+and never re-reads. The tree distributes a change to the NEXT session to boot;
+every session already running stays frozen at what it loaded, with no way to
+find out. This carries the one fact the disk cannot: YOU ARE BEHIND.
+
+WHY THE OPERATOR GETS ALERTED RATHER THAN THE SESSIONS GETTING INTERRUPTED
+
+Raising a signal asks every live session to stop and re-read. Whether a change
+is worth that is a judgement about materiality, and only the operator holds it.
+So --notify tells him it is time to signal, and he decides. The alternative --
+auto-signalling on every commit -- trains every reader to ignore the signal,
+which is the same failure as a smoke alarm that goes off when you make toast.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+_LIB = _ROOT / "lib"
+# grip_notify uses `lib.`-prefixed absolute imports (lib/grip_notify.py:47
+# imports lib.handoff_chime), so the REPO ROOT must be importable, not just
+# lib/. Both are added: lib/ for sibling modules that import each other flat,
+# root for the ones that address themselves as a package.
+for _p in (str(_ROOT), str(_LIB)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import grip_notify  # noqa: E402
+import harness_signal as hs  # noqa: E402
+
+
+def _alert(title: str, message: str) -> bool:
+    """Alert the operator through GRIP's existing notifier. Never reimplement it.
+
+    An earlier version of this file hand-rolled an `osascript` call, which was
+    duplication of `lib/grip_notify.py` -- a 1254-line facade whose
+    MacOSLocalBackend already does exactly that, with a capability probe, a
+    remedy string when it cannot run, and other backends behind the same call.
+    A council seat caught it. Calling the facade means this command gains every
+    future backend without being edited.
+
+    The same review found the sharper error: WhatsApp was reported here as
+    unreachable after a single HTTP 401, when `lib/whatsapp_transport.py::post`
+    already sends headlessly by hand-rolling the MCP handshake. Declaring a
+    capability absent without searching for it is the negative-capability
+    failure `rules/prove-it-claims-canonical.md` names, and it is why both
+    transports are now reached through code that already existed.
+    """
+    try:
+        return bool(grip_notify.notify(message, title=title))
+    except Exception:
+        # Never let a failed alert take the signal down with it: the generation
+        # bump is the durable half and has already landed on disk. A missed
+        # notification is reported by the caller, not raised here.
+        return False
+
+
+def cmd_raise(args) -> int:
+    sig = hs.raise_signal(
+        args.reason, severity=args.severity, action=args.action or "",
+    )
+    print(f"[harness-signal] generation {sig['generation']} raised "
+          f"({sig['severity']}): {sig['reason']}")
+    if sig["action"]:
+        print(f"[harness-signal] action: {sig['action']}")
+
+    if args.notify:
+        title = f"GRIP: signal {sig['generation']} ({sig['severity']})"
+        body = sig["reason"] + (f" — {sig['action']}" if sig["action"] else "")
+        delivered = _alert(title, body)
+        print(f"[harness-signal] operator alert: {'delivered' if delivered else 'FAILED'}")
+        if not delivered:
+            # Never silently swallow a failed alert: the operator asked to be
+            # told, and a notification that failed is indistinguishable from
+            # one that was never requested unless it is reported.
+            print("[harness-signal] WARNING: the operator was NOT alerted",
+                  file=sys.stderr)
+    return 0
+
+
+def cmd_check(args) -> int:
+    r = hs.is_stale(args.my_generation)
+    if args.json:
+        print(json.dumps(r, indent=2, sort_keys=True))
+    elif r["stale"]:
+        print(f"[harness-signal] STALE — you are at generation {r['my_generation']}, "
+              f"tree is at {r['current_generation']} ({r['behind_by']} behind)")
+        print(f"[harness-signal] {r['severity']}: {r['reason']}")
+        if r["action"]:
+            print(f"[harness-signal] action: {r['action']}")
+    else:
+        print(f"[harness-signal] current at generation {r['current_generation']}")
+    # Exit 3 when stale so a shell caller can branch without parsing text.
+    # Not 1: that is indistinguishable from the script erroring.
+    return 3 if r["stale"] else 0
+
+
+def cmd_status(args) -> int:
+    sig = hs.read_signal()
+    if sig["generation"] == 0:
+        print("[harness-signal] no signal has ever been raised on this tree")
+        return 0
+    print(json.dumps(sig, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_ack(args) -> int:
+    """Record that this harness saw the signal and acted."""
+    e = hs.ack_signal(args.generation, harness=args.harness, session_id=args.session_id)
+    print(f"[harness-signal] {e['harness']} acknowledged generation {e['generation']}")
+    return 0
+
+
+def cmd_reach(args) -> int:
+    """Who actually acted -- not how many were messaged.
+
+    This is the question grip-presence could not answer: it reported a
+    broadcast reaching 24 sessions, of which roughly five were live and none
+    were non-Claude-Code, because it counted attempts rather than receipts.
+    """
+    r = hs.reach(args.generation)
+    if args.json:
+        print(json.dumps(r, indent=2, sort_keys=True))
+        return 0
+    if not r["harnesses"]:
+        print(f"[harness-signal] generation {r['generation']}: NOBODY has acknowledged")
+    else:
+        print(f"[harness-signal] generation {r['generation']} acknowledged by "
+              f"{len(r['harnesses'])} harness(es): {', '.join(r['harnesses'])}")
+    if r["unreadable_lines"]:
+        print(f"[harness-signal] {r['unreadable_lines']} unreadable ack line(s) skipped",
+              file=sys.stderr)
+    return 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    r = sub.add_parser("raise", help="bump the generation and say what changed")
+    r.add_argument("reason", help="what changed, in words a stranger understands")
+    r.add_argument("--severity", default="reload", choices=hs.SEVERITIES)
+    r.add_argument("--action", default="", help="what a reader should DO")
+    r.add_argument("--notify", action="store_true", help="alert the operator")
+    r.set_defaults(func=cmd_raise)
+
+    c = sub.add_parser("check", help="am I behind?")
+    c.add_argument("--my-generation", type=int, default=hs.UNKNOWN_GENERATION)
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(func=cmd_check)
+
+    a = sub.add_parser("ack", help="record that this harness acted")
+    a.add_argument("generation", type=int)
+    a.add_argument("--harness", required=True,
+                   help="which harness is acknowledging (claude, codex, opencode, ...)")
+    a.add_argument("--session-id", default="")
+    a.set_defaults(func=cmd_ack)
+
+    rc = sub.add_parser("reach", help="who acknowledged -- receipts, not attempts")
+    rc.add_argument("generation", type=int)
+    rc.add_argument("--json", action="store_true")
+    rc.set_defaults(func=cmd_reach)
+
+    s = sub.add_parser("status", help="show the current signal")
+    s.set_defaults(func=cmd_status)
+
+    args = ap.parse_args(argv)
+    try:
+        return args.func(args)
+    except hs.SignalError as exc:
+        print(f"[harness-signal] {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

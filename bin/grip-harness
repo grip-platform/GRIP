@@ -1,0 +1,677 @@
+#!/usr/bin/env python3
+"""grip-harness — wire ANY AI CLI harness at GRIP's HAL gateway (:4010) + a
+GRIP MCP capability. The "any harness" rail of the VeriSign-of-AI strategy:
+GRIP's substrate (HAL multi-provider routing + grip-run code-exec) made usable
+from a foreign harness with one idempotent command.
+
+USAGE
+  grip-harness codex [--model <claude-id>] [--mcp grip-run] [--profiles] [--dry-run]
+      Wire codex-cli at HAL :4010 (Responses wire) + register the grip-run MCP
+      server. Idempotent: re-running rewrites ONLY the GRIP-MANAGED fence in
+      ~/.codex/config.toml; user blocks ([projects.*]/[plugins.*]) untouched.
+      --profiles also (re)writes ~/.codex/<p>.config.toml for non-Anthropic
+      vendors (deepseek/gemini3/xai) so `codex --profile <p>` offloads via HAL.
+
+  grip-harness aider [--model <claude-id>] [--dry-run]
+      Wire aider at HAL :4010 via ~/.aider.conf.yml (GRIP-MANAGED YAML fence:
+      openai-api-base :4010 + model openai/<id>). Idempotent; the api key is
+      NOT written — export AIDER_OPENAI_API_KEY=$HAL_GATEWAY_KEY before running.
+
+  grip-harness opencode [--model <claude-id>] [--dry-run]
+      Deep-merge a provider.hal block (@ai-sdk/openai-compatible, baseURL :4010)
+      into ~/.config/opencode/opencode.json. Other providers + user keys kept
+      verbatim; invalid existing JSON is refused (never clobbered).
+
+  grip-harness cursor [--model <claude-id>]
+      Cursor is a GUI app with no config file — PRINTS the exact Settings →
+      Models → OpenAI Base URL override steps (no file is written).
+
+  grip-harness style [--dry-run]
+      Write GRIP's canonical-style block (lib/canonical_style_projection.py) into
+      every harness surface on this machine: $CODEX_HOME/AGENTS.md,
+      ~/.config/opencode/AGENTS.md, ~/.hermes/SOUL.md, ~/.gemini/AGENTS.md. Each
+      harness command above also does this for its own surface after it wires.
+
+  grip-harness env
+      Print the shell lines to export HAL_GATEWAY_KEY + start the gateway.
+
+  grip-harness doctor [codex]
+      Probe :4010 (401/200 on /v1/models = UP), check the harness binary, the
+      keychain entry, the grip-run server file, and (for codex) that the config
+      still LOADS after a write (`codex --version` — a bad wire_api fails here).
+
+  grip-harness list
+      Show the harness registry (supported + planned) and GRIP_HOME.
+
+Unknown harness → exit 2, loud (never a silent mis-wire). 'planned' harnesses
+exit 3 with their note (no stub config is ever written).
+
+See lib/grip_harness.py for the canonical constants + pure emitters.
+"""
+
+from __future__ import annotations
+
+# Windows consoles default to cp1252, which cannot encode the glyphs below.
+# Located from __file__, not sys.path[0]: the tests load these commands with
+# SourceFileLoader, which does not put bin/ on the path.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from _grip_console import ensure_utf8_stdio  # noqa: E402
+
+ensure_utf8_stdio()
+
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+import grip_harness as gh  # noqa: E402
+import grip_harness_model as ghm  # noqa: E402
+
+
+def _eprint(*a: object) -> None:
+    print(*a, file=sys.stderr)
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+
+
+# --- the canonical style, projected into the harness's own surface ---------
+# One generated block, delivered per harness (lib/canonical_style_projection.py):
+# $CODEX_HOME/AGENTS.md, ~/.config/opencode/AGENTS.md, ~/.hermes/SOUL.md and
+# ~/.gemini/AGENTS.md. Called after a successful wire, so every `gg++ <name>`
+# launch projects. Fail-open: a projection fault never fails the wiring.
+
+def _project_style(harness: str) -> None:
+    try:
+        import canonical_style_projection as csp  # noqa: PLC0415
+        results = csp.project_for(harness)
+    except Exception as e:  # noqa: BLE001 -- the wiring stands; say what was skipped
+        _eprint(f"[grip-harness] canonical style not projected for {harness}: {type(e).__name__}: {e}")
+        return
+    for result in results:
+        state = "repaired" if result.repaired else ("rewrote" if result.changed else "unchanged")
+        _eprint(f"[grip-harness]   canonical style -> {result.path} ({state})")
+
+
+def cmd_style(args: list[str]) -> int:
+    """Project the canonical-style block into every harness surface on this machine."""
+    dry = False
+    for a in args:
+        if a == "--dry-run":
+            dry = True
+        else:
+            _eprint(f"grip-harness style: unknown arg {a!r}")
+            return 2
+    import canonical_style_projection as csp  # noqa: PLC0415
+    if dry:
+        for name, path in csp.targets():
+            _eprint(f"[dry-run] would write {path} ({name})")
+        sys.stdout.write(csp.fenced_block())
+        return 0
+    results = csp.project_all()
+    for result in results:
+        state = "repaired" if result.repaired else ("rewrote" if result.changed else "unchanged")
+        print(f"{result.harness:9} {result.path}  {state}")
+    if not results:
+        print("no harness home found on this machine (codex, opencode, hermes, agy)")
+    return 0
+
+
+# --- subcommand: codex ------------------------------------------------------
+
+def cmd_codex(args: list[str]) -> int:
+    model = ghm.resolve_model("codex")
+    mcp = gh.GRIP_RUN_MCP
+    with_profiles = False
+    dry_run = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--model" and i + 1 < len(args):
+            model, i = args[i + 1], i + 1
+        elif a == "--mcp" and i + 1 < len(args):
+            mcp, i = args[i + 1], i + 1
+        elif a == "--profiles":
+            with_profiles = True
+        elif a == "--dry-run":
+            dry_run = True
+        else:
+            _eprint(f"grip-harness codex: unknown arg {a!r}")
+            return 2
+        i += 1
+
+    if mcp not in gh.UNIVERSAL_MCP_RELPATHS:
+        _eprint(
+            f"grip-harness: MCP {mcp!r} is not a universal GRIP server "
+            f"(eligible: {sorted(gh.UNIVERSAL_MCP_RELPATHS)}). "
+            "Org-specific servers are never exposed (mcp-org-isolation)."
+        )
+        return 2
+
+    grip_home = gh.resolve_grip_home()
+    server_js = gh.mcp_server_path(grip_home, mcp)
+    if not server_js.exists():
+        _eprint(f"grip-harness: GRIP MCP server not found: {server_js}")
+        _eprint(f"  (GRIP_HOME resolved to {grip_home})")
+        return 4
+
+    block = gh.emit_codex_config(grip_home, mcp=mcp)
+    cfg = Path(gh.HARNESSES["codex"]["config_path"]).expanduser()
+    # TOML-aware: root keys must precede the first table header, else `model`
+    # silently binds to whatever table the fence lands behind.
+    existing_text = _read_text(cfg)
+    # A fence with no end marker is unrepairable by inspection, so the rewrite
+    # below would silently drop whatever sat under it. Back it up instead.
+    truncated_fence = gh.has_truncated_fence(existing_text)
+    merged = gh.merge_managed_toml(existing_text, block)
+
+    if dry_run:
+        _eprint(f"[dry-run] would write {cfg} (GRIP-MANAGED fence: provider :4010 + {mcp} MCP)")
+        _eprint(f"[dry-run] would write {cfg.parent / f'{gh.HAL_CODEX_PROFILE}.config.toml'} "
+                f"(model {model} via HAL)")
+        if with_profiles:
+            for prof in gh.CROSS_WIRE_PROFILES:
+                _eprint(f"[dry-run] would write {cfg.parent / f'{prof}.config.toml'}")
+        sys.stdout.write(block)
+        return 0
+
+    if truncated_fence:
+        backup = cfg.with_suffix(cfg.suffix + f".grip-backup-{int(time.time())}")
+        gh.atomic_write_text(backup, existing_text)
+        _eprint(f"[grip-harness] WARNING: {cfg} has a GRIP-MANAGED block with no end "
+                f"marker. Where it ends cannot be known, so the rest of the file is "
+                f"being replaced. Your original is saved at {backup}")
+
+    gh.write_config_text(cfg, merged)
+    _eprint(f"[grip-harness] wired codex: HAL :4010 provider + {mcp} MCP in {cfg}")
+    _project_style("codex")
+    hal = gh.write_hal_profile(model, codex_home=str(cfg.parent))
+    _eprint(f"[grip-harness]   profile → {hal} (codex -p {gh.HAL_CODEX_PROFILE}, model {model})")
+    if gh.base_pins_gateway_outside_fence(merged):
+        _eprint(f"[grip-harness] WARNING: {cfg} pins model_provider = "
+                f"\"{gh.HAL_PROVIDER_NAME}\" OUTSIDE the GRIP-managed block, so a plain "
+                "`codex` still goes through HAL instead of your subscription. That line "
+                "is yours; delete it to make plain `codex` use your ChatGPT login.")
+    if with_profiles:
+        for prof, pmodel in gh.CROSS_WIRE_PROFILES.items():
+            # `profile_writes` above is only a --dry-run preview; the real write
+            # goes through the library so tests exercise the merge directly.
+            p = gh.write_cross_wire_profile(prof, pmodel, codex_home=str(cfg.parent))
+            _eprint(f"[grip-harness]   profile → {p} (codex --profile {p.stem})")
+
+    # Verify-canonical: a bad wire_api makes codex fail to LOAD config entirely.
+    ok, detail = _codex_loads()
+    _eprint(f"[grip-harness] config load check: {detail}")
+    print("Done. Plain `codex` uses its own login (your ChatGPT subscription); "
+          f"`CODEX_HOME=~/.codex-hal codex -p {gh.HAL_CODEX_PROFILE}` routes via HAL :4010 "
+          "(gateway must be up + HAL_GATEWAY_MULTIPROVIDER=1).")
+    return 0 if ok else 5
+
+
+# --- shared --model/--dry-run parsing for the simple emitters ---------------
+
+def _parse_model_dry(harness: str, args: list[str]) -> tuple[str | None, str, bool]:
+    """Parse the common (--model <id>, --dry-run) args. Returns (err, model, dry).
+
+    ``err`` is non-None (a message) only on a bad arg — the caller returns 2.
+    Seed from resolve_model so env/persisted selection is used when --model is absent.
+    """
+    model = ghm.resolve_model(harness)
+    dry = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--model" and i + 1 < len(args):
+            model, i = args[i + 1], i + 1
+        elif a == "--dry-run":
+            dry = True
+        else:
+            return f"grip-harness {harness}: unknown arg {a!r}", model, dry
+        i += 1
+    return None, model, dry
+
+
+# --- subcommand: aider (YAML fence merge into ~/.aider.conf.yml) -------------
+
+def cmd_aider(args: list[str]) -> int:
+    err, model, dry = _parse_model_dry("aider", args)
+    if err:
+        _eprint(err)
+        return 2
+    block = gh.emit_aider_config(default_model=model)
+    cfg = Path(gh.HARNESSES["aider"]["config_path"]).expanduser()
+    merged = gh.merge_managed_block(_read_text(cfg), block)
+    if dry:
+        _eprint(f"[dry-run] would write {cfg} (GRIP-MANAGED YAML fence → HAL :4010)")
+        sys.stdout.write(block)
+        return 0
+    gh.atomic_write_text(cfg, merged)
+    _eprint(f"[grip-harness] wired aider → HAL :4010 in {cfg}")
+    print(f'Done. Export the key first: export {gh.AIDER_ENV_KEY}="$(security '
+          f'find-generic-password -s {gh.HAL_GATEWAY_KEYCHAIN} -w)"  then run: aider')
+    return 0
+
+
+# --- subcommand: opencode (JSON deep-merge of provider.hal) ------------------
+
+def _link_opencode_plugin(name: str) -> None:
+    """Symlink integrations/opencode/<name> into OpenCode's plugin directory once,
+    as bin/grip-opencode does for grip-safety.js. A link that exists is left alone."""
+    source = Path(__file__).resolve().parent.parent / "integrations" / "opencode" / name
+    plugin_dir = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "opencode" / "plugins"
+    link = plugin_dir / name
+    if not source.exists() or link.exists() or link.is_symlink():
+        return
+    try:
+        plugin_dir.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(source)
+        _eprint(f"[grip-harness]   linked {name} -> {link}")
+    except OSError as e:
+        _eprint(f"[grip-harness]   could not link {name}: {e}")
+
+
+def cmd_opencode(args: list[str]) -> int:
+    err, model, dry = _parse_model_dry("opencode", args)
+    if err:
+        _eprint(err)
+        return 2
+    resolved = gh.resolve_opencode_chat_model(model)
+    if resolved != model:
+        _eprint(f"[grip-harness] '{model}' is Responses-API-only (not a chat model "
+                f"on /v1/chat/completions) — wiring chat sibling '{resolved}' instead.")
+    model = resolved
+    if gh.is_unverified_opencode_chat_model(model):
+        _eprint(f"[grip-harness] '{model}' is not in the proven HAL chat menu — wiring "
+                f"it anyway, but it was not verified against :4010; a Responses-only or "
+                f"unknown id will fail on the first message.")
+    cfg = Path(gh.HARNESSES["opencode"]["config_path"]).expanduser()
+    try:
+        merged = gh.merge_opencode_config(_read_text(cfg), default_model=model)
+    except ValueError as e:  # invalid existing JSON — never clobber
+        _eprint(f"grip-harness opencode: {e}")
+        return 6
+    if dry:
+        _eprint(f"[dry-run] would write {cfg} (deep-merge provider.hal → HAL :4010)")
+        sys.stdout.write(merged)
+        return 0
+    gh.write_config_text(cfg, merged)
+    _eprint(f"[grip-harness] wired opencode → HAL :4010 (provider.hal) in {cfg}")
+    _project_style("opencode")
+    _link_opencode_plugin("grip-style.js")
+    print(f'Done. Export the key first: export {gh.HAL_GATEWAY_ENV_KEY}="$(security '
+          f'find-generic-password -s {gh.HAL_GATEWAY_KEYCHAIN} -w)"  then: opencode (model hal/{model})')
+    return 0
+
+
+# --- subcommand: agy (JSON deep-merge) ---------------------------------------
+
+def cmd_agy(args: list[str]) -> int:
+    err, model, dry = _parse_model_dry("agy", args)
+    if err:
+        _eprint(err)
+        return 2
+    cfg = Path(gh.HARNESSES["agy"]["config_path"]).expanduser()
+    grip_home = gh.resolve_grip_home()
+    try:
+        merged = gh.merge_agy_config(_read_text(cfg), grip_home=grip_home, default_model=model)
+    except ValueError as e:  # invalid existing JSON — never clobber
+        _eprint(f"grip-harness agy: {e}")
+        return 6
+    if dry:
+        _eprint(f"[dry-run] would write {cfg} (deep-merge trustedWorkspaces, context, mcp)")
+        sys.stdout.write(merged)
+        return 0
+    gh.atomic_write_text(cfg, merged)
+    _eprint(f"[grip-harness] wired agy → GRIP infrastructure in {cfg}")
+    _project_style("agy")
+    return 0
+
+
+# --- subcommand: cursor (GUI — PRINT steps, never write a file) -------------
+
+def cmd_cursor(args: list[str]) -> int:
+    err, model, _dry = _parse_model_dry("cursor", args)
+    if err:
+        _eprint(err)
+        return 2
+    # Cursor has no file to write (GUI Settings only) — emit the steps to stdout.
+    sys.stdout.write(gh.emit_cursor_instructions(default_model=model))
+    return 0
+
+
+# --- subcommand: env --------------------------------------------------------
+
+def cmd_env(_args: list[str]) -> int:
+    # Print the service bin/grip and the shims ACTUALLY read, in their real preference
+    # order, rather than the module's placeholder constant. gh.HAL_GATEWAY_KEYCHAIN is
+    # "grip-hal-gateway-token", an opaque non-Anthropic bearer; a harness given that value
+    # 401s on any claude-* id. Copying this line verbatim therefore produced a shell that
+    # looked wired and could not reach Pool A. Preference order matches
+    # lib/harness/cli.py::credentialed_env — subscription first, metered key as fallback.
+    print('export HAL_GATEWAY_KEY="$(security find-generic-password -s grip-claude-oauth -w '
+          '2>/dev/null || security find-generic-password -s grip-anthropic-external -w)"')
+    print("export HAL_GATEWAY_MULTIPROVIDER=1   # required for non-Anthropic cross-wire")
+    print("# start the gateway if down:")
+    print("(cd ~/.hal && python3 -m lib.hal.gateway --port 4010) &")
+    return 0
+
+
+# --- subcommand: doctor -----------------------------------------------------
+
+def _probe_gateway() -> tuple[bool, str]:
+    url = gh.HAL_GATEWAY_BASE_URL + "/models"
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            code = resp.status
+    except urllib.error.HTTPError as e:
+        code = e.code  # 401 = UP and auth-gated (the healthy signal)
+    except (urllib.error.URLError, OSError) as e:
+        return False, f"DOWN ({e}); start: cd ~/.hal && python3 -m lib.hal.gateway --port 4010"
+    if code in (200, 401):
+        return True, f"UP (HTTP {code} on /v1/models)"
+    return False, f"unexpected HTTP {code} on /v1/models (expected 401/200)"
+
+
+def _keychain_present(service: str) -> tuple[bool, str]:
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password", "-s", service, "-w"],
+            capture_output=True, text=True, timeout=6,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError) as e:
+        return False, f"could not query keychain ({e})"
+    if r.returncode == 0 and r.stdout.strip():
+        return True, "present"
+    return False, f"missing (add via /activate-grip; service={service})"
+
+
+def _codex_loads() -> tuple[bool, str]:
+    codex = shutil.which("codex")
+    if codex is None:
+        return False, "codex not on PATH (skipped load check)"
+    try:
+        env = dict(os.environ, CODEX_HOME=str(Path(gh.HARNESSES["codex"]["config_path"]).expanduser().parent))
+        # `codex --version` never reads config.toml (measured on 0.156.1: a config
+        # with wire_api = "chat" still printed the version), so it cannot notice a
+        # broken config. `codex mcp list` loads the whole config without calling a
+        # model, and fails on a bad wire_api or a mistyped value.
+        r = subprocess.run([codex, "mcp", "list"], env=env, stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=20)
+    except (subprocess.SubprocessError, OSError) as e:
+        return False, f"codex mcp list failed to run ({e})"
+    if r.returncode == 0:
+        return True, "OK (config loaded)"
+    return False, f"FAILED — config did not load: {(r.stderr or r.stdout).strip()[:160]}"
+
+
+def cmd_doctor(args: list[str]) -> int:
+    harness = args[0] if args else "codex"
+    grip_home = gh.resolve_grip_home()
+    checks: list[tuple[str, bool, str]] = []
+
+    ok, detail = _probe_gateway()
+    checks.append(("HAL gateway :4010", ok, detail))
+
+    kc_ok, kc_detail = _keychain_present(gh.HAL_GATEWAY_KEYCHAIN)
+    checks.append((f"keychain {gh.HAL_GATEWAY_KEYCHAIN}", kc_ok, kc_detail))
+
+    # grip-run MCP is exposed to codex only; check it solely for codex.
+    if harness == "codex":
+        server_js = gh.mcp_server_path(grip_home, gh.GRIP_RUN_MCP)
+        checks.append((f"grip-run server ({grip_home.name})", server_js.exists(),
+                       str(server_js) if server_js.exists() else f"MISSING: {server_js}"))
+        bin_ok = shutil.which("codex") is not None
+        checks.append(("codex on PATH", bin_ok, shutil.which("codex") or "not found"))
+        load_ok, load_detail = _codex_loads()
+        checks.append(("codex config loads", load_ok, load_detail))
+    elif harness in ("aider", "opencode"):
+        # Live-CLI harnesses — the load-bearing check is the binary on PATH.
+        path = shutil.which(harness)
+        checks.append((f"{harness} on PATH", path is not None, path or "not found"))
+    elif harness == "cursor":
+        # GUI app — no CLI binary to probe; the wiring is in-app Settings.
+        checks.append(("cursor (GUI)", True,
+                       "GUI app — wire via Settings → Models → OpenAI Base URL "
+                       "(run: grip-harness cursor)"))
+    elif harness not in gh.SUPPORTED_HARNESSES:
+        _eprint(f"grip-harness doctor: {harness!r} not a supported harness "
+                f"(supported: {list(gh.SUPPORTED_HARNESSES)})")
+        return 2
+
+    all_ok = True
+    for name, ok, detail in checks:
+        mark = "✓" if ok else "✗"
+        all_ok = all_ok and ok
+        print(f"{mark} {name}: {detail}")
+    print(f"\nGRIP_HOME: {grip_home}")
+    return 0 if all_ok else 1
+
+
+# --- subcommand: list -------------------------------------------------------
+
+def cmd_list(_args: list[str]) -> int:
+    print(f"GRIP_HOME: {gh.resolve_grip_home()}\n")
+    print("HARNESSES:")
+    for name, spec in gh.HARNESSES.items():
+        print(f"  {name:<12} [{spec['status']:<9}] {spec['config_path']}")
+        print(f"               {spec['note']}")
+    print(f"\nUniversal GRIP MCP capabilities exposable: {sorted(gh.UNIVERSAL_MCP_RELPATHS)}")
+    return 0
+
+
+# --- subcommand: kiro -------------------------------------------------------
+# Kiro does not speak OpenAI-compat, so the HAL-gateway wiring path (used by
+# codex/opencode/aider) does not apply. Instead this writes TWO files:
+#   1. ~/.kiro/steering/grip-context.md  — injected into every Kiro session
+#   2. ~/.kiro/agents/grip.md            — the global 'grip' agent definition
+# Both use the HTML-comment GRIP-MANAGED fence for idempotent re-runs.
+
+def cmd_kiro(args: list[str]) -> int:
+    dry_run = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--dry-run":
+            dry_run = True
+        else:
+            _eprint(f"grip-harness kiro: unknown arg {a!r}")
+            return 2
+        i += 1
+
+    grip_home = gh.resolve_grip_home()
+
+    # --- steering file ---
+    steering_path = Path(gh.KIRO_STEERING_PATH).expanduser()
+    steering_block = gh.emit_kiro_steering(grip_home)
+    existing_steering = _read_text(steering_path)
+    merged_steering = gh.merge_kiro_managed_block(existing_steering, steering_block)
+
+    # --- agent file ---
+    agent_path = Path(gh.KIRO_AGENT_PATH).expanduser()
+    agent_block = gh.emit_kiro_agent(grip_home)
+    existing_agent = _read_text(agent_path)
+    merged_agent = gh.merge_kiro_managed_block(existing_agent, agent_block)
+
+    if dry_run:
+        _eprint(f"[dry-run] would write {steering_path}")
+        sys.stdout.write("--- steering ---\n")
+        sys.stdout.write(steering_block)
+        _eprint(f"[dry-run] would write {agent_path}")
+        sys.stdout.write("--- agent ---\n")
+        sys.stdout.write(agent_block)
+        return 0
+
+    steering_path.parent.mkdir(parents=True, exist_ok=True)
+    gh.atomic_write_text(steering_path, merged_steering)
+    _eprint(f"[grip-harness] wrote Kiro steering → {steering_path}")
+
+    agent_path.parent.mkdir(parents=True, exist_ok=True)
+    gh.atomic_write_text(agent_path, merged_agent)
+    _eprint(f"[grip-harness] wrote Kiro agent → {agent_path}")
+
+    print(
+        "Done. GRIP context is now wired into Kiro CLI:\n"
+        f"  Steering : {steering_path}  (injected into every session)\n"
+        f"  Agent    : {agent_path}  (select with `/agent grip` in Kiro)\n"
+        "\n"
+        "Note: Kiro's model endpoint is AWS-backed — HAL gateway wiring does\n"
+        "not apply. The integration uses steering + agent config only."
+    )
+    return 0
+
+
+# --- Wave-2 handlers (2026-08-19) -------------------------------------------
+# Generic BY MECHANISM, never by content. The emitters differ per harness
+# because the tools genuinely differ (goose splits host from path, hermes needs
+# a magic provider value, interpreter needs an openai/ prefix). What is uniform
+# is the plumbing — read, merge, write atomically — so only that is shared.
+
+#: harness -> how its config file is merged. Absent = nothing to write.
+_WAVE2_FENCED_YAML = ("hermes", "continue", "interpreter", "goose")
+_WAVE2_FENCED_TOML = ("codewhale",)
+_WAVE2_JSON = ("cline", "kilo", "pi")
+#: No writable global config: the emitter PRINTS the steps (as cursor does).
+_WAVE2_PRINT_ONLY = ("qwen", "crush", "trueforge")
+
+
+def _wave2_file_handler(harness: str):
+    """Build a handler that merges this harness's block into its config file."""
+
+    def handler(args: list[str]) -> int:
+        err, model, dry = _parse_model_dry(harness, args)
+        if err:
+            _eprint(err)
+            return 2
+        emitter = gh.EMITTERS[harness]
+        cfg = Path(gh.HARNESSES[harness]["config_path"]).expanduser()
+        existing = _read_text(cfg)
+
+        if harness in _WAVE2_JSON:
+            # The JSON mergers parse the existing document and raise rather
+            # than clobber it, so a hand-edited file survives a bad parse as a
+            # loud error instead of silently becoming GRIP's version.
+            try:
+                merged = emitter(existing, model)
+            except ValueError as e:
+                _eprint(f"grip-harness {harness}: {e}")
+                return 2
+            preview = merged
+        else:
+            block = emitter(model)
+            if gh.has_truncated_fence(existing):
+                _eprint(f"grip-harness {harness}: {cfg} has an unterminated "
+                        "GRIP-MANAGED fence — refusing to merge. Repair it by hand.")
+                return 2
+            merger = (gh.merge_managed_toml if harness in _WAVE2_FENCED_TOML
+                      else gh.merge_managed_block)
+            if harness == "hermes":
+                merger = gh.merge_hermes_config
+            merged = merger(existing, block)
+            preview = block
+
+        spec = gh.HARNESSES[harness]
+        if dry:
+            _eprint(f"[dry-run] would write {cfg}  "
+                    f"(confidence: {spec.get('confidence', 'unknown')})")
+            sys.stdout.write(preview)
+            return 0
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        writer = gh.write_config_text if harness == "hermes" else gh.atomic_write_text
+        writer(cfg, merged)
+        _eprint(f"[grip-harness] wired {harness} -> HAL :4010 in {cfg}")
+        if harness == "hermes":
+            _project_style("hermes")      # the persona file, ~/.hermes/SOUL.md
+        if spec.get("confidence") == "docs-only":
+            # Say so out loud. A docs-only key that is wrong produces a config
+            # the tool parses and ignores, which looks exactly like success.
+            _eprint(f"[grip-harness] NOTE: {harness} config keys are "
+                    "documentation-derived, not verified against a live wire. "
+                    "If it does not take effect, the key names are the first "
+                    "thing to check.")
+        return 0
+
+    handler.__name__ = f"cmd_{harness.replace('-', '_')}"
+    return handler
+
+
+def _wave2_print_handler(harness: str):
+    """Build a handler that prints wiring steps for a harness with no file."""
+
+    def handler(args: list[str]) -> int:
+        err, model, _dry = _parse_model_dry(harness, args)
+        if err:
+            _eprint(err)
+            return 2
+        _eprint(f"[grip-harness] {harness} has no config file GRIP can write "
+                f"— {gh.HARNESSES[harness]['config_path']}")
+        sys.stdout.write(gh.EMITTERS[harness](model))
+        return 0
+
+    handler.__name__ = f"cmd_{harness.replace('-', '_')}"
+    return handler
+
+
+_DISPATCH = {
+    "codex": cmd_codex,
+    "aider": cmd_aider,
+    "opencode": cmd_opencode,
+    "cursor": cmd_cursor,
+    "agy": cmd_agy,
+    "kiro": cmd_kiro,
+    "style": cmd_style,
+    "env": cmd_env,
+    "doctor": cmd_doctor,
+    "list": cmd_list,
+}
+
+# Wave 2 registers through the same table, so `main` needs no special case.
+for _h in (*_WAVE2_FENCED_YAML, *_WAVE2_FENCED_TOML, *_WAVE2_JSON):
+    _DISPATCH[_h] = _wave2_file_handler(_h)
+for _h in _WAVE2_PRINT_ONLY:
+    _DISPATCH[_h] = _wave2_print_handler(_h)
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        _eprint(__doc__)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    handler = _DISPATCH.get(cmd)
+    if handler is None:
+        # Unknown command may name a planned harness — say so explicitly.
+        spec = gh.HARNESSES.get(cmd)
+        if spec is not None and spec["status"] == "env-wire":
+            _eprint(f"grip-harness: {cmd!r} is wired per-launch by env, not by config file.")
+            _eprint(f"  {spec['note']}")
+            _eprint("  Use: GRIP_INFINITE=1 grip    (opt-in; fail-open when the gateway is down)")
+            _eprint("  (exit 4: informational — no config file was emitted)")
+            return 4
+        if spec is not None and spec["status"] == "planned":
+            _eprint(f"grip-harness: harness {cmd!r} is PLANNED, not yet implemented.")
+            _eprint(f"  {spec['note']}")
+            _eprint(f"  Supported now: {list(gh.SUPPORTED_HARNESSES)}")
+            return 3
+        _eprint(f"grip-harness: unknown command/harness {cmd!r}. "
+                f"Try: {list(_DISPATCH)} (see --help).")
+        return 2
+    return handler(rest)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

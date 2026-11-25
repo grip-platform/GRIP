@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# grip-kimi — launch Moonshot's Kimi Code CLI with GRIP's HAL gateway route live.
+#
+# WHY THIS EXISTS. Kimi Code CLI reads its providers from ~/.kimi-code/config.toml
+# and states that it "does not fall back to shell environment variables for
+# credentials" (providers.html:42, read as text 2026-09-07). So the route has to be
+# IN THE FILE before the CLI starts, and this launcher's job is to keep it there —
+# idempotently, without touching anything the operator wrote — and then hand over
+# to `kimi` unchanged. lib/kimi_hal_route.py is the writer; this shim calls it,
+# exports the gateway doorstop, and execs. lib/harness/kimi.py points its
+# EXECUTABLE here for the same reason CodexHarness points at grip-codex: a bare
+# binary launched from code has no route and no credential.
+#
+# THE CREDENTIAL IS ANSWERED IN THE FILE, NOT HERE. [providers.hal] carries
+# `api_key = "grip-local-doorstop"`, a PLACEHOLDER the gateway discards (HAL
+# attaches its own per-provider keychain key, lib/hal/gateway_egress.py).
+# HAL_GATEWAY_KEY is still exported below, for parity with grip-codex/grip-dsh and
+# for anything kimi spawns that does read it (an MCP server, say). It is NEVER a
+# real Anthropic credential: this route lists only Moonshot ids, so a placeholder
+# is exactly what makes an accidental Anthropic fall-through fail loudly with 401
+# rather than quietly spend the weekly limit (bin/grip-dsh, verified 2026-08-19).
+# That is a deliberate departure from bin/grip-codex, which must read a real key
+# because codex can be pointed at claude-* ids; kimi cannot be, from this route.
+#
+# Provenance (vendor docs read as text on 2026-09-07): getting-started.html:42 the
+# install line, :55-56 `kimi -p`, :97 `kimi --version`; providers.html:42 the
+# credential rule. The CLI was not installed where this was written, so
+# bin/grip-kimi-verify is the operator's first-install proof.
+#
+# Usage: grip-kimi [<kimi args>...]      e.g. grip-kimi -p "summarise this repo"
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+KEYCHAIN_SERVICE="grip-hal-gateway-token"
+GATEWAY_BASE="http://127.0.0.1:4010"
+INSTALL_LINE='curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash'
+
+# Cross-platform keychain reader, verbatim from bin/grip-codex so the shims stay
+# the same shape on every OS. Reads ONLY the placeholder service above.
+_kv_get() {
+  case "$(uname -s)" in
+    Darwin)
+      security find-generic-password -s "$1" -w 2>/dev/null
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      GK_N="$1" powershell -NoProfile -Command '
+        $v=[Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime]::new();
+        try { $c=$v.Retrieve($env:GK_N,"grip"); $c.RetrievePassword(); [Console]::Out.Write($c.Password) } catch { exit 1 }' 2>/dev/null
+      ;;
+    Linux)
+      secret-tool lookup service "$1" 2>/dev/null
+      ;;
+  esac
+}
+
+# 1. The vendor binary must exist. 127 is the shell's own "command not found", so
+#    a caller sees the code a missing binary would give — with the reason and the
+#    vendor's documented install line, never a guessed package name. GRIP does not
+#    install third-party binaries on the operator's behalf.
+if ! command -v kimi >/dev/null 2>&1; then
+  >&2 echo "[grip-kimi] kimi is not on PATH — Kimi Code CLI is not installed on this machine."
+  >&2 echo "[grip-kimi] GRIP never installs third-party binaries for you. The vendor's documented install is:"
+  >&2 echo "[grip-kimi]   $INSTALL_LINE"
+  >&2 echo "[grip-kimi] then run grip-kimi-verify to prove it boots through the HAL route."
+  exit 127
+fi
+
+# 2. Keep config.toml carrying the hal route. Idempotent: rewrites nothing when
+#    the block is already current, and REFUSES (so we refuse to launch) when the
+#    file is corrupt or the operator already owns [providers.hal] — launching with
+#    an unknown route would fail at the first request, far from its cause.
+#    GRIP's dependencies live in the venv; worktrees carry none of their own, so
+#    the shared tree's venv is the fallback (the grip-dsh ladder).
+#    resolve_venv_python knows both layouts (Windows Scripts/python.exe, POSIX
+#    bin/python3) but falls back to the SYSTEM python, so a candidate counts
+#    only inside its own venv.
+if [[ -f "$CLAUDE_DIR/lib/kimi_hal_route.py" ]]; then
+  source "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib/venv-utils.sh"
+  for venv in "$CLAUDE_DIR/venv" "$HOME/.grip/venv" "$HOME/.claude/venv"; do
+    candidate="$(resolve_venv_python "$venv" || true)"
+    [[ "$candidate" == "$venv/"* ]] && PY="$candidate" && break
+  done
+  if [[ -z "${PY:-}" ]]; then
+    >&2 echo "[grip-kimi] no GRIP venv found; system python3 is not used."
+    >&2 echo "[grip-kimi] looked in: \$CLAUDE_DIR/venv, ~/.grip/venv, ~/.claude/venv"
+    exit 1
+  fi
+  "$PY" "$CLAUDE_DIR/lib/kimi_hal_route.py" || {
+    >&2 echo "[grip-kimi] could not update config.toml — refusing to launch with an unknown route"
+    exit 1
+  }
+fi
+
+# 3. The doorstop. An exported value wins (the documented direct-invocation
+#    contract, as grip-dsh); the keychain PLACEHOLDER item is next; the literal is
+#    last. Never fatal: refusing to launch over a value nothing authenticates
+#    against would be the worse failure (bin/grip-codex header).
+if [[ -n "${HAL_GATEWAY_KEY:-}" ]]; then
+  :   # caller supplied it; nothing to resolve
+elif HAL_GATEWAY_KEY="$(_kv_get "$KEYCHAIN_SERVICE")" && [[ -n "$HAL_GATEWAY_KEY" ]]; then
+  :   # keychain placeholder
+else
+  HAL_GATEWAY_KEY="grip-local-doorstop"
+fi
+export HAL_GATEWAY_KEY
+
+# 4. The gateway being down is a runtime fact, not a config error — say so and
+#    launch anyway; it can be started while kimi is running. /health only, read
+#    without a pipe, matching the grip-dsh rationale (a /v1 completion probe
+#    round-trips to an upstream provider and reports a healthy gateway as down).
+_gw_health="$(curl -sf --max-time 2 "$GATEWAY_BASE/health" 2>/dev/null || true)"
+if [[ ! "$_gw_health" =~ \"service\"[[:space:]]*:[[:space:]]*\"hal-gateway[\"/] ]]; then
+  >&2 echo "[grip-kimi] note: could not confirm a HAL gateway on 127.0.0.1:4010 — the hal"
+  >&2 echo "[grip-kimi] route may fail until it is started. Start it, then retry in-session."
+fi
+
+exec kimi "$@"

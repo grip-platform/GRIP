@@ -1,0 +1,731 @@
+#!/bin/bash
+# grip-black-october -- check one Mac or Linux box against the October 2026
+# ("Black October") security floors, then apply each fix only after a typed yes.
+#
+# Standalone on purpose: bash 3.2 (macOS /bin/bash) or newer, no GRIP imports,
+# copy the file as it is. Nothing here installs, binds or restarts anything in
+# `check` mode. Every fix shows its exact commands first, waits for the word
+# "yes" on stdin, announces every sudo, and re-runs the matching check after.
+#
+#   grip-black-october check [--network] [--json]   ten read-only checks
+#   grip-black-october fix <id> [--ssh-off] [--label L]   one fix, with a typed yes
+#   grip-black-october undo <id>                     the README's undo for that fix
+#   grip-black-october list                          the fix and undo ids
+#
+# The floors come from the vendor sources named beside each one. They were
+# checked against those sources on 2026-10-26 (GRIP docs/measurements/
+# 2026-10-26-black-october-proving-ground.md); versions change, so re-check.
+#
+# Trust lists are NOT embedded. The two trust fixes fetch roots.json and
+# impacted-intermediates.json from the incident page at run time and refuse
+# unless each file's sha256 equals the value pinned below after a human review.
+# A mismatch means the list changed: review it, then re-pin.
+#
+# Never prints a secret: tokens are counted, never shown. Never pipes a download
+# into a shell. Process arguments and file contents stay out of the report.
+#
+# Windows has a twin, bin/grip-black-october.ps1 (GRIP#8858): the same item names,
+# statuses, JSON shape and floors, and tests/test_grip_black_october_parity.py keeps
+# the shared floors, pins and probe targets equal in both files.
+
+set -u
+
+GBO_VERSION="2026.11.09"
+# The checks ask several Pythons one-line questions; Apple's python3 writes a
+# bytecode cache under ~/Library/Caches when it answers. A check writes nothing.
+export PYTHONDONTWRITEBYTECODE=1
+
+# ---- floors (vendor source beside each) --------------------------------------
+FLOOR_MACOS="26.7.1"            # support.apple.com/en-us/149228 (CVE-2026-86950)
+FLOOR_NODE_26="26.12.1"         # nodejs.org October 2026 security releases
+FLOOR_NODE_24="24.22.1"         #   (CVE-2026-111497, Brotli decoder OOB write)
+FLOOR_NODE_22="22.23.4"
+FLOOR_BROTLI="1.2.1"            # github.com/google/brotli/releases/tag/v1.2.1
+FLOOR_BUN="1.4.4"               # github.com/oven-sh/bun/issues/46352
+FLOOR_CLAUDE="2.1.308"          # README check 4 (marker control=3 fix=3 at 2.1.308)
+FLOOR_PIP="26.2.2"              # pip.pypa.io/en/stable/news/ (2026-10-20)
+FLOOR_UV="0.13.5"               # github.com/astral-sh/uv/releases/tag/0.13.5
+FLOOR_CERTIFI="2026.10.19"      # certifi git: "Remove emsign" 2026-10-18
+FLOOR_CA_CERTS="2026-10-20"     # Homebrew ca-certificates after certifi's change
+FLOOR_TAILSCALE="1.104.2"       # tailscale.com/security-bulletins TS-2026-013
+FLOOR_CHROME="156"              # chromereleases.googleblog.com (353 fixes)
+FLOOR_PHP_85="8.5.12"; FLOOR_PHP_84="8.4.27"; FLOOR_PHP_83="8.3.36"; FLOOR_PHP_82="8.2.35"
+FLOOR_RUBY_40="4.0.9"; FLOOR_RUBY_34="3.4.12"; FLOOR_RUBY_33="3.3.13"
+FLOOR_NEXT_16="16.4.1"; FLOOR_NEXT_15="15.5.28"; FLOOR_SHARP="0.35.5"
+FLOOR_STORYBOOK_8="8.6.19"; FLOOR_STORYBOOK_9="9.1.21"; FLOOR_STORYBOOK_10="10.6.2"
+FLOOR_PILLOW="13.0.0"
+
+# ---- the incident page lists, pinned by sha256 after human review ------------
+INCIDENT_BASE="https://emudhra.we-have-a-problem.com"
+ROOTS_JSON_SHA256="119f32cd81a6b5a4e3c4c2df5fe07daa90dc43cafa123a62f0394f1895d92380"
+INTERMEDIATES_JSON_SHA256="f67b3abe9b4879f4e91874ed041beccd71257f1db41c588c724ccf12aa90c59e"
+# The two roots F4 step 2 removes from /etc/ssl/cert.pem, matched by subject
+# name in the pinned roots.json; their fingerprints are re-derived from the PEM.
+ROOT_NAMES="AAA Certificate Services|emSign ECC Root CA - G3"
+EXPECTED_INTERMEDIATES=16
+
+OS_NAME="$(uname -s 2>/dev/null || echo unknown)"
+WORK_DIR="${GBO_WORK_DIR:-$HOME/.grip-black-october}"
+CERT_PEM_BACKUP="/etc/ssl/cert.pem.bak-emudhra-2026-10-22"
+# Two paths the hermetic tests point at files of their own; the fixes keep the real ones.
+TAILSCALE_APP_PLIST="${GBO_TAILSCALE_APP_PLIST:-/Applications/Tailscale.app/Contents/Info.plist}"
+CERT_PEM="${GBO_CERT_PEM:-/etc/ssl/cert.pem}"
+WANT_NETWORK=0
+WANT_JSON=0
+ROWS=""
+
+# ---- small helpers ------------------------------------------------------------
+say() { printf '%s\n' "$*"; }
+warn() { printf '%s\n' "$*" >&2; }
+is_mac() { [ "$OS_NAME" = "Darwin" ]; }
+is_linux() { [ "$OS_NAME" = "Linux" ]; }
+have() { command -v "$1" >/dev/null 2>&1; }
+# in_root CMD...: run CMD from /, where no ordinary account can leave a file. A Python
+# started with -c or -m looks in the current folder before its own libraries, so a
+# certifi.py, a pip package, a PIL package or an ssl.py in the folder this script was
+# started from would run as the user. uv reads a uv.toml from the current folder too,
+# which can change where it downloads from. Python's -I would also close the door, but
+# it hides the user's own site-packages, so a check would read the wrong certifi.
+in_root() { (cd / && "$@"); }
+
+# vge A B: 0 when version A >= version B. Dots separate components; a leading
+# "v" and anything after the first non-digit in a component are ignored.
+vge() {
+    local a="${1#v}" b="${2#v}" ia ib i
+    # A trailing dot makes every string carry the delimiter, so `cut` on a
+    # one-component version ("156") yields empty fields past the first instead
+    # of repeating the whole string (cut prints a delimiter-less line whole).
+    a="$(printf '%s' "$a" | tr -c '0-9.\n' '.')."; b="$(printf '%s' "$b" | tr -c '0-9.\n' '.')."
+    i=1
+    while [ "$i" -le 6 ]; do
+        ia="$(printf '%s' "$a" | cut -d. -f"$i")"; ib="$(printf '%s' "$b" | cut -d. -f"$i")"
+        ia="${ia:-0}"; ib="${ib:-0}"
+        [ "$ia" -gt "$ib" ] 2>/dev/null && return 0
+        [ "$ia" -lt "$ib" ] 2>/dev/null && return 1
+        i=$((i + 1))
+    done
+    return 0
+}
+
+# status_for VERSION FLOOR -> "ok" or "at risk" ("unknown" when VERSION is empty)
+status_for() { [ -n "$1" ] || { printf 'unknown'; return; }; vge "$1" "$2" && printf 'ok' || printf 'at risk'; }
+
+row() { ROWS="${ROWS}${1}|${2}|${3}
+"; }
+
+# every executable named $1 on PATH, one per line, duplicates by real path removed
+each_on_path() {
+    local name="$1" d p seen="" r
+    local IFS=:
+    for d in $PATH; do
+        p="$d/$name"
+        [ -x "$p" ] || continue
+        r="$(readlink -f "$p" 2>/dev/null || printf '%s' "$p")"
+        case "$seen" in *"|$r|"*) continue ;; esac
+        seen="$seen|$r|"; printf '%s\n' "$p"
+    done
+}
+
+sha256_of() { if have shasum; then shasum -a 256 "$1" | cut -d' ' -f1; else sha256sum "$1" | cut -d' ' -f1; fi; }
+
+# brotli_fixed FILE: the README's marker. control>0 and fix=0 reads unpatched;
+# control=0 means the marker does not apply. A clue, not proof (README check 2).
+brotli_fixed() {
+    local c f
+    have strings || { printf 'control=? fix=? (no strings tool)'; return; }
+    c="$(strings -n 8 "$1" 2>/dev/null | grep -c FORMAT_EXUBERANT_NIBBLE)"
+    f="$(strings -n 8 "$1" 2>/dev/null | grep -c FORMAT_BLOCK_SWITCH)"
+    printf 'control=%s fix=%s' "$c" "$f"
+}
+
+brew_prefix() { if have brew; then brew --prefix 2>/dev/null; elif [ -d /opt/homebrew ]; then printf '/opt/homebrew'; elif [ -d /usr/local/Homebrew ]; then printf '/usr/local'; fi; }
+cellar_versions() { local p; p="$(brew_prefix)"; [ -n "$p" ] && ls "$p/Cellar/$1" 2>/dev/null | tr '\n' ' ' | sed 's/ $//'; }
+cellar_current() { local p; p="$(brew_prefix)"; [ -n "$p" ] && readlink "$p/opt/$1" 2>/dev/null | sed 's|.*/||'; }
+
+code_dirs() {
+    if [ -n "${GBO_CODE_DIRS:-}" ]; then printf '%s' "$GBO_CODE_DIRS" | tr ':' '\n'
+    else printf '%s\n' "$HOME/CodeTonight" "$HOME/.grip" "$HOME/.hal" "$HOME/Developer" "$HOME/code" "$HOME/src"; fi
+}
+existing_code_dirs() { code_dirs | while IFS= read -r d; do [ -d "$d" ] && printf '%s\n' "$d"; done; }
+
+# the Pythons worth asking: every python3 on PATH, Apple's, and the venvs
+pythons() {
+    local p
+    each_on_path python3
+    [ -x /usr/bin/python3 ] && printf '%s\n' /usr/bin/python3
+    for p in "$HOME/.claude/venv/bin/python" "$HOME/.grip/venv/bin/python" "$HOME/.hal/venv/bin/python"; do [ -x "$p" ] && printf '%s\n' "$p"; done  # venv-path-ok(this file is copied as it is to other machines and sources nothing from GRIP, so venv-utils.sh is not available to it; it only READS these venvs to report their pip and certifi versions and never runs GRIP under them; Windows is out of scope for a bash checklist, and GBO_PYTHONS adds any other venv)
+    [ -n "${GBO_PYTHONS:-}" ] && printf '%s' "$GBO_PYTHONS" | tr ':' '\n'
+    true
+}
+# deduplicated by the path as given, never by the interpreter it points at: a
+# venv's python is a symlink to the interpreter it was made from, and only the
+# symlink path sees the venv's own pip, certifi and Pillow. Two venv paths that
+# are the same directory (one reached through a symlinked home dir) count once.
+unique_pythons() {
+    local p key seen=""
+    pythons | while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        key="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)/$(basename "$p")"
+        case "$seen" in *"|$key|"*) continue ;; esac
+        seen="$seen|$key|"; printf '%s\n' "$p"
+    done
+}
+
+# ---- the checks ----------------------------------------------------------------
+check_os() {
+    local v
+    if is_mac; then
+        v="$(sw_vers -productVersion 2>/dev/null)"
+        row "macos" "$(status_for "$v" "$FLOOR_MACOS")" "sw_vers $v; floor $FLOOR_MACOS (CoreGraphics CVE-2026-86950); a 27.x reading is newer than the floor, and the fix is documented for 26.7.1"
+    else
+        row "macos" "n/a" "not macOS ($OS_NAME $(uname -r 2>/dev/null))"
+    fi
+}
+
+check_node() {
+    local n v major floor found=0
+    for n in $(each_on_path node) "$HOME"/.nvm/versions/node/*/bin/node; do
+        [ -x "$n" ] || continue
+        v="$("$n" -v 2>/dev/null)"; v="${v#v}"
+        [ -n "$v" ] || { row "node" "unknown" "$n: does not run"; found=1; continue; }
+        major="${v%%.*}"
+        case "$major" in 26) floor="$FLOOR_NODE_26" ;; 24) floor="$FLOOR_NODE_24" ;; 22) floor="$FLOOR_NODE_22" ;; *) floor="" ;; esac
+        if [ -n "$floor" ]; then row "node" "$(status_for "$v" "$floor")" "$n v$v; floor $floor"
+        else row "node" "unknown" "$n v$v; no fixed release published for major $major (end of life?)"; fi
+        found=1
+    done
+    [ "$found" -eq 1 ] || row "node" "n/a" "no node on PATH or under ~/.nvm"
+}
+
+check_brotli() {
+    local cur all lib marker
+    if is_mac; then
+        cur="$(cellar_current brotli)"; all="$(cellar_versions brotli)"
+        if [ -z "$cur" ]; then row "brotli" "n/a" "no Homebrew brotli"; return; fi
+        lib="$(brew_prefix)/opt/brotli/lib/libbrotlidec.1.dylib"
+        marker="$([ -f "$lib" ] && brotli_fixed "$lib")"
+        row "brotli" "$(status_for "$cur" "$FLOOR_BROTLI")" "Homebrew brotli $cur (installed: $all); floor $FLOOR_BROTLI; libbrotlidec marker $marker"
+        row "brotli-in-memory" "$(brotli_in_memory_status)" "$(brotli_in_memory_evidence)"
+    else
+        lib="$(ls /usr/lib/*/libbrotlidec.so.1 /usr/lib64/libbrotlidec.so.1 2>/dev/null | head -1)"
+        [ -n "$lib" ] || { row "brotli" "n/a" "no system libbrotlidec found"; return; }
+        marker="$(brotli_fixed "$lib")"
+        case "$marker" in *"fix=0"*) row "brotli" "at risk" "$lib marker $marker (unpatched by the marker; the distro's fixed package version decides)" ;;
+            *) row "brotli" "unknown" "$lib marker $marker (patched by the marker; confirm with the distro advisory)" ;; esac
+    fi
+}
+brotli_in_memory_count() { lsof -nP 2>/dev/null | grep libbrotlidec | grep -v "brotli/$FLOOR_BROTLI" | awk '{print $2}' | sort -u | grep -c . ; }
+brotli_in_memory_status() { local c; c="$(brotli_in_memory_count)"; [ "$c" -eq 0 ] && printf 'ok' || printf 'at risk'; }
+brotli_in_memory_evidence() {
+    local c cmds; c="$(brotli_in_memory_count)"
+    cmds="$(lsof -nP 2>/dev/null | grep libbrotlidec | grep -v "brotli/$FLOOR_BROTLI" | awk '{print $1}' | sort | uniq -c | awk '{printf "%s x%s ", $2, $1}')"
+    printf '%s process(es) of this user hold a brotli older than %s in memory (%s); without sudo only your own processes are seen' "$c" "$FLOOR_BROTLI" "${cmds:-none}"
+}
+
+check_bun() {
+    local v oc ev
+    if have bun; then v="$(bun --version 2>/dev/null)"; row "bun" "$(status_for "$v" "$FLOOR_BUN")" "bun $v; floor $FLOOR_BUN"
+    else row "bun" "n/a" "no standalone bun on PATH"; fi
+    if have opencode; then
+        oc="$(readlink -f "$(command -v opencode)" 2>/dev/null)"
+        ev="$(strings -n 6 "$oc" 2>/dev/null | grep -m1 -oE 'Bun v1\.[0-9]+\.[0-9]+' | sed 's/Bun v//')"
+        row "bun-tools" "$(status_for "$ev" "$FLOOR_BUN")" "opencode $(opencode --version 2>/dev/null | head -1) embeds Bun ${ev:-?}; floor $FLOOR_BUN; marker $(brotli_fixed "$oc"); report only: wait for an opencode release with a fixed Bun"
+    fi
+}
+
+check_claude() {
+    local b v ev deny
+    have claude || { row "claude" "n/a" "no claude on PATH"; return; }
+    b="$(readlink -f "$(command -v claude)" 2>/dev/null)"
+    v="$(claude --version 2>/dev/null | head -1 | awk '{print $1}')"
+    ev="$(strings -n 6 "$b" 2>/dev/null | grep -m1 -oE 'Bun v1\.[0-9]+\.[0-9]+')"
+    deny="$(grep -c '"WebFetch"' "$HOME/.claude/settings.json" 2>/dev/null || true)"
+    row "claude" "$(status_for "$v" "$FLOOR_CLAUDE")" "Claude Code $v (${ev:-no Bun string}); floor $FLOOR_CLAUDE; marker $(brotli_fixed "$b"); WebFetch deny lines in settings: ${deny:-0}"
+}
+
+check_tailscale() {
+    local cli app daemon st ev prefs serve
+    have tailscale || [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ] || { row "tailscale" "n/a" "no tailscale"; return; }
+    cli="$(tailscale version 2>/dev/null | head -1)"
+    app=""; is_mac && [ -f "$TAILSCALE_APP_PLIST" ] && app="$(plutil -extract CFBundleShortVersionString raw -o - "$TAILSCALE_APP_PLIST" 2>/dev/null)"
+    daemon="${app:-$cli}"
+    st="$(status_for "$daemon" "$FLOOR_TAILSCALE")"
+    ev="daemon $daemon; floor $FLOOR_TAILSCALE (TS-2026-013)"
+    if [ -n "$app" ] && [ -n "$cli" ] && [ "$app" != "$cli" ]; then ev="$ev; TWO INSTALLS: CLI $cli (Homebrew) and app $app; 'tailscale version' reads the CLI, the app is the daemon"; fi
+    row "tailscale" "$st" "$ev"
+    prefs="$(tailscale debug prefs 2>/dev/null | grep -E '"RunSSH"|"Advertise"' | tr -d ' \t' | tr '\n' ' ')"
+    serve="$(tailscale serve status --json 2>/dev/null | grep -cE 'unix:|AcceptAppCaps' || true)"
+    case "$prefs" in
+        "") row "tailworm" "unknown" "prefs unreadable (daemon not running or no socket access)" ;;
+        *'"RunSSH":true'*|*'"Advertise":true'*) row "tailworm" "at risk" "$prefs serve-entries=${serve:-0}; a flagged feature is on (Tailscale SSH or the app connector)" ;;
+        *) row "tailworm" "ok" "$prefs serve-entries=${serve:-0}; none of the 11 Tailworm findings applies" ;;
+    esac
+}
+
+check_chrome() {
+    local v
+    if is_mac; then v="$(plutil -extract CFBundleShortVersionString raw -o - '/Applications/Google Chrome.app/Contents/Info.plist' 2>/dev/null)"
+    elif have google-chrome; then v="$(google-chrome --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)"; fi
+    [ -n "${v:-}" ] || { row "chrome" "n/a" "no Chrome found"; return; }
+    row "chrome" "$(status_for "$v" "$FLOOR_CHROME")" "Chrome $v; floor $FLOOR_CHROME (353 security fixes)"
+}
+
+check_python_tools() {
+    local py pipv certv pyv st
+    for py in $(unique_pythons); do
+        pyv="$(in_root "$py" -c 'import sys;print(sys.version.split()[0])' 2>/dev/null)"
+        pipv="$(in_root "$py" -m pip --version 2>/dev/null | awk '{print $2}')"
+        certv="$(in_root "$py" -c 'import certifi;print(certifi.__version__)' 2>/dev/null)"
+        if [ -z "$pipv" ]; then row "pip" "n/a" "$py (python $pyv) has no pip"
+        else
+            st="$(status_for "$pipv" "$FLOOR_PIP")"
+            case "$py" in
+                /usr/bin/python3) if is_mac; then row "pip" "$st" "$py pip $pipv; floor $FLOOR_PIP; Apple's python: do not install packages with it"
+                                  else row "pip" "$st" "$py (python $pyv) pip $pipv; floor $FLOOR_PIP; the distribution's python: its pip comes from the package manager, not from pip"; fi ;;
+                *) row "pip" "$st" "$py (python $pyv) pip $pipv; floor $FLOOR_PIP" ;;
+            esac
+        fi
+        [ -n "$certv" ] && row "certifi" "$(status_for "$certv" "$FLOOR_CERTIFI")" "$py certifi $certv; floor $FLOOR_CERTIFI"
+    done
+    if have uv; then row "uv" "$(status_for "$(in_root uv --version 2>/dev/null | awk '{print $2}')" "$FLOOR_UV")" "$(in_root uv --version 2>/dev/null); floor $FLOOR_UV (0.13.5 rejects chains with a compromised intermediate)"
+    else row "uv" "n/a" "no uv on PATH"; fi
+    if is_mac && [ -n "$(cellar_current ca-certificates)" ]; then
+        row "ca-certificates" "$(status_for "$(cellar_current ca-certificates)" "$FLOOR_CA_CERTS")" "Homebrew ca-certificates $(cellar_current ca-certificates); floor $FLOOR_CA_CERTS"
+        [ -n "$(cellar_current certifi)" ] && row "certifi" "$(status_for "$(cellar_current certifi)" "$FLOOR_CERTIFI")" "Homebrew certifi $(cellar_current certifi); floor $FLOOR_CERTIFI"
+    fi
+}
+
+check_cert_pem() {
+    local f="$CERT_PEM" n present
+    is_mac || { [ -f /etc/ca-certificates.conf ] && check_debian_ca; return; }
+    [ -f "$f" ] || { row "cert-pem" "unknown" "$f missing"; return; }
+    n="$(grep -c 'BEGIN CERTIFICATE' "$f")"
+    present="$(grep -E "^=== .*CN=($ROOT_NAMES)" "$f" | sed 's/.*CN=//' | tr '\n' ';')"
+    if [ -n "$present" ]; then row "cert-pem" "at risk" "$f holds $n certificates including: $present (F4 step 2 removes them by fingerprint); backup $([ -f "$CERT_PEM_BACKUP" ] && echo present || echo absent)"
+    else row "cert-pem" "ok" "$f holds $n certificates, neither affected root by name; backup $([ -f "$CERT_PEM_BACKUP" ] && echo present || echo absent)"; fi
+}
+check_debian_ca() {
+    local f=/etc/ca-certificates.conf a b off
+    a="$(grep -c '^mozilla/emSign_ECC_Root_CA_-_G3.crt' "$f" 2>/dev/null || true)"; b="$(grep -c '^mozilla/Comodo_AAA_Services_root.crt' "$f" 2>/dev/null || true)"
+    off="$(grep -c '^!mozilla/\(emSign_ECC_Root_CA_-_G3\|Comodo_AAA_Services_root\)\.crt' "$f" 2>/dev/null || true)"
+    if [ "${a:-0}" -gt 0 ] || [ "${b:-0}" -gt 0 ]; then row "debian-ca" "at risk" "$f still enables emSign ECC Root CA - G3 ($a) or Comodo AAA Services ($b); fix debian-ca"
+    elif [ "${off:-0}" -eq 2 ]; then row "debian-ca" "ok" "$f: both affected roots are commented out (lines starting with !)"
+    elif [ "${off:-0}" -eq 1 ]; then row "debian-ca" "ok" "$f: one affected root is commented out and the other is not listed under its Mozilla name"
+    else row "debian-ca" "unknown" "$f lists neither affected root under its Mozilla name; the bundle may carry them under other names, so run check --network"; fi
+}
+
+check_keychain_deny() {
+    is_mac || return 0
+    local n
+    n="$(security dump-trust-settings -d 2>/dev/null | grep -c 'eMudhra\|EM DV\|EM OV\|EM EV' || true)"
+    row "keychain-deny" "$([ "${n:-0}" -gt 0 ] && echo ok || echo unknown)" "admin trust settings mention eMudhra certificates ${n:-0} time(s); F4 step 3 adds 16 deny entries; whether macOS honours a deny for a certificate in no keychain is unverified (README)"
+}
+
+check_servers() {
+    local v major r f d py pv ole st floor
+    if have php; then v="$(php -v 2>/dev/null | head -1 | awk '{print $2}')"; major="$(printf '%s' "$v" | cut -d. -f1,2)"
+        case "$major" in 8.5) floor="$FLOOR_PHP_85" ;; 8.4) floor="$FLOOR_PHP_84" ;; 8.3) floor="$FLOOR_PHP_83" ;; 8.2) floor="$FLOOR_PHP_82" ;; *) floor="" ;; esac
+        [ -n "$floor" ] && row "php" "$(status_for "$v" "$floor")" "php $v; floor $floor (PHP2Shell)" || row "php" "unknown" "php $v; no fixed release for this branch"
+    else row "php" "n/a" "no php"; fi
+    have gitlab-ctl && row "gitlab" "at risk" "gitlab-ctl present: every self-managed release since 7.0 is affected (CVE-2026-110264); update" || row "gitlab" "n/a" "no gitlab-ctl"
+    for r in $(each_on_path ruby); do
+        v="$("$r" -v 2>/dev/null | awk '{print $2}' | sed 's/p.*//')"; major="$(printf '%s' "$v" | cut -d. -f1,2)"
+        case "$r" in /usr/bin/ruby) row "ruby" "n/a" "$r $v is Apple's; do not run servers on it"; continue ;; esac
+        case "$major" in 4.0) floor="$FLOOR_RUBY_40" ;; 3.4) floor="$FLOOR_RUBY_34" ;; 3.3) floor="$FLOOR_RUBY_33" ;; *) floor="" ;; esac
+        [ -n "$floor" ] && row "ruby" "$(status_for "$v" "$floor")" "$r $v; floor $floor (regexp fixes)" || row "ruby" "unknown" "$r $v; no fix on this branch (3.2 and older get none)"
+    done
+    for d in $(existing_code_dirs); do
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            v="$(grep -m1 '"version"' "$f" | sed 's/.*: *"//; s/".*//')"; major="${v%%.*}"
+            case "$major" in 16) floor="$FLOOR_NEXT_16" ;; 15) floor="$FLOOR_NEXT_15" ;; *) floor="" ;; esac
+            if [ -n "$floor" ]; then row "nextjs" "$(status_for "$v" "$floor")" "next $v in ${f%/node_modules/*}; floor $floor (and sharp $FLOOR_SHARP); matters when self-hosted"
+            else row "nextjs" "unknown" "next $v in ${f%/node_modules/*}; no fixed line for major $major"; fi
+        done <<EOF
+$(find "$d" -maxdepth 6 -path '*/node_modules/next/package.json' 2>/dev/null)
+EOF
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            v="$(grep -m1 '"version"' "$f" | sed 's/.*: *"//; s/".*//')"; major="${v%%.*}"
+            case "$major" in 8) floor="$FLOOR_STORYBOOK_8" ;; 9) floor="$FLOOR_STORYBOOK_9" ;; 10) floor="$FLOOR_STORYBOOK_10" ;; *) floor="" ;; esac
+            if [ -n "$floor" ]; then row "storybook" "$(status_for "$v" "$floor")" "storybook $v in ${f%/node_modules/*}; floor $floor (CVE-2026-114125, dev server only)"
+            else row "storybook" "unknown" "storybook $v in ${f%/node_modules/*}; no fixed line for major $major"; fi
+        done <<EOF
+$(find "$d" -maxdepth 6 -path '*/node_modules/storybook/package.json' 2>/dev/null)
+EOF
+    done
+    for py in $(unique_pythons); do
+        pv="$(in_root "$py" -c 'import importlib.util as u; u.find_spec("PIL") and print(__import__("PIL").__version__)' 2>/dev/null)"
+        [ -n "$pv" ] || continue
+        ole="$(in_root "$py" -c 'import importlib.util as u; print("yes" if u.find_spec("olefile") else "no")' 2>/dev/null)"
+        if vge "$pv" "$FLOOR_PILLOW"; then st="ok"; elif [ "$ole" = "yes" ]; then st="at risk"; else st="ok"; fi
+        row "pillow" "$st" "$py Pillow $pv olefile=$ole; floor $FLOOR_PILLOW; the FPX decoder is reachable only with olefile installed"
+    done
+}
+
+check_keys_platforms() {
+    local ev=""
+    have railway && ev="$ev railway-cli"; have opencode && ev="$ev opencode-cli"
+    [ -d "$HOME/.railway" ] && ev="$ev ~/.railway"; [ -d "$HOME/.config/opencode" ] && ev="$ev ~/.config/opencode"
+    row "keys-platforms" "question" "present:${ev:- none}; the operator must say whether any key was stored on OpenCode Console, Treg, Railway, Fireworks AI or TiDB Cloud (rotate if so)"
+}
+
+check_hygiene() {
+    local st ev n d files
+    if is_mac; then ev="$(/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null)"; case "$ev" in *enabled*) st=ok ;; *disabled*) st="at risk" ;; *) st=unknown ;; esac
+    elif have ufw; then ev="$(ufw status 2>/dev/null | head -1)"; case "$ev" in *inactive*) st="at risk" ;; *active*) st=ok ;; *) st=unknown ;; esac
+    else st=unknown; ev="no firewall tool found"; fi
+    row "firewall" "$st" "${ev:-no output}"
+    n="$(grep -c '_authToken' "$HOME/.npmrc" 2>/dev/null || true)"
+    row "npm-tokens" "$([ "${n:-0}" -gt 0 ] && echo question || echo ok)" "${n:-0} _authToken line(s) in ~/.npmrc (values never shown); check each against its registry before calling it dead"
+    files=""
+    for d in $(existing_code_dirs); do
+        files="$files$(find "$d" -maxdepth 4 -name '.env*' -perm -o=r -not -path '*/node_modules/*' -not -name '*.example' -not -name '*.sample' -not -name '*.template' 2>/dev/null)
+"
+    done
+    n="$(printf '%s' "$files" | grep -c . || true)"
+    row "env-perms" "$([ "${n:-0}" -gt 0 ] && echo 'at risk' || echo ok)" "${n:-0} world-readable .env* file(s) under $(existing_code_dirs | tr '\n' ' ')(example/sample/template files excluded)"
+    if have lsof; then
+        ev="$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR>1 && $9 ~ /^\*:|^0\.0\.0\.0:|^\[::\]:/ {print $1 ":" $9}' | sort -u | tr '\n' ' ')"
+        n="$(printf '%s' "$ev" | wc -w | tr -d ' ')"
+        row "listeners" "$([ "$n" -gt 0 ] && echo question || echo ok)" "$n listener(s) on all interfaces: ${ev:-none}; bind dev servers to 127.0.0.1"
+    else row "listeners" "unknown" "no lsof"; fi
+    n="$(ps -axo user= 2>/dev/null | awk '$1!="root" && $1!~/^_/' | sort -u | grep -c .)"
+    row "accounts" "info" "$n non-system account(s) run processes on this machine ($(ps -axo user= 2>/dev/null | awk '$1!="root" && $1!~/^_/' | grep -c .) processes; names withheld); lsof and netstat without sudo show only your own sockets, so run ps -axo user,pid,comm yourself to name them"
+}
+
+# ---- the network checks (check --network) -----------------------------------
+HOSTS="dv-g3b dv-g3b-aaa dv-g3c dv-g3c-aaa ov-g3b ov-g3b-aaa ov-g3c ov-g3c-aaa ev-g3b ev-g3b-aaa ev-g3c ev-g3c-aaa dv-g3b-noct dv-g3b-aaa-noct"
+GOOD_URL="$INCIDENT_BASE/"
+probe() {
+    case "$1" in
+        curl)     "$CURL_BIN" -sS -m 15 -o "$PROBE_T/curl.out" "$2" 2>/dev/null; case $? in 0) echo ok ;; 60) echo cert ;; *) echo err ;; esac ;;
+        nscurl)   /usr/bin/nscurl "$2" 2>&1 | head -c 400 | awk '/Load failed/{f=1} /Code=-120[1-4]/{c=1} END{print (c ? "cert" : f ? "err" : NR ? "ok" : "err")}' ;;
+        python:*) in_root "${1#python:}" -c 'import ssl,sys,urllib.request as u
+try: u.urlopen(sys.argv[1], timeout=15); print("ok")
+except Exception as e: print("ok" if hasattr(e, "code") else "cert" if isinstance(getattr(e, "reason", e), ssl.SSLCertVerificationError) else "err")' "$2" 2>/dev/null || echo err ;;
+        node:*)   "${1#node:}" -e 'fetch(process.argv[1]).then(() => console.log("ok")).catch(e => console.log(/CERT|ISSUER|SIGNATURE|SELF_SIGNED/.test(e.cause?.code ?? "") ? "cert" : "err"))' "$2" 2>/dev/null || echo err ;;
+        pip:*)    (cd "$PROBE_T" && "${1#pip:}" -m pip download -vvv --no-cache-dir --retries 0 --timeout 15 --no-index --no-deps --only-binary=:all: --find-links "$2" -d "$PROBE_T/dl" zz-nonexistent-pkg-31337 2>&1) |
+                    awk '/"GET [^"]*" (200|304)/{ok=1} /problem confirming the ssl certificate/ && !/module is (not available|unavailable)/{c=1} END{print (ok ? "ok" : c ? "cert" : "err")}' ;;
+        uv)       echo zz-nonexistent-pkg-31337 | (cd "$PROBE_T" && uv pip compile - -vv --no-cache --no-index --find-links "$2" 2>&1) |
+                    awk '/Received response .*status/{ok=1} /invalid peer certificate/{c=1} END{print (ok ? "ok" : c ? "cert" : "err")}' ;;
+        java:*)   [ -f "$PROBE_T/P.java" ] || printf '%s\n' 'public class P { public static void main(String[] a) { try { java.net.HttpURLConnection c = (java.net.HttpURLConnection) java.net.URI.create(a[0]).toURL().openConnection();' \
+                    'c.setConnectTimeout(15000); c.setReadTimeout(15000); c.getResponseCode(); System.out.println("ok"); } catch (Exception e) { for (Throwable t = e; t != null; t = t.getCause())' \
+                    'if (t instanceof java.security.cert.CertificateException || t instanceof java.security.cert.CertPathValidatorException || t instanceof java.security.cert.CertPathBuilderException) { System.out.println("cert"); return; } System.out.println("err"); } } }' > "$PROBE_T/P.java"
+                  "${1#java:}/bin/java" "$PROBE_T/P.java" "$2" </dev/null 2>/dev/null || echo err ;;
+    esac
+}
+# verdict CLIENT LABEL: the control must load, then all 14 hosts must be rejected
+verdict() {
+    local h out t r
+    [ "$(probe "$1" "$GOOD_URL")" = ok ] || { row "trust-probe" "unknown" "$2: control failed (no network, or the tool is broken)"; return; }
+    out="$(for h in $HOSTS; do probe "$1" "https://$h-emudhra.we-have-a-problem.com/"; done)"
+    t="$(printf '%s\n' "$out" | grep -c '^ok$')"; r="$(printf '%s\n' "$out" | grep -c '^cert$')"
+    if [ "$t" -gt 0 ]; then row "trust-probe" "at risk" "$2: TRUSTS the bad chain (trusted $t, rejected $r of 14)"
+    elif [ "$r" -eq 14 ]; then row "trust-probe" "ok" "$2: safe (rejected 14 of 14)"
+    else row "trust-probe" "unknown" "$2: trusted $t, rejected $r, other $((14 - t - r)) of 14"; fi
+}
+check_trust_probe() {
+    local py n j
+    PROBE_T="$(mktemp -d "${TMPDIR:-/tmp}/gbo-probe.XXXXXX")"; mkdir -p "$PROBE_T/dl"
+    CURL_BIN="$(is_mac && echo /usr/bin/curl || command -v curl)"
+    [ -x "$CURL_BIN" ] && verdict curl "curl $CURL_BIN"
+    is_mac && [ -x /usr/bin/nscurl ] && verdict nscurl "nscurl (Apple URLSession)"
+    for py in $(unique_pythons); do
+        verdict "python:$py" "python $(in_root "$py" -c 'import sys;print(sys.version.split()[0])' 2>/dev/null) $py"
+        [ -n "$(in_root "$py" -m pip --version 2>/dev/null)" ] && verdict "pip:$py" "pip $(in_root "$py" -m pip --version 2>/dev/null | awk '{print $2}') $py"
+    done
+    for n in $(each_on_path node); do verdict "node:$n" "node $("$n" -v 2>/dev/null) $n"; done
+    have uv && verdict uv "uv $(in_root uv --version 2>/dev/null | awk '{print $2}')"
+    if is_mac && [ -x /usr/libexec/java_home ]; then
+        for j in $(/usr/libexec/java_home -V 2>&1 | grep -oE '/.*/Contents/Home$' | sort -u); do [ -x "$j/bin/java" ] && verdict "java:$j" "java $("$j/bin/java" -version 2>&1 | head -1 | cut -d'"' -f2) $j"; done
+    elif [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then verdict "java:$JAVA_HOME" "java $JAVA_HOME"; fi
+    row "trust-probe-downloads" "$([ "$(find "$PROBE_T/dl" -type f | grep -c .)" -eq 0 ] && echo ok || echo 'at risk')" "$(find "$PROBE_T/dl" -type f | grep -c .) file(s) landed in the probe's download directory (the package does not exist, so none should)"
+    rm -rf "$PROBE_T"
+}
+check_softwareupdate() {
+    is_mac || return 0
+    local ev; ev="$(softwareupdate -l 2>&1 | grep -E 'Label:|Title:' | sed 's/^[ \t]*//' | tr '\n' ' ' | cut -c1-400)"
+    row "softwareupdate" "info" "${ev:-nothing listed}"
+}
+
+# ---- output -------------------------------------------------------------------
+json_str() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g' | awk '{printf "%s%s", (NR>1?"\\n":""), $0}'; }
+emit_rows() {
+    local item st ev first=1
+    if [ "$WANT_JSON" -eq 1 ]; then
+        printf '{"tool":"grip-black-october","version":"%s","os":"%s","generated_utc":"%s","network":%s,"items":[' "$GBO_VERSION" "$OS_NAME" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$([ "$WANT_NETWORK" -eq 1 ] && echo true || echo false)"
+        printf '%s' "$ROWS" | while IFS='|' read -r item st ev; do
+            [ -n "$item" ] || continue
+            [ "$first" -eq 1 ] && first=0 || printf ','
+            printf '{"item":"%s","status":"%s","evidence":"%s"}' "$(json_str "$item")" "$(json_str "$st")" "$(json_str "$ev")"
+        done
+        printf ']}\n'
+    else
+        printf 'item | status | evidence\n--- | --- | ---\n'
+        printf '%s' "$ROWS" | while IFS='|' read -r item st ev; do [ -n "$item" ] && printf '%s | %s | %s\n' "$item" "$st" "$ev"; done
+    fi
+}
+
+run_checks() {
+    check_os; check_node; check_brotli; check_bun; check_claude; check_tailscale; check_chrome
+    check_python_tools; check_cert_pem; check_keychain_deny; check_servers; check_keys_platforms; check_hygiene
+    if [ "$WANT_NETWORK" -eq 1 ]; then check_trust_probe; check_softwareupdate; fi
+}
+cmd_check() {
+    local a
+    for a in "$@"; do case "$a" in --network) WANT_NETWORK=1 ;; --json) WANT_JSON=1 ;; *) warn "check: unknown option $a"; return 2 ;; esac; done
+    run_checks; emit_rows
+}
+recheck() { ROWS=""; "$1"; say ""; say "re-check:"; emit_rows; }
+
+# ---- fixes --------------------------------------------------------------------
+# ask_yes: shows what will run, then waits for the literal word yes on stdin.
+ask_yes() {
+    local reply
+    say ""; say "Type yes to run the commands above (anything else cancels):"
+    IFS= read -r reply || reply=""
+    [ "$reply" = "yes" ] && return 0
+    say "cancelled: nothing ran"; return 1
+}
+announce_sudo() { say "NOTE: the next step uses sudo (it will ask for your password): $1"; }
+need_mac() { is_mac || { warn "fix $1: macOS only"; return 1; }; }
+
+fetch_pinned() { # fetch_pinned NAME EXPECTED_SHA256 -> path on stdout, or returns 1
+    local name="$1" want="$2" out got
+    mkdir -p "$WORK_DIR/incident" || return 1
+    out="$WORK_DIR/incident/$name"
+    curl -sS -m 30 -o "$out" "$INCIDENT_BASE/$name" || { warn "could not fetch $name"; return 1; }
+    got="$(sha256_of "$out")"
+    if [ "$got" != "$want" ]; then
+        warn "STOP: $name changed since this script pinned it (sha256 $got, pinned $want). Review the list, then re-pin. Nothing changed."
+        return 1
+    fi
+    printf '%s' "$out"
+}
+# pem_from_json FILE INDEX FIELD: one JSON string field of array element INDEX (macOS plutil; python3 elsewhere)
+json_field() {
+    if have plutil && is_mac; then plutil -extract "$2.$3" raw -o - "$1" 2>/dev/null
+    else python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d[int(sys.argv[2])][sys.argv[3]])' "$1" "$2" "$3" 2>/dev/null; fi
+}
+fingerprint_of_pem() { openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 | tr -d :; }
+
+fix_node() {
+    if is_mac && have brew; then
+        say "F1 Node: Homebrew node $(cellar_current node) -> newest (floor $FLOOR_NODE_26)."; say "  brew upgrade node"
+        say "  Afterwards restart every long-running Node service yourself (this script restarts nothing)."
+        ask_yes || return 1; brew upgrade node; recheck check_node
+    else say "F1 Node: install $FLOOR_NODE_26 (or $FLOOR_NODE_24 / $FLOOR_NODE_22) with your version manager or the official package with its SHA256 checked; shown, not run."; fi
+}
+fix_brotli() {
+    need_mac brotli || return 1; have brew || { warn "no brew"; return 1; }
+    say "F2 brotli: Homebrew brotli $(cellar_current brotli) -> $FLOOR_BROTLI."; say "  HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 brew upgrade brotli"
+    say "  Then restart every process the brotli-in-memory row lists; the HAL gateway and wire are never restarted by a session that routes through them."
+    ask_yes || return 1; HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 brew upgrade brotli; recheck check_brotli
+}
+fix_bun_tools() { say "F3/bun-tools: report only. Standalone Bun: install $FLOOR_BUN or later. Tools that embed Bun (opencode) need their own release; re-run check until the bun-tools row reads ok."; ROWS=""; check_bun; emit_rows; }
+fix_claude() {
+    have claude || { warn "no claude"; return 1; }
+    local v; v="$(claude --version 2>/dev/null | head -1 | awk '{print $1}')"
+    if vge "$v" "$FLOOR_CLAUDE"; then say "F3 Claude Code $v is at or above $FLOOR_CLAUDE: nothing to do."; return 0; fi
+    say "F3 Claude Code $v -> $FLOOR_CLAUDE+:"; say "  claude update"; say "  then restart running sessions; remove any WebFetch deny you added earlier."
+    ask_yes || return 1; claude update; recheck check_claude
+}
+fix_pip_uv_certifi() {
+    local py pipv cmds=""
+    if is_mac && have brew; then cmds="  brew upgrade ca-certificates certifi uv
+"; fi
+    for py in $(unique_pythons); do
+        case "$py" in /usr/bin/python3) continue ;; esac
+        pipv="$(in_root "$py" -m pip --version 2>/dev/null | awk '{print $2}')"; [ -n "$pipv" ] || continue
+        vge "$pipv" "$FLOOR_PIP" || cmds="$cmds  (cd / && $py -m pip install -U pip)
+"
+    done
+    have uv && cmds="$cmds  (cd / && uv python upgrade)   (only the Pythons uv manages; existing venvs keep their interpreter and pip)
+"
+    say "F4 step 1: bundles, pip in each Python below $FLOOR_PIP, uv:"; printf '%s' "$cmds"
+    [ -x /usr/bin/python3 ] && say "  (Apple's /usr/bin/python3 is skipped on purpose: pip $FLOOR_PIP needs Python 3.10+, and the README says never to install packages with it)"
+    [ -n "$cmds" ] || { say "nothing to do"; return 0; }
+    ask_yes || return 1
+    if is_mac && have brew; then brew upgrade ca-certificates certifi uv; fi
+    for py in $(unique_pythons); do
+        case "$py" in /usr/bin/python3) continue ;; esac
+        pipv="$(in_root "$py" -m pip --version 2>/dev/null | awk '{print $2}')"; [ -n "$pipv" ] || continue
+        vge "$pipv" "$FLOOR_PIP" || in_root "$py" -m pip install -U pip
+    done
+    have uv && in_root uv python upgrade
+    recheck check_python_tools
+}
+fix_cert_pem() {
+    need_mac cert-pem || return 1
+    local roots i n name pem fp bad="" d t gone=0 parsed=0 old new f
+    say "F4 step 2: remove the two affected roots from /etc/ssl/cert.pem, by SHA-256 fingerprint taken from the pinned roots.json."
+    say "  COUNCIL HOLD (2026-10-26): this is the broad step. Only clients that read the FILE change: Apple's LibreSSL tools, Apple's python3, and the"
+    say "  Keychain-fallback half of Apple's curl. Removing AAA Certificate Services also drops every chain that ends only at that root for those clients."
+    say "  Run it only after the OS update (which puts Apple's cert.pem back), after step 1 and a re-probe, and only if a file-reading client still trusts the chain."
+    say "  Step 3 (keychain-deny) is what stops curl, nscurl and git; first-hand reports say the file edit alone leaves the direct emSign chain accepted by them."
+    roots="$(fetch_pinned roots.json "$ROOTS_JSON_SHA256")" || return 1
+    i=0; n=0
+    while name="$(json_field "$roots" "$i" name)" && [ -n "$name" ]; do
+        case "$name" in "AAA Certificate Services"|"emSign ECC Root CA - G3")
+            pem="$(json_field "$roots" "$i" pem)"; printf '%s\n' "$pem" > "$WORK_DIR/incident/root-$i.pem"
+            fp="$(fingerprint_of_pem "$WORK_DIR/incident/root-$i.pem")"
+            [ -n "$fp" ] && { bad="$bad $fp"; n=$((n + 1)); say "  will remove: $name  sha256 $fp"; } ;;
+        esac
+        i=$((i + 1))
+    done
+    [ "$n" -eq 2 ] || { warn "STOP: expected 2 root fingerprints from roots.json, got $n; nothing changed"; return 1; }
+    say "  backup: $CERT_PEM_BACKUP (kept if already there)"; announce_sudo "cp -p /etc/ssl/cert.pem to the backup, then install the filtered file"
+    ask_yes || return 1
+    [ -f "$CERT_PEM_BACKUP" ] || sudo cp -p /etc/ssl/cert.pem "$CERT_PEM_BACKUP" || return 1
+    d="$(mktemp -d)"; t="$(mktemp)"
+    awk -v d="$d" '/^=== /{close(f); n++} {f = sprintf("%s/%04d", d, n); print > f}' "$CERT_PEM_BACKUP"
+    for f in "$d"/*; do
+        fp="$(fingerprint_of_pem "$f")"; [ -n "$fp" ] && parsed=$((parsed + 1))
+        case " $bad " in *" $fp "*) gone=$((gone + 1)); continue ;; esac
+        cat "$f" >> "$t"
+    done
+    old="$(grep -c 'BEGIN CERTIFICATE' "$CERT_PEM_BACKUP")"; new="$(grep -c 'BEGIN CERTIFICATE' "$t")"
+    if [ "$parsed" -eq 0 ]; then say "STOP: openssl failed on every certificate, nothing installed"
+    elif [ "$gone" -ge 1 ] && [ "$gone" -le 2 ] && [ $((old - new)) -eq "$gone" ]; then
+        sudo install -m 644 -o root -g wheel "$t" /etc/ssl/cert.pem && say "ok: removed $gone root(s), $old -> $new"
+    elif [ "$gone" -eq 0 ]; then say "nothing to do: neither root is in this file ($parsed certificates read)"
+    else say "STOP: counts do not add up ($old -> $new, $gone matched), nothing installed"; fi
+    rm -rf "$d" "$t"; recheck check_cert_pem
+}
+fix_keychain_deny() {
+    need_mac keychain-deny || return 1
+    local inter i pem f fp n=0 ok=1 out dir
+    say "F4 step 3 (human at the screen): deny the $EXPECTED_INTERMEDIATES certificates with compromised keys in Apple's admin trust settings."
+    say "  The certificates come from the pinned impacted-intermediates.json; existing admin trust settings are exported first and kept."
+    say "  The README's own caveat: whether macOS honours a deny for a certificate that is in no keychain is not verified. Re-run check --network afterwards; the probe decides."
+    inter="$(fetch_pinned impacted-intermediates.json "$INTERMEDIATES_JSON_SHA256")" || return 1
+    dir="$WORK_DIR/emudhra-proof"; rm -rf "$dir"; mkdir -p "$dir/certs" || return 1
+    i=0
+    while pem="$(json_field "$inter" "$i" pem)" && [ -n "$pem" ]; do printf '%s\n' "$pem" > "$dir/certs/$i.crt.pem"; i=$((i + 1)); done
+    [ "$i" -eq "$EXPECTED_INTERMEDIATES" ] || { warn "STOP: $i certificates in the pinned file, expected $EXPECTED_INTERMEDIATES; nothing imported"; return 1; }
+    for f in "$dir"/certs/*.crt.pem; do fp="$(fingerprint_of_pem "$f")"; say "  deny: $(openssl x509 -in "$f" -noout -subject 2>/dev/null | sed 's/.*CN *= *//')  sha256 $fp"; done
+    announce_sudo "security trust-settings-import -d (one password and one confirmation window)"
+    ask_yes || return 1
+    if out="$(security trust-settings-export -d "$dir/current.plist" 2>&1)"; then cp "$dir/current.plist" "$dir/deny.plist"
+    else case "$out" in *"No Trust Settings"*) ;; *) ok=0; warn "STOP: export failed: $out" ;; esac; fi
+    [ "$ok" -eq 1 ] || return 1
+    for f in "$dir"/certs/*.crt.pem; do
+        if [ -f "$dir/deny.plist" ]; then security add-trusted-cert -r deny -i "$dir/deny.plist" -o "$dir/next.plist" "$f" && mv "$dir/next.plist" "$dir/deny.plist" && n=$((n + 1))
+        else security add-trusted-cert -r deny -o "$dir/deny.plist" "$f" && n=$((n + 1)); fi
+    done
+    say "before: $(plutil -p "$dir/current.plist" 2>/dev/null | grep -c issuerName) entries, after: $(plutil -p "$dir/deny.plist" 2>/dev/null | grep -c issuerName)"
+    if [ "$n" -eq "$EXPECTED_INTERMEDIATES" ]; then sudo security trust-settings-import -d "$dir/deny.plist"; else say "STOP: nothing imported ($n of $EXPECTED_INTERMEDIATES certificates added)"; return 1; fi
+    recheck check_keychain_deny
+}
+fix_debian_ca() {
+    is_linux || { warn "fix debian-ca: Linux only"; return 1; }
+    [ -f /etc/ca-certificates.conf ] || { warn "no /etc/ca-certificates.conf"; return 1; }
+    say "F4 step 5 (Debian/Ubuntu): comment the two affected roots out and rebuild the bundle:"
+    say "  sudo sed -i -e 's|^mozilla/emSign_ECC_Root_CA_-_G3.crt|!&|' -e 's|^mozilla/Comodo_AAA_Services_root.crt|!&|' /etc/ca-certificates.conf && sudo update-ca-certificates"
+    announce_sudo "sed on /etc/ca-certificates.conf and update-ca-certificates"
+    ask_yes || return 1
+    sudo sed -i -e 's|^mozilla/emSign_ECC_Root_CA_-_G3.crt|!&|' -e 's|^mozilla/Comodo_AAA_Services_root.crt|!&|' /etc/ca-certificates.conf && sudo update-ca-certificates
+    recheck check_debian_ca
+}
+fix_tailscale() {
+    local ssh_off=0 a
+    for a in "$@"; do [ "$a" = "--ssh-off" ] && ssh_off=1; done
+    if [ "$ssh_off" -eq 1 ]; then
+        say "WARNING: tailscale set --ssh=false ends Tailscale SSH on THIS machine. If that is how you reach it, first make sure plain ssh works, or you lock yourself out."
+        say "  tailscale set --ssh=false"; ask_yes || return 1; tailscale set --ssh=false; recheck check_tailscale; return
+    fi
+    say "F5 Tailscale -> $FLOOR_TAILSCALE+:"
+    if is_mac; then
+        [ -f "$TAILSCALE_APP_PLIST" ] && say "  the daemon is the Tailscale app ($(plutil -extract CFBundleShortVersionString raw -o - "$TAILSCALE_APP_PLIST" 2>/dev/null)): update it through the app's own updater (menu bar icon -> Check for updates); this script does not do that"
+        have brew && [ -n "$(cellar_current tailscale)" ] && say "  brew upgrade tailscale        (the CLI only; it must match the daemon to stop the mismatch warning)"
+        say "  Tailworm mitigations only where check flagged a feature (none applies when RunSSH and Advertise are false)."
+        if have brew && [ -n "$(cellar_current tailscale)" ]; then ask_yes || return 1; brew upgrade tailscale; recheck check_tailscale; fi
+    else say "  sudo tailscale update   (or your package manager); shown, not run"; announce_sudo "tailscale update"; ask_yes || return 1; sudo tailscale update; recheck check_tailscale; fi
+}
+fix_macos_chrome() {
+    need_mac macos-chrome || return 1
+    local label="" a i=0
+    for a in "$@"; do i=$((i + 1)); [ "$a" = "--label" ] && label="$(printf '%s\n' "$@" | sed -n "$((i + 1))p")"; done
+    say "F6: relaunch Chrome once it has fetched 156 (Chrome updates itself; the check reads the installed version)."
+    say "  macOS: install at a time when a restart is fine, then run check --network again (the update restores Apple's cert.pem)."
+    if [ -z "$label" ]; then say "  softwareupdate -l   lists labels; re-run as: fix macos-chrome --label '<Label>'"; softwareupdate -l 2>&1 | grep -E 'Label:' | sed 's/^[ \t]*//'; return 0; fi
+    say "  sudo softwareupdate -i \"$label\"      (no --restart: you choose when to restart)"
+    announce_sudo "softwareupdate -i"; ask_yes || return 1; sudo softwareupdate -i "$label"; recheck check_os
+}
+fix_firewall() {
+    need_mac firewall || return 1
+    say "F9 firewall on (laptops):"; say "  sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on"
+    announce_sudo "socketfilterfw --setglobalstate on"; ask_yes || return 1
+    sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on; recheck check_hygiene
+}
+fix_env_perms() {
+    local d files="" f
+    for d in $(existing_code_dirs); do
+        files="$files$(find "$d" -maxdepth 4 -name '.env*' -perm -o=r -not -path '*/node_modules/*' -not -name '*.example' -not -name '*.sample' -not -name '*.template' 2>/dev/null)
+"
+    done
+    [ -n "$(printf '%s' "$files" | grep -c .)" ] && [ "$(printf '%s' "$files" | grep -c .)" -gt 0 ] || { say "F9 env-perms: no world-readable env files"; return 0; }
+    say "F9 env-perms: chmod 600 on these files (contents never read):"; printf '%s' "$files" | sed 's/^/  /'
+    ask_yes || return 1
+    printf '%s' "$files" | while IFS= read -r f; do [ -n "$f" ] && chmod 600 "$f"; done
+    recheck check_hygiene
+}
+fix_npm_tokens() {
+    local tokens  # grep -c prints its own 0; with no file it prints nothing (GRIP#9453)
+    tokens=$(grep -c '_authToken' "$HOME/.npmrc" 2>/dev/null || true)
+    say "F9 npm-tokens: report only. ${tokens:-0} _authToken line(s) in ~/.npmrc; registries named (tokens masked):"
+    grep '_authToken' "$HOME/.npmrc" 2>/dev/null | sed 's/_authToken.*/_authToken=<masked>/' | sed 's/^/  /'
+    say "  Check each token against its registry (a 401 from the GitHub API settles a GitHub Packages token), then remove the dead ones yourself."
+}
+fix_keys() {
+    say "F7 rotate keys (checklist; nothing runs). If you ever stored an API key or env var on one of these, rotate it:"
+    printf '  %s\n' "Railway (21 Oct 2026)" "OpenCode Console (17 Oct 2026)" "Fireworks AI (9 Oct 2026, press reports)" "TiDB Cloud (reports)" "Treg, treg.to (22 Oct 2026): rotate every key stored there and the Treg API key"
+}
+
+cmd_fix() {
+    local id="${1:-}"; shift || true
+    case "$id" in
+        node) fix_node "$@" ;; brotli) fix_brotli "$@" ;; bun-tools) fix_bun_tools "$@" ;; claude) fix_claude "$@" ;;
+        pip-uv-certifi) fix_pip_uv_certifi "$@" ;; cert-pem) fix_cert_pem "$@" ;; keychain-deny) fix_keychain_deny "$@" ;;
+        debian-ca) fix_debian_ca "$@" ;; tailscale) fix_tailscale "$@" ;; macos-chrome) fix_macos_chrome "$@" ;;
+        firewall) fix_firewall "$@" ;; env-perms) fix_env_perms "$@" ;; npm-tokens) fix_npm_tokens "$@" ;; keys) fix_keys "$@" ;;
+        *) warn "fix: unknown id '$id'"; cmd_list; return 2 ;;
+    esac
+}
+
+# ---- undo ---------------------------------------------------------------------
+cmd_undo() {
+    local id="${1:-}" f
+    case "$id" in
+        cert-pem) need_mac cert-pem || return 1; [ -f "$CERT_PEM_BACKUP" ] || { warn "no backup at $CERT_PEM_BACKUP"; return 1; }
+            say "  sudo cp -p $CERT_PEM_BACKUP /etc/ssl/cert.pem"; announce_sudo "cp"; ask_yes || return 1; sudo cp -p "$CERT_PEM_BACKUP" /etc/ssl/cert.pem; recheck check_cert_pem ;;
+        keychain-deny) need_mac keychain-deny || return 1; ls "$WORK_DIR"/emudhra-proof/certs/*.crt.pem >/dev/null 2>&1 || { warn "no certificates under $WORK_DIR/emudhra-proof/certs"; return 1; }
+            say "  for each file: sudo security remove-trusted-cert -d <file>"; announce_sudo "security remove-trusted-cert -d"; ask_yes || return 1
+            for f in "$WORK_DIR"/emudhra-proof/certs/*.crt.pem; do sudo security remove-trusted-cert -d "$f"; done; recheck check_keychain_deny ;;
+        firewall) need_mac firewall || return 1; say "  sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate off"; announce_sudo "socketfilterfw"; ask_yes || return 1
+            sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate off; recheck check_hygiene ;;
+        debian-ca) is_linux || { warn "Linux only"; return 1; }; say "  sudo sed -i -e 's|^!mozilla/emSign_ECC_Root_CA_-_G3.crt|mozilla/emSign_ECC_Root_CA_-_G3.crt|' -e 's|^!mozilla/Comodo_AAA_Services_root.crt|mozilla/Comodo_AAA_Services_root.crt|' /etc/ca-certificates.conf && sudo update-ca-certificates"
+            announce_sudo "sed and update-ca-certificates"; ask_yes || return 1
+            sudo sed -i -e 's|^!mozilla/emSign_ECC_Root_CA_-_G3.crt|mozilla/emSign_ECC_Root_CA_-_G3.crt|' -e 's|^!mozilla/Comodo_AAA_Services_root.crt|mozilla/Comodo_AAA_Services_root.crt|' /etc/ca-certificates.conf && sudo update-ca-certificates; recheck check_debian_ca ;;
+        node|brotli|pip-uv-certifi|claude|tailscale|macos-chrome) say "undo $id: no undo needed, these are plain upgrades (README)"; ;;
+        *) warn "undo: unknown id '$id'"; cmd_list; return 2 ;;
+    esac
+}
+
+cmd_list() {
+    say "fix ids:  node brotli bun-tools claude pip-uv-certifi cert-pem keychain-deny debian-ca tailscale [--ssh-off] macos-chrome [--label L] firewall env-perms npm-tokens keys"
+    say "undo ids: cert-pem keychain-deny firewall debian-ca"
+}
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
+
+main() {
+    local cmd="${1:-check}"; [ $# -gt 0 ] && shift
+    case "$cmd" in
+        check) cmd_check "$@" ;; fix) cmd_fix "$@" ;; undo) cmd_undo "$@" ;; list) cmd_list ;;
+        --version) say "grip-black-october $GBO_VERSION" ;; -h|--help|help) usage ;;
+        *) warn "unknown command '$cmd'"; usage; return 2 ;;
+    esac
+}
+# GBO_NO_MAIN=1 lets a test source the functions without running a command.
+[ "${GBO_NO_MAIN:-0}" = "1" ] || main "$@"

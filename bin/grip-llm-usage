@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# One-glance LLM-usage dashboard + IDR-style /verify provenance.
+# Surfaces the real HAL multi-provider fan-out (groq/gemini/deepseek/xai/anthropic)
+# that the Claude Code usage panel can't see. Backed by a signed hash-chain
+# (lib/audit_chain — same crypto as the IDR forest). See lib/llm_usage_ledger.py.
+set -euo pipefail
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+source "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib/venv-utils.sh"
+if ! PY="$(resolve_venv_python "$CLAUDE_DIR/venv")"; then
+  echo "[grip-llm-usage] no Python interpreter found (searched $CLAUDE_DIR/venv, then PATH)" >&2
+  exit 1
+fi
+exec env PYTHONPATH="$CLAUDE_DIR" "$PY" -m lib.llm_usage_ledger "$@"

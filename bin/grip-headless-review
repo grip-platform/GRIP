@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# grip-headless-review — headless HAL Council PR review wrapper
+#
+# Invokes council_converge.py with the right environment for local headless
+# execution via the Anthropic subscription token. The heavy lifting — parallel
+# provider dispatch, MESH deliberation, fix loop, PR comment — stays in Python.
+# This script is the operator-friendly entry point.
+#
+# Usage:
+#   grip-headless-review --pr <number> --repo <owner/name> [options]
+#
+# Options:
+#   --pr <number>           PR number to review (required)
+#   --repo <owner/name>     GitHub repository slug (required)
+#   --dry-run               Review only; skip fix commits
+#   --max-iterations <N>    Maximum fix iterations (default: 3)
+#   --help                  Show this message and exit
+#
+# Required environment:
+#   CLAUDE_CODE_OAUTH_TOKEN — Anthropic subscription token (obtain via: hal --subscribe)
+#
+# Example:
+#   grip-headless-review --pr 123 --repo grip-platform/GRIP
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONVERGE="$REPO_ROOT/.github/scripts/council_converge.py"
+
+# ---------- helpers ----------------------------------------------------------
+
+usage() {
+  cat <<'EOF'
+Usage:
+  grip-headless-review --pr <number> --repo <owner/name> [options]
+
+Options:
+  --pr <number>           PR number to review (required)
+  --repo <owner/name>     GitHub repository slug (required)
+  --dry-run               Review only; skip fix commits
+  --max-iterations <N>    Maximum fix iterations (default: 3)
+  --help                  Show this message and exit
+
+Required environment:
+  CLAUDE_CODE_OAUTH_TOKEN — Anthropic subscription token (obtain via: hal --subscribe)
+
+Example:
+  grip-headless-review --pr 123 --repo grip-platform/GRIP
+EOF
+  exit 0
+}
+
+die() { echo "[grip-headless-review] ERROR: $*" >&2; exit 1; }
+
+# ---------- arg parse --------------------------------------------------------
+
+PR=""
+REPO=""
+EXTRA_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h)        usage ;;
+    --pr)             PR="$2";                             shift 2 ;;
+    --repo)           REPO="$2";                           shift 2 ;;
+    --dry-run)        EXTRA_ARGS+=(--dry-run);             shift   ;;
+    --max-iterations) EXTRA_ARGS+=(--max-iterations "$2"); shift 2 ;;
+    *) die "Unknown argument: $1" ;;
+  esac
+done
+
+[[ -n "$PR"   ]] || die "--pr is required"
+[[ -n "$REPO" ]] || die "--repo is required"
+
+# ---------- env guard --------------------------------------------------------
+
+# Require the Anthropic subscription token used for headless council dispatch.
+AUTH_VAR="CLAUDE_CODE_OAUTH_TOKEN"
+# The :- default is load-bearing under `set -u`. Without it the indirection on an UNSET
+# variable aborts the script with "grip-headless-review: line 80: !AUTH_VAR: unbound
+# variable" BEFORE reaching die(), so the operator sees a bash internals message instead
+# of the instruction that would fix it. The guard refused correctly and diagnosed wrongly,
+# which is the worse half to get wrong. Observed rc=1 with exactly that stderr, 2026-08-31.
+test -n "${!AUTH_VAR:-}" \
+  || die "$AUTH_VAR is not set. Run 'hal --subscribe' to obtain a token."
+
+[[ -f "$CONVERGE" ]] \
+  || die "council_converge.py not found at $CONVERGE — run from the GRIP repo root"
+
+# ---------- dispatch ---------------------------------------------------------
+
+exec python3 "$CONVERGE" --pr "$PR" --repo "$REPO" "${EXTRA_ARGS[@]}"

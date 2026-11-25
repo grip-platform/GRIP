@@ -1,0 +1,368 @@
+# GRIP Safety Gates - Default Configuration
+# These gates provide deterministic HALT conditions that the agent cannot override.
+# 
+# THE CORE PRINCIPLE:
+# Safety emerges from systems that can say "NO" deterministically —
+# even when doing so is inconvenient, inefficient, or against apparent optimization.
+#
+# User can override/extend in ~/.grip/gates.yaml
+
+version: "2.0"
+
+defaults:
+  enabled: true
+  action: deny
+  audit: true
+
+gates:
+  # ==========================================================================
+  # GATE 0: Always Allow - Critical tools that should never be blocked
+  # ==========================================================================
+  - id: always-allow
+    name: "Always Allow Critical Tools"
+    description: "User interaction and task management tools are never blocked"
+    priority: 0
+    enabled: true
+    condition:
+      type: tool_match
+      tools:
+        - AskUserQuestion
+        - TodoWrite
+        - TaskCreate
+        - TaskUpdate
+        - TaskGet
+        - TaskList
+    action: allow
+    reason: "Critical user interaction tools are always allowed"
+
+  # ==========================================================================
+  # GATE 1: Confidence Gate - HALT when confidence is low
+  # ==========================================================================
+  - id: confidence-gate
+    name: "Confidence Gate"
+    description: "HALT when agent confidence is below threshold - ASK don't guess"
+    priority: 10
+    enabled: true
+    condition:
+      type: confidence_threshold
+      threshold: 0.7  # Below 70% confidence = HALT
+    action: deny
+    reason: "[CONFIDENCE GATE] Confidence below threshold. HALT and ask user rather than proceed with uncertainty."
+    recovery: ask_user
+    tests:
+      must_block:
+        - { confidence: 0.5, description: "50% confidence should block" }
+        - { confidence: 0.3, description: "30% confidence should block" }
+      must_allow:
+        - { confidence: 0.8, description: "80% confidence should pass" }
+        - { confidence: 0.95, description: "95% confidence should pass" }
+
+  # ==========================================================================
+  # GATE 2: Dependency Guardian - Block reads from dependency folders
+  # ==========================================================================
+  - id: dependency-guardian
+    name: "Dependency Guardian"
+    description: "Block reads from node_modules, venv, dist, etc. - wastes tokens"
+    priority: 20
+    enabled: true
+    condition:
+      type: path_contains
+      tools: [Read, Glob, Grep]
+      paths:
+        - node_modules
+        - .next
+        - dist
+        - build
+        - __pycache__
+        - venv
+        - .venv
+        - target
+        - vendor
+        - Pods
+        - .git/objects
+        - .nuxt
+        - .output
+        - coverage
+        - .cache
+    action: deny
+    reason: "[DEPENDENCY GUARDIAN] Cannot read from dependency folders. These waste 50k+ tokens. Use rg/fd with --exclude instead."
+    tests:
+      must_block:
+        - { tool: Read, path: "node_modules/lodash/index.js" }
+        - { tool: Glob, pattern: "**/__pycache__/**" }
+      must_allow:
+        - { tool: Read, path: "src/index.js" }
+        - { tool: Read, path: "package.json" }
+
+  # ==========================================================================
+  # GATE 3: Destructive Git - Block dangerous git operations
+  # ==========================================================================
+  - id: destructive-git
+    name: "Destructive Git Guard"
+    description: "Block force push, hard reset, and other destructive git operations"
+    priority: 30
+    enabled: true
+    condition:
+      type: command_pattern
+      tools: [Bash]
+      patterns:
+        - "git\\s+push\\s+.*--force"
+        - "git\\s+push\\s+-f\\b"
+        - "git\\s+push\\s+\\S+\\s+\\+\\S+"
+        - "git\\s+reset\\s+--hard"
+        - "git\\s+clean\\s+-fd"
+        - "git\\s+checkout\\s+--\\s+\\S"
+        - "git\\s+checkout\\s+[a-f0-9]+\\s+--"
+        - "git\\s+restore\\s+(?!--staged)\\S"
+        - "git\\s+stash\\s+drop"
+        # git branch -D: case-sensitive check in hook code (not regex here, since IGNORECASE would match -d)
+        - "git\\s+branch\\s+-[A-Za-z]*D\\b"
+    action: deny
+    reason: "[DESTRUCTIVE GIT] This operation cannot be undone. Ask user for explicit approval first."
+    recovery: ask_user
+    tests:
+      must_block:
+        - { tool: Bash, command: "git push --force origin main" }
+        - { tool: Bash, command: "git reset --hard HEAD~5" }
+        - { tool: Bash, command: "git push origin +main", description: "Plus-prefix force push" }
+        - { tool: Bash, command: "git checkout -- src/index.ts", description: "Discard specific file" }
+        - { tool: Bash, command: "git checkout abc123 -- src/index.ts", description: "Overwrite from ref" }
+        - { tool: Bash, command: "git restore src/index.ts", description: "Restore discard" }
+        - { tool: Bash, command: "git stash drop", description: "Drop stash" }
+        - { tool: Bash, command: "git branch -D feature-branch", description: "Force delete branch" }
+      must_allow:
+        - { tool: Bash, command: "git push origin main" }
+        - { tool: Bash, command: "git reset --soft HEAD~1" }
+        - { tool: Bash, command: "git checkout main", description: "Switch branch is safe" }
+        - { tool: Bash, command: "git checkout -b new-branch", description: "Create branch is safe" }
+        - { tool: Bash, command: "git restore --staged src/index.ts", description: "Unstage is safe" }
+        - { tool: Bash, command: "git stash list", description: "List stash is safe" }
+        - { tool: Bash, command: "git branch -d feature-branch", description: "Safe delete merged branch" }
+
+  # ==========================================================================
+  # GATE 4: Secrets Detection - Block commits with sensitive files
+  # ==========================================================================
+  - id: secrets-detection
+    name: "Secrets Detection"
+    description: "Block git operations that might commit sensitive files"
+    priority: 40
+    enabled: true
+    condition:
+      type: command_pattern
+      tools: [Bash]
+      patterns:
+        - "git\\s+(add|commit).*\\.env(?!\\.(example|sample|template|dist|defaults|schema)\\b)"
+        - "git\\s+(add|commit).*credentials\\.json"
+        - "git\\s+(add|commit).*secrets\\.json"
+        - "git\\s+(add|commit).*\\.pem"
+        - "git\\s+(add|commit).*\\.key"
+        - "git\\s+(add|commit).*id_rsa"
+        - "git\\s+(add|commit).*id_ed25519"
+    action: deny
+    reason: "[SECRETS DETECTION] Command may commit sensitive files. Never commit secrets."
+    tests:
+      must_block:
+        - { tool: Bash, command: "git add .env", description: "Adding .env should block" }
+        - { tool: Bash, command: "git add .env.local", description: "Adding .env.local should block" }
+        - { tool: Bash, command: "git add .env.production", description: "Adding .env.production should block" }
+        - { tool: Bash, command: "git add .env.development.local", description: "Adding .env.development.local should block" }
+      must_allow:
+        - { tool: Bash, command: "git add src/" }
+        - { tool: Bash, command: "git add .env.example", description: "Template files are safe to commit" }
+        - { tool: Bash, command: "git add .env.sample", description: "Sample files are safe to commit" }
+        - { tool: Bash, command: "git add .env.template", description: "Template files are safe to commit" }
+
+  # ==========================================================================
+  # GATE 5: Context Gate - HALT at context threshold
+  # ==========================================================================
+  - id: context-gate
+    name: "Context Gate"
+    description: "HALT when approaching context limit to prevent data loss"
+    priority: 50
+    enabled: true
+    condition:
+      type: context_threshold
+      threshold: 0.80  # 80% of max context
+    action: deny
+    reason: "[CONTEXT GATE] Context at {percent}%. HALT: Use AskUserQuestion for user choice: compact, serialize+fresh, push through, or checkpoint."
+    recovery: ask_user
+    tests:
+      must_block:
+        - { context_percent: 0.85, description: "85% should block" }
+        - { context_percent: 0.95, description: "95% should block" }
+      must_allow:
+        - { context_percent: 0.50, description: "50% should pass" }
+        - { context_percent: 0.79, description: "79% should pass" }
+
+  # ==========================================================================
+  # GATE 6: Bash Tool Substitution - Block inefficient tool usage
+  # ==========================================================================
+  - id: tool-substitution
+    name: "Tool Substitution"
+    description: "Block grep/find/cat when better alternatives exist"
+    priority: 60
+    enabled: true
+    condition:
+      type: command_pattern
+      tools: [Bash]
+      patterns:
+        - "\\bgrep\\s+"
+        - "\\bfind\\s+"
+        - "\\bcat\\s+[^|]*\\|"
+    action: deny
+    reason: "[TOOL SUBSTITUTION] Use rg instead of grep, fd instead of find, Read tool instead of cat piping."
+    tests:
+      must_block:
+        - { tool: Bash, command: "grep -r 'pattern' ." }
+        - { tool: Bash, command: "find . -name '*.js'" }
+      must_allow:
+        - { tool: Bash, command: "rg 'pattern' ." }
+        - { tool: Bash, command: "fd '*.js'" }
+
+  # ==========================================================================
+  # GATE 7: Temp Script Prevention - Block temp script creation
+  # ==========================================================================
+  - id: temp-script-prevention
+    name: "Temp Script Prevention"
+    description: "Block creation of temporary scripts that waste tokens"
+    priority: 70
+    enabled: true
+    condition:
+      type: path_contains
+      tools: [Write]
+      paths:
+        - /tmp/
+        - /var/folders/
+      # Only block script files
+      patterns:
+        - "\\.sh$"
+        - "\\.py$"
+        - "\\.js$"
+        - "\\.ts$"
+    action: deny
+    reason: "[TEMP SCRIPT] Creating temporary scripts wastes 3-8k tokens. Use direct execution or MultiEdit."
+    tests:
+      must_block:
+        - { tool: Write, path: "/tmp/script.sh" }
+        - { tool: Write, path: "/var/folders/abc/temp.py" }
+      must_allow:
+        - { tool: Write, path: "~/.claude/scripts/permanent.sh" }
+        - { tool: Write, path: "output.txt" }
+
+  # ==========================================================================
+  # GATE 8: Production Safety - Block production operations
+  # ==========================================================================
+  - id: production-safety
+    name: "Production Safety"
+    description: "Block operations that affect production without explicit approval"
+    priority: 80
+    enabled: true
+    condition:
+      type: command_pattern
+      tools: [Bash]
+      patterns:
+        - "deploy.*prod"
+        - "production"
+        - "--env\\s*=?\\s*prod"
+        - "DROP\\s+TABLE"
+        - "DROP\\s+DATABASE"
+        - "TRUNCATE"
+        - "DELETE\\s+FROM.*WHERE\\s*1\\s*=\\s*1"
+    action: deny
+    reason: "[PRODUCTION SAFETY] Production operations require explicit human approval."
+    recovery: ask_user
+    tests:
+      must_block:
+        - { tool: Bash, command: "deploy --env prod" }
+        - { tool: Bash, command: "psql -c 'DROP TABLE users'" }
+      must_allow:
+        - { tool: Bash, command: "deploy --env staging" }
+        - { tool: Bash, command: "psql -c 'SELECT * FROM users'" }
+
+  # ==========================================================================
+  # GATE 9: Read Cache - Block redundant file reads
+  # ==========================================================================
+  - id: read-cache
+    name: "Read Cache"
+    description: "Block reading the same file more than twice per session"
+    priority: 90
+    enabled: true
+    condition:
+      type: custom
+      expression: "read_count(path) >= 2"
+      tools: [Read]
+    action: deny
+    reason: "[READ CACHE] File already read {count}x this session. Use your cached mental model."
+    # Tests require state pre-population - tested manually
+    tests:
+      must_allow:
+        - { tool: Read, path: "src/index.js", description: "First read always allowed" }
+
+  # ==========================================================================
+  # GATE R: Restricted Docs - Block reads of restricted docs without identity
+  # ==========================================================================
+  - id: restricted-docs-gate
+    name: "Restricted Documents Gate"
+    description: "Block reads of restricted docs unless V>> identity active"
+    priority: 15
+    enabled: true
+    condition:
+      type: path_contains
+      tools: [Read, Glob, Grep]
+      paths:
+        - docs/restricted/
+    action: deny
+    reason: "[RESTRICTED DOCS] This document requires identity verification. Only V>> signature can access restricted documents."
+    bypass:
+      signatures: ["V>>"]
+    tests:
+      must_block:
+        - { tool: Read, path: "docs/restricted/CUBE-CONVERGENCE.md", description: "Restricted doc without identity" }
+      must_allow:
+        - { tool: Read, path: "docs/SAFETY-GATES.md", description: "Non-restricted doc always allowed" }
+
+  # ==========================================================================
+  # GATE F: SSH Blocking - Block SSH/remote access commands
+  # ==========================================================================
+  - id: ssh-blocking
+    name: "SSH Blocking Gate"
+    description: "Block SSH and remote access commands - all SSH hosts are production"
+    priority: 130
+    enabled: true
+    condition:
+      type: command_pattern
+      tools: [Bash]
+      patterns:
+        - "^\\s*ssh\\s+(?!-)"
+        - "\\bssh\\s+\\S+@"
+        - "\\bssh\\s+-[A-Za-z]*[^-]\\s+\\S+"
+        - "\\bansible\\s+(?!-playbook)\\S+\\s+-m\\s+(?:shell|command|raw)"
+        - "\\bansible\\s+(?!-playbook)\\S+\\s+-a\\s+"
+        - "\\bscp\\s+"
+        - "\\brsync\\s+[^:]*\\S+:"
+        - "\\bsftp\\s+"
+      # Whitelist patterns (checked first, allows operation)
+      whitelist:
+        - "\\bansible-playbook\\b"
+        - "\\bssh-keygen\\b"
+        - "\\bssh-add\\b"
+        - "\\bssh-agent\\b"
+        - "\\blocalhost\\b"
+        - "\\b127\\.0\\.0\\.1\\b"
+    action: deny
+    reason: "[SSH GATE] All SSH-accessible hosts are production systems. Use API-based tools or ansible-playbook."
+    tests:
+      must_block:
+        - { tool: Bash, command: "ssh user@prod.example.com", description: "Direct SSH blocked" }
+        - { tool: Bash, command: "ssh -i key.pem ubuntu@10.0.0.1", description: "SSH with key blocked" }
+        - { tool: Bash, command: "ansible webservers -m shell -a 'uptime'", description: "Ansible ad-hoc blocked" }
+        - { tool: Bash, command: "ansible livekit -m shell -a 'docker logs sip'", description: "Ansible shell blocked" }
+        - { tool: Bash, command: "scp file.txt user@server:/path", description: "SCP blocked" }
+        - { tool: Bash, command: "rsync -av ./local/ user@server:/remote/", description: "Remote rsync blocked" }
+        - { tool: Bash, command: "sftp user@server", description: "SFTP blocked" }
+      must_allow:
+        - { tool: Bash, command: "ansible-playbook -i inventory deploy.yml", description: "ansible-playbook allowed" }
+        - { tool: Bash, command: "ssh-keygen -t ed25519", description: "ssh-keygen allowed" }
+        - { tool: Bash, command: "ssh-add ~/.ssh/id_rsa", description: "ssh-add allowed" }
+        - { tool: Bash, command: "ssh localhost", description: "localhost SSH allowed" }
+        - { tool: Bash, command: "rsync -av ./local/ ./backup/", description: "Local rsync allowed" }

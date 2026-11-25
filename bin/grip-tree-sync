@@ -1,0 +1,692 @@
+#!/usr/bin/env bash
+# grip-tree-sync — keep a GRIP tree level with origin/main.
+#
+# WHY THIS EXISTS. A worktree is born from origin/main and then drifts: the
+# session lives for hours while main moves underneath it. On 2026-08-19 a
+# session's worktree was 7 commits behind by mid-session, and the drift was not
+# cosmetic — the shared tree and the worktree disagreed about module contents,
+# so a test suite that loads modules from CLAUDE_DIR/lib imported one copy while
+# the assertions read the other, masking a genuinely failing test.
+#
+# Two trees need this, for different reasons:
+#   * the SHARED tree (~/.grip), because launchd agents EXECUTE from it — a
+#     stale shared tree is an unreviewed deploy (rules/shared-tree-is-not-canonical.md);
+#   * the SESSION worktree, because that is where the work happens.
+#
+# Idempotent: on an already-level tree it merges nothing and exits 0, so it is
+# safe to run on a timer (f∘f = f).
+#
+# Usage:
+#   grip-tree-sync                 # sync the tree you are standing in
+#   grip-tree-sync --shared        # sync the shared tree (~/.grip) as well
+#   grip-tree-sync --check         # report only, never merge (exit 1 if behind,
+#                                  # or if commits exist on no remote branch)
+#   grip-tree-sync --path <dir>    # sync a specific tree
+#   grip-tree-sync --autostash     # also heal a DIRTY tree that is behind
+#   grip-tree-sync --shared       # ALSO re-aligns overlapping shared skills in
+#                                  # ~/.agents/skills (canonical SKILL.md always
+#                                  # wins, never deletes, agents-only skills untouched)
+#
+#   On a fast-forward, a file changed both here and on main no longer blocks:
+#   main's version is staged and the local edits are merged back in, and a file
+#   the tree rebuilds itself takes main's copy (lib/tree_sync_resolve.py,
+#   REGENERATED). Only a real overlap declines. For the shared tree, every
+#   session hears through the presence mesh when a merge lands or a NEW
+#   obstacle appears, and a run waits while a session holds the presence lock
+#   grip-shared-tree. GRIP_TREE_SYNC_MESH and CLAUDE_MESH_DB_PATH redirect both.
+set -euo pipefail
+
+# The seven porcelain XY codes that mean "unmerged path" (git-status(1)).
+# ONE source of truth: _unmerged_paths builds its awk pattern from this string,
+# so the list and the matcher cannot drift apart. The human gloss for each code
+# lives beside that function, where a reader needs it.
+readonly UNMERGED_XY='DD|AU|UD|UA|DU|AA|UU'
+_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+CHECK_ONLY=0
+DO_SHARED=0
+AUTOSTASH=0
+TARGETS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --check)  CHECK_ONLY=1; shift ;;
+        --shared) DO_SHARED=1; shift ;;
+        --autostash) AUTOSTASH=1; shift ;;
+        --path)   TARGETS+=("${2:?--path needs a directory}"); shift 2 ;;
+        -h|--help) sed -n '2,36p' "$0"; exit 0 ;;
+        *) >&2 echo "[grip-tree-sync] unknown argument: $1"; exit 2 ;;
+    esac
+done
+
+[[ ${#TARGETS[@]} -eq 0 ]] && TARGETS+=("$PWD")
+# Resolved UNCONDITIONALLY, not only under --shared: the per-tree loop's
+# `is_shared` check (which gates the settings-reconcile calls below, and the
+# pre-existing mesh notifications) must recognise the shared tree whenever a
+# target happens to BE it, including a plain no-flag invocation run from
+# inside ~/.claude -- not only the --shared-appended case. -P resolves
+# ~/.claude -> ~/.grip, so it matches by the REAL path either way.
+shared="$(cd "${CLAUDE_DIR:-$HOME/.claude}" 2>/dev/null && pwd -P || true)"
+if [[ "$DO_SHARED" -eq 1 && -n "$shared" ]]; then
+    already=0
+    for t in "${TARGETS[@]}"; do
+        [[ "$(cd "$t" 2>/dev/null && pwd -P || echo x)" == "$shared" ]] && already=1
+    done
+    [[ "$already" -eq 0 ]] && TARGETS+=("$shared")
+fi
+
+# A merge can exit 0 and still leave the tree unusable. `git merge --autostash`
+# stashes the dirty tree, merges, then RE-APPLIES the stash — and when that last
+# step conflicts, git writes conflict markers into the working files, leaves
+# them unmerged, keeps the stash on the stack, and exits 0 anyway. It creates no
+# MERGE_HEAD, so `git merge --abort` cannot run (verified: exit 128, "There is
+# no merge to abort"), and the conflict branch further down never fires.
+#
+# On 2026-09-10 that printed "merged origin/main (+3)" over a settings.json full
+# of conflict markers in the SHARED tree — the one every fresh session and every
+# launchd agent reads — so every session started for the next ~90 minutes died
+# with "Expected object, but received undefined" until a human repaired it by
+# hand. The tool reported success for a state that broke production.
+#
+# Detection is therefore on git's own recorded state, never on its message text,
+# which is not a stable interface across git versions.
+#
+# Returns non-zero when git could not answer AT ALL, which is deliberately not
+# the same as answering "nothing is unmerged". Piping a failed `git status`
+# straight into awk yields an empty result that is indistinguishable from a
+# clean tree — the exact conflation this whole change exists to remove, and it
+# is reachable: a corrupt .git/index makes `git status` exit 128 (verified).
+# bin/grip-tree-check already settled this posture by exiting 3 rather than 0
+# when git cannot answer; "unknown" must never read as "fine".
+_unmerged_paths() {
+    # The glosses for UNMERGED_XY, which the constant itself cannot carry:
+    # DD both deleted · AU added by us · UD deleted by them · UA added by them
+    # DU deleted by us · AA both added · UU both modified.
+    #
+    # core.quotePath=false is load-bearing, not cosmetic. By default git C-quotes
+    # any path holding a non-ASCII byte, so an ordinary accented filename is
+    # printed as "caf\303\251.json" — and _report_broken_tree hands that string
+    # to the operator inside a `git checkout HEAD -- <path>` recovery command,
+    # where it does not match (verified: exit 1, "did not match any file(s)").
+    # That is the failure this file's own comment below already calls worse than
+    # saying nothing: naming a path the operator cannot act on. Turning quoting
+    # off emits the real bytes, so the command works.
+    #
+    # It stays safe for the line-based parse because git quotes a tab or a
+    # newline REGARDLESS of this setting (verified) — a record therefore never
+    # spans two lines. Only `--porcelain -z` would emit raw control bytes, and
+    # that needs a NUL-record parse here AND in the reader below.
+    local porcelain=""
+    if ! porcelain="$(git -C "$1" -c core.quotePath=false status --porcelain --untracked-files=no 2>/dev/null)"; then
+        return 1
+    fi
+    printf '%s\n' "$porcelain" \
+        | awk -v codes="$UNMERGED_XY" '$0 ~ "^(" codes ") " { print substr($0, 4) }'
+}
+
+# The dirty files that can actually obstruct merging $2 into this tree.
+#
+# Until 2026-09-22 the answer was every line of `git status --porcelain`, which
+# asks "does this file differ from HEAD" — a question the merge never asks.
+# Measured that day on the shared tree: 829 files reported dirty and 37 could
+# actually obstruct the merge. The other 792 were deletions origin/main had
+# itself already made, which git applies without complaint. The tree had sat
+# unmergeable for weeks on account of them (GRIP#6346) while 25 launchd agents
+# kept re-dirtying it, so waiting for the dirty count to reach zero was never
+# going to work.
+#
+# A dirty file obstructs the merge if EITHER of two things is true. The union
+# is what git's own behaviour requires; both halves were measured against a
+# real repository before being written, because the two cases behave
+# OPPOSITELY and neither is obvious from reading git's documentation:
+#
+#   1. The target CHANGES it (deleting counts) AND its bytes on disk differ
+#      from the target's.         `diff HEAD <target>` and `diff <target>`
+#      The data-loss case: whatever the merge writes there is not what is on
+#      disk, so landing it would discard uncommitted content.
+#
+#      The first clause is load-bearing, and it was missing until 2026-09-24.
+#      For a file the merge never touches, the target holds HEAD's bytes, so
+#      every locally modified file "differed from the target" and ANY
+#      uncommitted work anywhere refused every sync. Measured that day on the
+#      shared tree: 94 uncommitted files, an 8-file update touching none of
+#      them, a refusal naming settings.json and eleven others — and git's own
+#      `merge --ff-only` accepted the same tree at once. The merge never writes
+#      an untouched path, so nothing there can be lost.
+#
+#   2. The target CHANGES it and leaves content behind.
+#                                      `diff --diff-filter=d HEAD <target>`
+#      git's own refusal: before writing a path it compares the worktree
+#      against the INDEX, never against the content it is about to write. So a
+#      file already holding the target's exact bytes is still refused — "Your
+#      local changes would be overwritten by merge" — even though nothing
+#      would in fact be lost. Predicting that here is what lets the refusal
+#      name the real obstacle, instead of attempting a merge git rejects and
+#      then reporting it to the operator as a conflict it is not.
+#
+#      `--diff-filter=d` excludes paths the target DELETES, and that exclusion
+#      is why the 792 drop out: git removing a file the worktree has already
+#      removed is not a write, and it succeeds.
+#
+# All four lists come from `git diff --name-only` rather than one of them from
+# `status --porcelain`, and that is load-bearing rather than tidiness. The two
+# commands SPELL PATHS DIFFERENTLY: porcelain quotes a path containing a space
+# as `"my file.json"` while diff prints it bare, so joining one against the
+# other drops every such path out of the intersection silently — a dirty file
+# with a space in its name would have been called safe and merged over. Caught
+# by test_unmerged_path_with_a_space_in_its_name_is_still_named, which is
+# exactly the regression anchor it was written to be.
+#
+# `--no-renames` for the same reason: a rename would otherwise be reported as
+# `old -> new` on one side and as two plain paths on the other. Turning
+# detection off gives every list the same shape, and a rename is then two
+# ordinary paths each tested on its own merits.
+_blocking_dirty_paths() {
+    local tree="$1" target="$2" dirty="" on_disk="" target_writes="" changed=""
+    # core.quotePath=false for the same reason as _unmerged_paths above: the
+    # paths this prints reach the operator inside a recovery command, and a
+    # C-quoted `"caf\303\251.json"` is a path they cannot act on.
+    if ! dirty="$(git -C "$tree" -c core.quotePath=false diff --name-only --no-renames HEAD 2>/dev/null)"; then
+        return 1
+    fi
+    # Nothing dirty at all is the empty blocking set, and the two diffs below
+    # would be wasted calls on the overwhelmingly common path.
+    if [[ -z "$dirty" ]]; then
+        return 0
+    fi
+    if ! on_disk="$(git -C "$tree" -c core.quotePath=false diff --name-only --no-renames "$target" 2>/dev/null)"; then
+        return 1
+    fi
+    if ! target_writes="$(git -C "$tree" -c core.quotePath=false diff --name-only --no-renames --diff-filter=d HEAD "$target" 2>/dev/null)"; then
+        return 1
+    fi
+    if ! changed="$(git -C "$tree" -c core.quotePath=false diff --name-only --no-renames HEAD "$target" 2>/dev/null)"; then
+        return 1
+    fi
+    # One stream, four record kinds, each behind a two-character prefix, so
+    # the original path is always substr($0, 3) and no temporary file is
+    # involved. The prefix goes on via sed rather than `printf 'T %s\n' "$l"`,
+    # which tags only the FIRST line of a multi-line value and lets every later
+    # path fall through the awk untagged — a real defect in this function's
+    # first draft, invisible to any fixture whose lists held one entry each.
+    {
+        printf '%s\n' "$on_disk"       | sed 's/^/T /'
+        printf '%s\n' "$target_writes" | sed 's/^/W /'
+        printf '%s\n' "$changed"       | sed 's/^/C /'
+        printf '%s\n' "$dirty"         | sed 's/^/D /'
+    } | awk '
+        $1 == "T" { on_disk[substr($0, 3)] = 1; next }
+        $1 == "W" { written[substr($0, 3)] = 1; next }
+        $1 == "C" { changed[substr($0, 3)] = 1; next }
+        {
+            path = substr($0, 3)
+            if (path == "") { next }
+            if ((path in written) || ((path in on_disk) && (path in changed))) { print path }
+        }
+    '
+}
+
+# Skip-worktree entries the target changes. git leaves skip-worktree entries out
+# of every diff, so _blocking_dirty_paths cannot see them, yet git still refuses
+# to fast-forward over one whose working copy differs from its index entry. That
+# froze the shared tree on 2026-10-03, when two PRs changed the hypotheses
+# ledgers, and the refusal was reported as a merge conflict (GRIP#7288).
+_skip_worktree_changed() {
+    local tree="$1" target="$2" flagged="" changed=""
+    if ! flagged="$(git -C "$tree" -c core.quotePath=false ls-files -v 2>/dev/null)"; then
+        return 1
+    fi
+    if ! changed="$(git -C "$tree" -c core.quotePath=false diff --name-only --no-renames HEAD "$target" 2>/dev/null)"; then
+        return 1
+    fi
+    {
+        printf '%s\n' "$changed" | sed 's/^/C /'
+        printf '%s\n' "$flagged" | awk '/^[Ss] / { print "S " substr($0, 3) }'
+    } | awk '
+        $1 == "C" { changed[substr($0, 3)] = 1; next }
+        $1 == "S" && (substr($0, 3) in changed) { print substr($0, 3) }
+    '
+}
+
+# plan-v4 C5/C7: repair-only settings.json composition for the shared tree
+# (restores a managed item that drifted from HEAD's tracked copy -- a /model-
+# picker rewrite, a hook edit -- even when nothing needed merging this run),
+# and the falsifier that checks a past sync's settings.json changes actually
+# arrived. Both delegate entirely to bin/grip-settings-reconcile, which knows
+# the ownership classification and the override file; this script only
+# decides WHEN to call it and folds the result into `rc`.
+_reconcile_settings_repair() {
+    local tree="$1" out="" rc=0
+    out="$("$_SCRIPT_DIR/grip-settings-reconcile" --claude-dir "$tree" 2>&1)" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        printf '%s\n' "$out" | sed 's/^/[grip-tree-sync] /' >&2
+    elif [[ "$out" != *"nothing to do"* ]]; then
+        printf '%s\n' "$out" | sed 's/^/[grip-tree-sync] /'
+    fi
+    return "$rc"
+}
+
+_check_settings_arrived() {
+    local tree="$1" out="" rc=0
+    out="$("$_SCRIPT_DIR/grip-settings-reconcile" --claude-dir "$tree" --check 2>&1)" || rc=$?
+    printf '%s\n' "$out" | sed 's/^/[grip-tree-sync] /'
+    return "$rc"
+}
+
+# The interpreter for lib/tree_sync_resolve.py: the GRIP venv when there is one,
+# in either platform's layout, else a system python that actually runs. Both
+# rungs are resolve_venv_python's own. The resolver uses the standard library
+# only and signs nothing, so the system rung is a genuine fallback here. The
+# helper is sourced here rather than at the top because this only ever runs in a
+# command substitution, so its PYTHONIOENCODING default stays out of the sync.
+_resolver_python() {
+    source "$_SCRIPT_DIR/../scripts/lib/venv-utils.sh" || return 1
+    resolve_venv_python "${CLAUDE_DIR:-$HOME/.claude}/venv"
+}
+
+# Who holds the presence server's grip-shared-tree lock, if anyone does now. It is
+# the database bin/mesh reads, through the same override. Read-only and fail-open,
+# like the lock itself: no database, no sqlite3 or an unreadable file all mean
+# "not held". The presence server writes expires_at as UTC ISO-8601 with a Z, so
+# a string comparison against SQLite's clock in the same shape is exact.
+_shared_lock_holder() {
+    local db="${CLAUDE_MESH_DB_PATH:-$HOME/.grip-session-mesh/presence.db}"
+    if [[ ! -f "$db" ]] || ! command -v sqlite3 >/dev/null 2>&1; then
+        return 0
+    fi
+    sqlite3 -readonly "$db" "SELECT holder_name FROM locks WHERE resource = 'grip-shared-tree' AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now') LIMIT 1;" 2>/dev/null || true
+}
+
+# One line to every live session through the presence mesh (bin/mesh broadcast),
+# sent as the tool rather than as whichever session ran it, so that session hears
+# it too. Fail-open: a missing mesh or database never turns a sync into an error.
+_mesh_tell() {
+    local mesh="${GRIP_TREE_SYNC_MESH:-$_SCRIPT_DIR/mesh}"
+    if [[ ! -x "$mesh" ]]; then
+        return 0
+    fi
+    env -u CLAUDE_CODE_SESSION_ID CLAUDE_SESSION_ID=grip-tree-sync "$mesh" broadcast "$1" >/dev/null 2>&1 || true
+}
+
+# Tell every session about a NEW obstacle on the shared tree, once. The same
+# blocking set on the next run is not news, even though main may have moved on.
+# The fingerprint lives in the tree's own git directory, so it is never tracked.
+_tell_obstacle() {
+    local tree="$1" paths="$2" behind_n="$3" gd="" sig="" listed=""
+    if [[ "$is_shared" -ne 1 ]]; then
+        return 0
+    fi
+    gd="$(git -C "$tree" rev-parse --absolute-git-dir 2>/dev/null || true)"
+    if [[ -z "$gd" ]]; then
+        return 0
+    fi
+    sig="$(printf '%s\n' "$paths" | LC_ALL=C sort | git hash-object --stdin 2>/dev/null || true)"
+    if [[ -f "$gd/grip-tree-sync-obstacle" && "$(cat "$gd/grip-tree-sync-obstacle" 2>/dev/null || true)" == "$sig" ]]; then
+        return 0
+    fi
+    printf '%s\n' "$sig" > "$gd/grip-tree-sync-obstacle" 2>/dev/null || true
+    listed="$(printf '%s\n' "$paths" | head -5 | paste -sd ',' - | sed 's/,/, /g')"
+    _mesh_tell "[grip-tree-sync] the shared tree is $behind_n commit(s) behind main and cannot catch up: $listed changed both here and on main in ways that cannot be combined automatically. bin/grip-tree-sync --shared names each file and why."
+}
+
+# A merge landed on the shared tree: forget the last obstacle and say so.
+_after_merge() {
+    local tree="$1" behind_n="$2" gd=""
+    if [[ "$is_shared" -ne 1 ]]; then
+        return 0
+    fi
+    gd="$(git -C "$tree" rev-parse --absolute-git-dir 2>/dev/null || true)"
+    if [[ -n "$gd" ]]; then
+        rm -f "$gd/grip-tree-sync-obstacle"
+    fi
+    _mesh_tell "[grip-tree-sync] the shared tree caught up with main (+$behind_n, now at $(git -C "$tree" rev-parse --short HEAD 2>/dev/null || echo unknown)); every local edit kept."
+}
+
+# One line per file the resolver handled, from its "kind<TAB>path<TAB>why" output.
+_say_resolved() {
+    local name="$1" kind="" path="" why=""
+    while IFS=$'\t' read -r kind path why; do
+        case "$kind" in
+            # True for both ways a file is staged: the local copy IS main's version, or
+            # it already contains main's change beside local edits (a live settings.json).
+            staged) echo "[grip-tree-sync] $name: $path already held main's change -- staged main's version, file untouched" ;;
+            merged) echo "[grip-tree-sync] $name: $path changed here and on main -- combined both, local edits kept" ;;
+            replaced) echo "[grip-tree-sync] $name: $path is rebuilt here and clashed with main -- took main's copy" ;;
+            left)   >&2 echo "[grip-tree-sync] $name: $path -- $why" ;;
+            *)      ;;
+        esac
+    done <<< "$2"
+}
+
+# The files that stop the merge, with the resolver's reason for each when it gave one.
+_say_blocking() {
+    local name="$1" paths="$2" reasons="$3" kind="" path="" why=""
+    if [[ -z "$reasons" ]]; then
+        >&2 echo "[grip-tree-sync] $name: only these block the merge; the rest of the dirty tree already matches origin/main:"
+        while IFS= read -r path; do
+            if [[ -n "$path" ]]; then
+                >&2 echo "[grip-tree-sync]     $path"
+            fi
+        done <<< "$paths"
+        return 0
+    fi
+    >&2 echo "[grip-tree-sync] $name: these changed both here and on main in ways that cannot be combined automatically:"
+    while IFS=$'\t' read -r kind path why; do
+        if [[ -n "$path" ]]; then
+            >&2 echo "[grip-tree-sync]     $path -- $why"
+        fi
+    done <<< "$reasons"
+}
+
+
+# Report a tree carrying unmerged paths, and stop. The merge commit itself is
+# correct and is deliberately KEPT; what is broken is the working tree.
+#
+# Nothing is auto-resolved, deliberately. Choosing a side on the operator's
+# behalf is how a background tool silently rewrites model or hook wiring in
+# settings.json, and the one file that looked safely generated is not:
+# rules/system-capabilities.md is 18 lines of hand-authored prose carrying a
+# single generated stats line, so taking either whole side would discard real
+# content. This defect was caused by a tool being silently clever with files it
+# did not understand, and the fix for that is not more of the same.
+_report_broken_tree() {
+    local name="$1" tree="$2" paths="$3" why="$4" top=""
+    >&2 echo "[grip-tree-sync] $name: $why"
+    >&2 echo "[grip-tree-sync] $name: path(s) left unmerged, unusable as-is:"
+    while IFS= read -r wrecked; do
+        if [[ -n "$wrecked" ]]; then
+            >&2 echo "[grip-tree-sync]     $wrecked"
+        fi
+    done <<< "$paths"
+    top="$(git -C "$tree" stash list 2>/dev/null | head -1 || true)"
+    if [[ -n "$top" ]]; then
+        >&2 echo "[grip-tree-sync] $name: uncommitted work is NOT lost — top of stash: $top"
+    fi
+    >&2 echo "[grip-tree-sync] $name: resolve by hand (nothing here blocks you):"
+    >&2 echo "[grip-tree-sync]     cd $tree"
+    >&2 echo "[grip-tree-sync]     git checkout HEAD -- <path>   # take the merged side, drop local churn"
+    >&2 echo "[grip-tree-sync]     git stash pop                 # or restore the churn and merge it by hand"
+    >&2 echo "[grip-tree-sync]     git stash drop                # once you are sure you do not need it"
+}
+
+# The one-way additive skill mirror, run when --shared is given.
+#
+# WHY THIS EXISTS. A GRIP skill ships by editing ONE canonical SKILL.md, but the
+# OpenCode/pi harnesses load the skills from ~/.agents/skills/<name>/SKILL.md — a
+# SEPARATE tree that is not a copy of ~/.grip/skills. Measured 2026-09-20: 264
+# of 333 overlapping skills there were frozen at ~2026-09-06, and the stale copy
+# of absorb-knowledge shadowed the fresh shared-tree copy in load order, so the
+# harness acted on an old scope. ~/.grip/skills is itself a load surface, which
+# is why the fresh copy being shadowed was invisible until it was measured.
+#
+# The contract is deliberately NOT "~/.agents/skills equals the repo":
+#   * the agents tree is an AGGREGATE home — 662 entries vs the repo's 333,
+#     including ~200 generated source-command-* proxies
+#     (skills/surfacing-skills/scripts/surface_skills.py) and operator skills
+#     that legitimately live only there (job-analysis, offer-evaluation, ...);
+#   * so a pure mirror would DELETE ~329 legitimate entries. No half of this
+#     function ever deletes, and only entries present in BOTH trees are touched.
+#
+# It is additive, one-way and idempotent: canonical bytes win, nothing is ever
+# removed, and a re-run on an aligned tree copies nothing (f∘f = f), so it is
+# safe for the same timer that drives the git sync.
+_mirror_agents_skills() {
+    local src="$1" agents="${GRIP_AGENTS_SKILLS:-$HOME/.agents/skills}"
+    local canon="" ag="" n="" aligned=0 diverged=0
+    if [[ ! -d "$agents" ]]; then
+        echo "[grip-tree-sync] skills-mirror: $agents not present — nothing to mirror"
+        return 0
+    fi
+    for canon in "$src"/skills/*/SKILL.md; do
+        # A non-matching glob stays literal under bash and has no -f, so the
+        # guard doubles as the "empty skills dir" case.
+        [[ -f "$canon" ]] || continue
+        n="$(basename "$(dirname "$canon")")"
+        ag="$agents/$n/SKILL.md"
+        [[ -f "$ag" ]] || continue   # overlap only — never create into the agents tree
+        if ! cmp -s -- "$canon" "$ag"; then
+            diverged=$((diverged + 1))
+            if [[ "$CHECK_ONLY" -eq 1 ]]; then
+                echo "[grip-tree-sync] skills-mirror: $n/SKILL.md differs from canonical"
+            else
+                # cp follows a target symlink and rewrites through it; there are
+                # no symlinked skill dirs in the agents tree today, and following
+                # one would still leave canonical wins true, so plain cp is right.
+                cp -- "$canon" "$ag"
+                aligned=$((aligned + 1))
+            fi
+        fi
+    done
+    if [[ "$CHECK_ONLY" -eq 1 ]]; then
+        # Informational, deliberately NOT an exit-code gate: mirror drift is not
+        # the tree being behind, and --check's contract is about tree level-ness.
+        echo "[grip-tree-sync] skills-mirror: $diverged overlapping shared skill(s) differ from $agents"
+    elif [[ "$aligned" -gt 0 ]]; then
+        echo "[grip-tree-sync] skills-mirror: aligned $aligned overlapping SKILL.md(s) into $agents (canonical wins, no deletes)"
+    else
+        echo "[grip-tree-sync] skills-mirror: in sync"
+    fi
+}
+
+rc=0
+for tree in "${TARGETS[@]}"; do
+    if ! git -C "$tree" rev-parse --git-dir >/dev/null 2>&1; then
+        >&2 echo "[grip-tree-sync] not a git tree, skipping: $tree"
+        continue
+    fi
+    name="$(basename "$tree")"
+    is_shared=0
+    if [[ -n "${shared:-}" && "$(cd "$tree" 2>/dev/null && pwd -P || echo x)" == "$shared" ]]; then
+        is_shared=1
+    fi
+
+    # Fail-open on the network: an offline machine must not turn a routine
+    # sync into an error, so a failed fetch degrades to comparing the
+    # last-known ref rather than aborting.
+    git -C "$tree" fetch --quiet origin main 2>/dev/null || \
+        >&2 echo "[grip-tree-sync] $name: fetch failed — comparing against the last-fetched ref"
+
+    if ! git -C "$tree" rev-parse --verify --quiet origin/main >/dev/null 2>&1; then
+        >&2 echo "[grip-tree-sync] $name: no origin/main to compare against"
+        continue
+    fi
+
+    behind="$(git -C "$tree" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)"
+    ahead="$(git -C "$tree" rev-list --count origin/main..HEAD 2>/dev/null || echo 0)"
+    # An unmerged path is neither "dirty" nor "level" — it is BROKEN, so it must
+    # gate --check as well as a sync. Checked before anything else because git
+    # refuses to merge into unmerged paths anyway: without this a timer-driven
+    # run would retry the same doomed merge forever, reporting a conflict it
+    # cannot abort instead of the wreckage it is actually looking at.
+    if ! unmerged="$(_unmerged_paths "$tree")"; then
+        >&2 echo "[grip-tree-sync] $name: could not read this tree's state — cannot tell whether it is intact, so not calling it clean."
+        rc=1
+        continue
+    fi
+    if [[ -n "$unmerged" ]]; then
+        _report_broken_tree "$name" "$tree" "$unmerged" \
+            "UNMERGED paths present — this tree is not level and not safe to merge into."
+        rc=1
+        continue
+    fi
+
+    dirty_now="$(git -C "$tree" status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')"
+    # Is HEAD reachable from ANY remote branch? Ahead-of-main is not by itself a
+    # risk — a feature branch is ahead by design and its commits are safely on
+    # origin. What is unrecoverable is a commit that exists on no remote at all,
+    # so that is what this measures, in one call rather than one per commit.
+    on_remote="$(git -C "$tree" branch -r --contains HEAD 2>/dev/null | head -1 | tr -d ' ')"
+
+    # Report the tree's ACTUAL state, not just its behind-ness. Until 2026-08-30
+    # a tree holding 4 commits that existed on no remote branch, plus 3 modified
+    # files, printed "level with origin/main" and exited 0 — because behind was
+    # the only thing measured. "Level" is a claim about being in sync, and it
+    # could not disagree with a tree whose work existed on exactly one machine.
+    extra=""
+    if [[ "$ahead" -gt 0 && -z "$on_remote" ]]; then
+        extra="; $ahead commit(s) on NO remote branch — push them or back them up"
+    elif [[ "$ahead" -gt 0 ]]; then
+        extra="; $ahead ahead (already on $on_remote)"
+    fi
+    if [[ "$dirty_now" -gt 0 ]]; then
+        extra="$extra; $dirty_now uncommitted file(s)"
+    fi
+
+    if [[ "$behind" -eq 0 ]]; then
+        # plan-v4 C5/C7: the git state says "level", which says nothing about
+        # whether the LIVE settings.json still matches what HEAD tracks -- a
+        # runtime rewrite can drift it without ever making the tree dirty in
+        # a way a plain commit would catch. `if`, not `&&`, for the same
+        # set -e reason the ahead/on_remote check below already states.
+        if [[ "$is_shared" -eq 1 ]]; then
+            if [[ "$CHECK_ONLY" -eq 1 ]]; then
+                if ! _check_settings_arrived "$tree"; then
+                    rc=1
+                fi
+            else
+                if ! _reconcile_settings_repair "$tree"; then
+                    rc=1
+                fi
+            fi
+        fi
+        if [[ -z "$extra" ]]; then
+            echo "[grip-tree-sync] $name: level with origin/main"
+        else
+            echo "[grip-tree-sync] $name: level with origin/main$extra"
+            # Unpushed work is actionable, so --check must not call it clean.
+            # A real `if` rather than `[[ ... ]] && rc=1`: under `set -e` the
+            # short-circuit form exits the script whenever the test is false.
+            if [[ "$ahead" -gt 0 && -z "$on_remote" ]]; then
+                rc=1
+            fi
+        fi
+        continue
+    fi
+
+    if [[ "$CHECK_ONLY" -eq 1 ]]; then
+        echo "[grip-tree-sync] $name: BEHIND origin/main by $behind commit(s)$extra"
+        rc=1
+        continue
+    fi
+
+    # A session merging the shared tree by hand holds this presence lock, and the
+    # timer leaves the run to the next one rather than interleave its git steps
+    # with theirs (V>> /hitl, 2026-10-12).
+    if [[ "$is_shared" -eq 1 ]]; then
+        holder="$(_shared_lock_holder)"
+        if [[ -n "$holder" ]]; then
+            echo "[grip-tree-sync] $name: BEHIND by $behind, but $holder holds the shared-tree lock -- leaving this run to the next one"
+            continue
+        fi
+    fi
+
+    merge_args=(--no-edit)
+    # What gates the merge is the work the merge could DESTROY, never the raw
+    # count of files that differ from HEAD. See _blocking_dirty_paths.
+    if ! blocking="$(_blocking_dirty_paths "$tree" origin/main)"; then
+        >&2 echo "[grip-tree-sync] $name: could not compare this tree against origin/main — not merging."
+        rc=1
+        continue
+    fi
+    if ! skipped="$(_skip_worktree_changed "$tree" origin/main)"; then
+        >&2 echo "[grip-tree-sync] $name: could not list this tree's skip-worktree files -- not merging."
+        rc=1
+        continue
+    fi
+    blocking="$(printf '%s\n%s\n' "$blocking" "$skipped" | awk 'NF && !seen[$0]++')"
+    reasons=""
+    # On a fast-forward those files need not block at all: stage main's version
+    # of each and merge the local edits back in (lib/tree_sync_resolve.py). The
+    # resolver changes nothing unless every one of them can be combined.
+    if [[ -n "$blocking" && "$ahead" -eq 0 ]]; then
+        resolve_rc=0
+        resolved="$(printf '%s\n' "$blocking" | "$(_resolver_python)" "$_SCRIPT_DIR/../lib/tree_sync_resolve.py" --tree "$tree" --target origin/main)" || resolve_rc=$?
+        if [[ "$resolve_rc" -eq 0 ]]; then
+            _say_resolved "$name" "$resolved"
+            echo "[grip-tree-sync] $name: merged origin/main (+$behind)"
+            _after_merge "$tree" "$behind"
+            if [[ "$is_shared" -eq 1 ]]; then
+                if ! _reconcile_settings_repair "$tree"; then
+                    rc=1
+                fi
+            fi
+            continue
+        fi
+        if [[ "$resolve_rc" -ne 3 ]]; then
+            why="$(printf '%s\n' "$resolved" | awk -F '\t' '$1 == "error" { print $2; exit }')"
+            >&2 echo "[grip-tree-sync] $name: could not move the locally changed files (${why:-exit $resolve_rc}) -- the tree is as it was, not merging."
+            rc=1
+            continue
+        fi
+        reasons="$(printf '%s\n' "$resolved" | awk -F '\t' '$1 == "blocked"')"
+        blocking="$(printf '%s\n' "$reasons" | awk -F '\t' 'NF { print $2 }')"
+    fi
+    if [[ -n "$blocking" ]]; then
+        blocking_n="$(printf '%s\n' "$blocking" | wc -l | tr -d ' ')"
+        if [[ "$AUTOSTASH" -eq 0 ]]; then
+            # Default stays conservative: merging into uncommitted work is how a
+            # session loses changes it never chose to risk.
+            >&2 echo "[grip-tree-sync] $name: BEHIND by $behind, and $blocking_n uncommitted file(s) would be overwritten — not merging."
+            _say_blocking "$name" "$blocking" "$reasons"
+            >&2 echo "[grip-tree-sync] commit or stash those, or re-run with --autostash."
+            _tell_obstacle "$tree" "$blocking" "$behind"
+            rc=1
+            continue
+        fi
+
+        # A stash cannot carry a skip-worktree file, so the merge would only be
+        # refused again and reported as a conflict, which it is not (GRIP#7288).
+        if [[ -n "$skipped" && -n "$(comm -12 <(printf '%s\n' "$blocking" | LC_ALL=C sort) <(printf '%s\n' "$skipped" | LC_ALL=C sort))" ]]; then
+            >&2 echo "[grip-tree-sync] $name: a skip-worktree file blocks the merge, and --autostash cannot carry it -- not merging."
+            _say_blocking "$name" "$blocking" "$reasons"
+            rc=1
+            continue
+        fi
+
+        # git-crypt: a modified .gitattributes decides which files are
+        # encrypted, so stashing and reapplying it can round-trip a file
+        # through the wrong filter and corrupt it. Refuse, exactly as
+        # rules/commit-standards.md requires before any autostash operation.
+        if git -C "$tree" status --porcelain -- .gitattributes 2>/dev/null | grep -q .; then
+            >&2 echo "[grip-tree-sync] $name: .gitattributes is modified — refusing to autostash (git-crypt corruption risk)."
+            rc=1
+            continue
+        fi
+        merge_args+=(--autostash)
+        echo "[grip-tree-sync] $name: dirty and behind — merging with --autostash"
+    fi
+
+    if git -C "$tree" merge "${merge_args[@]}" origin/main >/dev/null 2>&1; then
+        # Exit 0 is not evidence the tree is usable. The autostash re-apply is a
+        # SEPARATE step that runs after the merge has already landed, and when it
+        # conflicts git says so on stderr and exits 0 regardless. Ask the tree.
+        if ! unmerged="$(_unmerged_paths "$tree")"; then
+            >&2 echo "[grip-tree-sync] $name: merge landed (+$behind) but this tree's state could not be read — cannot confirm it is intact."
+            rc=1
+        elif [[ -n "$unmerged" ]]; then
+            _report_broken_tree "$name" "$tree" "$unmerged" \
+                "merge landed (+$behind) but the AUTOSTASH RE-APPLY CONFLICTED — tree is BROKEN."
+            rc=1
+        else
+            echo "[grip-tree-sync] $name: merged origin/main (+$behind)"
+            _after_merge "$tree" "$behind"
+            if [[ "$is_shared" -eq 1 ]]; then
+                if ! _reconcile_settings_repair "$tree"; then
+                    rc=1
+                fi
+            fi
+        fi
+    else
+        # Abort rather than leave a half-merged tree behind a timer-driven run.
+        # git restores an autostash on abort, so uncommitted work comes back.
+        git -C "$tree" merge --abort 2>/dev/null || true
+        >&2 echo "[grip-tree-sync] $name: merge conflicted — aborted, tree untouched. Resolve by hand."
+        rc=1
+    fi
+done
+
+if [[ "$DO_SHARED" -eq 1 && -n "${shared:-}" ]]; then
+    _mirror_agents_skills "$shared"
+fi
+
+exit "$rc"

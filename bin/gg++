@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# gg++ — Load GRIP session context in the CURRENT directory, with
+#        concurrent-session isolation as the top priority.
+#
+# Unlike gogrip (which jumps to ~/.grip), gg++ loads session context and
+# starts Claude Code wherever you invoke it from.
+#
+# Concurrency: when another live claude session already shares this git
+# MAIN working tree, launching here would share .git/HEAD + .git/index —
+# the recurring cross-session branch/tree contamination class (Rule 13,
+# rules/efficiency-rules.md). Pre-flight detects that case and launches
+# inside a fresh git-crypt-safe worktree (lib/grip-worktree.sh) on a
+# disposable sess/gg-* branch instead. On exit the worktree is reaped when
+# it holds no work, and kept (with resume instructions) when it does.
+# Session memory/continuity is unaffected — the worktree's project context
+# is symlinked to the parent repo's by grip-worktree.sh.
+#
+# Usage: gg++ [--isolate|--no-isolate] [--dry-run] [harness] [--<family> [tier|effort]] [--direct] [context_tokens]
+#        gg++ -p "<task>" [grip-run flags...]
+#   context_tokens : optional max tokens for session context (default: 12000)
+#   --isolate      : force worktree isolation even when alone (GG_ISOLATE=on)
+#   --no-isolate   : legacy shared-tree launch                (GG_ISOLATE=off)
+#   --dry-run      : print the launch decision and exit; spawns nothing
+#   --<family>     : model family (--kimi, --qwen ...); `gg++ --help` lists them
+#   --direct       : vendor endpoint instead of HAL :4010 (claude/codex only;
+#                    the HAL witness and cost rows are NOT recorded)
+#   -p "<task>"    : run the task headlessly through bin/grip-run instead of
+#                    an interactive session (headless GRIP, slice 1 --
+#                    docs/headless-grip.md). Checked FIRST, before any of the
+#                    interactive-launch flags above, and exclusive with them.
+#
+# Env: GG_ISOLATE=auto|on|off   (default auto)
+#      GG_WORKTREE_ROOT=<dir>   (default ~/.gg-worktrees)
+
+set -euo pipefail
+
+GRIP_DIR="${GRIP_DIR:-$HOME/.grip}"
+
+if [[ ! -d "$GRIP_DIR" ]]; then
+    echo "Error: GRIP not installed at $GRIP_DIR" >&2
+    echo "Install: git clone https://github.com/grip-platform/GRIP.git ~/.grip" >&2
+    exit 1
+fi
+
+# Headless passthrough: `gg++ -p "<task>"` runs the task through
+# bin/grip-run instead of launching an interactive session. Checked here,
+# before gg-concurrency.sh is even sourced, because a headless run creates
+# and tears down its OWN isolation worktree (lib/headless_run.py) and must
+# never enter the interactive GG_ISOLATE dance below -- that dance assumes
+# an interactive claude session is about to be launched in the CURRENT
+# worktree, which a headless run never does. Kept deliberately minimal:
+# everything after -p passes straight through to grip-run's own parser.
+# GRIP_DIR is already validated above (the install check exits 1 when it is
+# missing), so the exec below never runs against an absent install.
+if [[ "${1:-}" == "-p" ]]; then
+    shift
+    exec "$GRIP_DIR/bin/grip-run" "$@"
+fi
+
+# shellcheck source=../lib/gg-concurrency.sh
+source "$GRIP_DIR/lib/gg-concurrency.sh"
+
+MODE="${GG_ISOLATE:-auto}"
+DRY_RUN=0
+TOKENS="12000"
+HARNESS="-"
+MODEL="-"
+EFFORT="-"
+DIRECT="-"
+PASSTHRU=()
+for arg in "$@"; do
+    case "$arg" in
+        --isolate)    MODE="on" ;;
+        --no-isolate) MODE="off" ;;
+        --dry-run)    DRY_RUN=1 ;;
+        --help|-h)    sed -n '2,26p' "$0"; exit 0 ;;
+        *)            PASSTHRU+=("$arg") ;;
+    esac
+done
+
+# Classification is SHARED with the gogrip shell function, via
+# lib/grip_launch_args.py, so the two gg++ surfaces cannot disagree about what
+# an argument means. That matters: this script is on PATH and wins in every
+# context where the zsh alias is not in play -- a script, a Makefile, cron,
+# `bash -c`. Before this it took the catch-all branch and swallowed a harness
+# name as the context-token budget, so `gg++ codex` reached
+# `grip fresh latest codex`, which fails deep inside context generation with a
+# message about compression rather than about the argument.
+# Backward-compatibility floor, mirroring the gogrip function: no arguments or
+# a single all-digits budget never reaches the classifier, so a missing
+# python3, an unreadable picker or a half-updated install cannot regress the
+# historical invocation. Structural, not a promise.
+if [[ ${#PASSTHRU[@]} -eq 1 && "${PASSTHRU[0]}" =~ ^[0-9]+$ ]]; then
+    TOKENS="${PASSTHRU[0]}"
+    PASSTHRU=()
+fi
+
+if [[ ${#PASSTHRU[@]} -gt 0 ]]; then
+    if PLAN="$(python3 "$GRIP_DIR/lib/grip_launch_args.py" "${PASSTHRU[@]}")"; then
+        case "$PLAN" in
+            LAUNCH\ *) read -r _KW HARNESS TOKENS MODEL EFFORT DIRECT _REST <<<"$PLAN" ;;
+            *)         printf '%s\n' "$PLAN"; exit 0 ;;   # --list / --help
+        esac
+    else
+        exit 2   # the classifier already explained itself on stderr
+    fi
+fi
+
+# Single source for the argv handed to grip. `fresh` MUST stay first: bin/grip
+# gates worktree isolation on the RAW argv[1] against an allowlist that does
+# not contain --harness.
+GRIP_ARGS=(fresh latest "$TOKENS")
+if [[ "$HARNESS" != "-" ]]; then
+    GRIP_ARGS=(fresh --harness "$HARNESS" latest "$TOKENS")
+fi
+
+COUNT="$(gg_count_claude_sessions)"
+TREE="$(gg_tree_state "$PWD")"
+DECISION="$(gg_should_isolate "$COUNT" "$TREE" "$MODE")"
+
+if [[ $DRY_RUN -eq 1 ]]; then
+    # tokens/harness/model are PRINTED so they can be asserted. Without them no
+    # test could tell correct parsing from silent swallowing, which is why the
+    # existing coverage stayed green while the catch-all was eating harness
+    # names.
+    echo "gg++ dry-run: decision=$DECISION live_claude=$COUNT tree=$TREE mode=$MODE tokens=$TOKENS harness=$HARNESS model=$MODEL effort=$EFFORT direct=$DIRECT cwd=$PWD"
+    # GRIP#5345: also say which GRIP_HARNESS_MODEL bin/grip will actually see.
+    # `model=-` reads as "no model", yet env(1) passes an already-exported
+    # GRIP_HARNESS_MODEL straight through, and bin/grip honours it.
+    if [[ "$MODEL" != "-" ]]; then
+        echo "gg++ dry-run: GRIP_HARNESS_MODEL=$MODEL"
+    elif [[ -n "${GRIP_HARNESS_MODEL:-}" ]]; then
+        echo "gg++ dry-run: GRIP_HARNESS_MODEL=$GRIP_HARNESS_MODEL (inherited from the environment, not from this command line)"
+    fi
+    exit 0
+fi
+
+# Environment overrides handed to bin/grip, built ONCE so the isolated and
+# non-isolated launch paths below cannot drift apart. A value of "-" means the
+# operator did not ask for it, and the variable is then not exported at all —
+# an empty GRIP_HARNESS_EFFORT would be indistinguishable from "no effort set"
+# for anything downstream trying to decide whether to act on it.
+_LAUNCH_ENV=()
+if [[ "$MODEL" != "-" ]]; then _LAUNCH_ENV+=("GRIP_HARNESS_MODEL=$MODEL"); fi
+if [[ "$EFFORT" != "-" ]]; then _LAUNCH_ENV+=("GRIP_HARNESS_EFFORT=$EFFORT"); fi
+if [[ "$DIRECT" == "direct" ]]; then _LAUNCH_ENV+=("GRIP_HARNESS_DIRECT=1"); fi
+
+_launch() {
+    # Session continuity via the grip CLI when available; plain claude otherwise.
+    if [[ ! -x "$GRIP_DIR/bin/grip" ]]; then
+        claude
+        return
+    fi
+    if [[ ${#_LAUNCH_ENV[@]} -gt 0 ]]; then
+        env "${_LAUNCH_ENV[@]}" "$GRIP_DIR/bin/grip" "${GRIP_ARGS[@]}"
+    else
+        "$GRIP_DIR/bin/grip" "${GRIP_ARGS[@]}"
+    fi
+}
+
+if [[ "$DECISION" == "isolate" ]]; then
+    REPO_ROOT="$(git -C "$PWD" rev-parse --show-toplevel)"
+    if WT="$(gg_worktree_create "$REPO_ROOT")"; then
+        BRANCH="$(git -C "$WT" symbolic-ref --short HEAD 2>/dev/null || echo 'sess/?')"
+        echo "[gg++] $COUNT live claude session(s) share $REPO_ROOT — isolating this launch" >&2
+        echo "[gg++]   worktree: $WT" >&2
+        echo "[gg++]   branch:   $BRANCH   (opt out next time: gg++ --no-isolate)" >&2
+        set +e
+        ( cd "$WT" && _launch )
+        RC=$?
+        set -e
+        gg_worktree_reap "$WT" "$REPO_ROOT" >/dev/null
+        exit $RC
+    fi
+    # Fail CLOSED: a shared-tree launch is exactly the contamination this
+    # pre-flight exists to prevent. The operator override is one flag away.
+    echo "[gg++] worktree isolation FAILED — refusing shared-tree launch." >&2
+    echo "[gg++] override (accepts contamination risk): gg++ --no-isolate" >&2
+    exit 1
+fi
+
+# Single-session, opted-out, already-isolated, or non-repo launch:
+# original behaviour for a bare launch, now sharing ONE argv with the isolated
+# path above so the two cannot drift.
+if [[ -x "$GRIP_DIR/bin/grip" ]]; then
+    if [[ ${#_LAUNCH_ENV[@]} -gt 0 ]]; then
+        exec env "${_LAUNCH_ENV[@]}" "$GRIP_DIR/bin/grip" "${GRIP_ARGS[@]}"
+    fi
+    exec "$GRIP_DIR/bin/grip" "${GRIP_ARGS[@]}"
+fi
+
+# Fallback: plain Claude Code
+exec claude

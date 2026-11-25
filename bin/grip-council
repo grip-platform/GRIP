@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# grip-council — real multi-LLM council via the HAL Gateway (goal #2205).
+#
+# Makes a council genuinely multi-PROVIDER (gemini/groq/deepseek/xai/qwen/...),
+# not Anthropic-only like the Workflow agent() primitive. Any dynamic workflow
+# that needs real multi-LLM shells out to THIS instead of fanning out Claude
+# agent()s:
+#
+#   grip-council "How should X work?" --roster open --synthesize
+#   grip-council --stdin --roster agora < question.txt
+#
+# Rosters: council (5-voice incl. 1 Anthropic) | agora (3 speakers + judge) |
+#          open (non-Anthropic only — parallel-safe when an Anthropic loop runs)
+#
+# Exit 0 = real multi-LLM (>=2 distinct non-Anthropic families answered); 3 = not.
+set -euo pipefail
+
+source "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib/venv-utils.sh"
+if ! PY="$(resolve_venv_python "$HOME/.claude/venv")"; then
+  echo "[grip-council] no Python interpreter found (searched $HOME/.claude/venv, then PATH)" >&2
+  exit 1
+fi
+exec "$PY" "$HOME/.claude/lib/hal_council_ideate.py" "$@"

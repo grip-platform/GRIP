@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""Who is running, what are they doing, and where is the brief to continue.
+
+The operator runs ~15 concurrent Claude Code sessions and cannot tell what any
+of them is. `presence.db` carries no task field at all, and its `name` column
+holds PID slugs and directory names -- `grip-session-69469-1789872835`, `.grip`,
+`void`. So the description has to be DERIVED, and the join that makes that
+possible is: `sessions.id` is `cc-<uuid>`, and the transcript for that session is
+`~/.grip/projects/<cwd-slug>/<uuid>.jsonl`.
+
+Output is Discord-ready markdown. Deliberately a NAME, a ONE-LINE description and
+a LINK -- never an excerpt. Transcripts carry client and personal content, so the
+derived line is capped and the raw text never leaves this process.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sqlite3
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+DB = HOME / ".grip-session-mesh" / "presence.db"
+PROJECTS = HOME / ".grip" / "projects"
+BRIEFS = HOME / ".grip" / "state"
+PLANS = HOME / ".grip" / "plans"
+DRAFTS = HOME / ".grip" / "drafts"
+
+RUNNING_S = 15 * 60
+IDLE_S = 24 * 60 * 60
+#: A derived line is a summary, never a quotation. Short enough that it cannot
+#: carry a paragraph of somebody's client work into a chat channel.
+SUMMARY_CAP = 110
+
+
+def _age_seconds(stamp: str) -> "float | None":
+    try:
+        t = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - t).total_seconds()
+
+
+def classify(age: "float | None") -> str:
+    """RUNNING / IDLE / STALE. Never 'dead': heartbeats are written on TOOL CALLS,
+    so a session thinking hard, or waiting on the operator, looks stale while
+    being perfectly alive."""
+    if age is None:
+        return "UNKNOWN"
+    if age < RUNNING_S:
+        return "RUNNING"
+    return "IDLE" if age < IDLE_S else "STALE"
+
+
+def transcript_for(session_id: str) -> "Path | None":
+    """`cc-<uuid>` -> the newest `<uuid>.jsonl` under ~/.grip/projects."""
+    uuid = session_id[3:] if session_id.startswith("cc-") else session_id
+    if not uuid or not PROJECTS.is_dir():
+        return None
+    hits = sorted(PROJECTS.glob(f"*/{uuid}*.jsonl"),
+                  key=lambda p: p.stat().st_mtime if p.exists() else 0)
+    return hits[-1] if hits else None
+
+
+def _text_of(rec: dict) -> str:
+    msg = rec.get("message") or {}
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+    return ""
+
+
+#: Text that arrives in a `user` record but is NOT the operator speaking. The
+#: harness injects skill bodies, command envelopes, hook notices and system
+#: reminders through the same channel, and the first version of this roster
+#: rendered four of those as though they were instructions -- "Base directory for
+#: this skill:", "A session-scoped Stop hook is now active", a workflow reference
+#: doc. A roster whose descriptions are machine chatter is worse than no roster,
+#: because it looks informative.
+_SCAFFOLD_PREFIXES = (
+    "<", "#", '"', "Base directory for this skill",
+    "A session-scoped Stop hook", "Stop hook", "Caveat:",
+    "Goal set:", "[TIME]", "Command:", "The user sent a new message",
+    "This session is being continued", "Your questions have been answered",
+)
+_SCAFFOLD_ANYWHERE = (
+    "Base directory for this skill",
+    "session-scoped Stop hook is now active",
+    "is running in the background",
+    "<command-name>",
+    "<system-reminder>",
+    "local-command-stdout",
+)
+
+
+def _is_scaffolding(text: str) -> bool:
+    """True when this `user` record is the harness talking, not the operator."""
+    if text.startswith(_SCAFFOLD_PREFIXES):
+        return True
+    head = text[:400]
+    return any(marker in head for marker in _SCAFFOLD_ANYWHERE)
+
+
+def tasks_from(path: "Path | None", cap: int = SUMMARY_CAP) -> tuple:
+    """(current, previous) operator instructions, plainly worded.
+
+    Read from the operator's OWN turns, not the agent's: what he asked for is a
+    better description of a session than what the agent said about it, and it is
+    the thing he will recognise. Harness scaffolding (system reminders, command
+    envelopes, hook output) is skipped -- those are not instructions.
+    """
+    if not path or not path.is_file():
+        return (None, None)
+    try:
+        tail = path.read_text(encoding="utf-8", errors="replace").splitlines()[-4000:]
+    except OSError:
+        return (None, None)
+    found: list = []
+    for line in reversed(tail):
+        if len(found) >= 2:
+            break
+        if not line.startswith("{"):
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("type") != "user":
+            continue
+        text = " ".join(_text_of(rec).split())
+        if not text or _is_scaffolding(text):
+            continue
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) < 4:
+            continue
+        found.append(text[:cap] + ("…" if len(text) > cap else ""))
+    while len(found) < 2:
+        found.append(None)
+    return (found[0], found[1])
+
+
+def brief_for(session_id: str) -> "Path | None":
+    uuid = (session_id[3:] if session_id.startswith("cc-") else session_id)[:8]
+    if not uuid or not BRIEFS.is_dir():
+        return None
+    hits = sorted(BRIEFS.glob(f"next-session-{uuid}*.md"))
+    return hits[0] if hits else None
+
+
+# /ultraprompt briefs are date+slug keyed and land in plans/ or next to the work
+# in drafts/, NOT in state/next-session-*.md. They are therefore listed as
+# standalone handoff artefacts rather than attached to any one session. Both
+# roots live under gitignored paths, which is why the per-session brief_for()
+# above never sees them.
+def recent_briefs(within_days: int = 7, cap: int = 10) -> "list[tuple[str, float]]":
+    cutoff = time.time() - within_days * 86400
+    roots = [PLANS, DRAFTS]
+    hits: list[tuple[str, float]] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        hits.extend((str(p), p.stat().st_mtime) for p in root.glob("**/ULTRAPROMPT-*.md")
+                    if p.is_file() and p.stat().st_mtime >= cutoff)
+    hits.sort(key=lambda t: t[1], reverse=True)
+    return hits[:cap]
+
+
+def collect(db: Path = DB) -> list:
+    if not db.is_file():
+        return []
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        rows = con.execute(
+            "select id, name, machine, last_heartbeat from sessions"
+        ).fetchall()
+    finally:
+        con.close()
+    out = []
+    for sid, name, machine, hb in rows:
+        age = _age_seconds(hb or "")
+        t = transcript_for(sid or "")
+        cur, prev = tasks_from(t)
+        out.append({
+            "id": sid, "name": name, "machine": machine,
+            "state": classify(age), "age": age,
+            "current": cur, "previous": prev,
+            "brief": brief_for(sid or ""),
+        })
+    order = {"RUNNING": 0, "IDLE": 1, "STALE": 2, "UNKNOWN": 3}
+    out.sort(key=lambda r: (order.get(r["state"], 9), r["age"] or 1e12))
+    return out
+
+
+def _ago(age: "float | None") -> str:
+    if age is None:
+        return "unknown"
+    if age < 90:
+        return f"{int(age)}s ago"
+    if age < 5400:
+        return f"{int(age // 60)}m ago"
+    if age < 172800:
+        return f"{int(age // 3600)}h ago"
+    return f"{int(age // 86400)}d ago"
+
+
+def render(rows: list) -> str:
+    if not rows:
+        return "**GRIP sessions** — no presence database found."
+    live = sum(1 for r in rows if r["state"] == "RUNNING")
+    lines = [f"**GRIP sessions** — {len(rows)} registered, {live} active in the "
+             "last 15 minutes.", ""]
+    for r in rows:
+        short = (r["id"] or "?")[3:11]
+        lines.append(f"**`{short}`** · {r['state']} · last active {_ago(r['age'])}")
+        lines.append(f"  now: {r['current'] or '_no operator instruction found_'}")
+        if r["previous"]:
+            lines.append(f"  before: {r['previous']}")
+        lines.append(f"  brief: {r['brief'].name if r['brief'] else '**none written**'}")
+        lines.append("")
+    missing = sum(1 for r in rows if not r["brief"])
+    if missing:
+        lines.append(f"_{missing} of {len(rows)} have no per-session brief._")
+    briefs = recent_briefs()
+    if briefs:
+        lines.append("")
+        lines.append(f"**Recent continuation briefs** — {len(briefs)} in the last 7 days")
+        for name, mtime in briefs:
+            rel = name.replace(str(HOME) + "/", "~/")
+            lines.append(f"  {_ago(time.time() - mtime)}  {rel}")
+    return "\n".join(lines)
+
+
+def main(argv: "list | None" = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--json", action="store_true", help="machine-readable")
+    ns = ap.parse_args(argv)
+    rows = collect()
+    if ns.json:
+        print(json.dumps([{**r, "brief": (r["brief"].name if r["brief"] else None)}
+                          for r in rows], indent=2))
+    else:
+        print(render(rows))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

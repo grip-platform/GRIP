@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# grip-skill-lint — strict-loader skill corpus linter.
+# Thin shim over lib/skill_lint.py. See that file for the rules.
+set -euo pipefail
+GRIP_DIR="${GRIP_DIR:-$HOME/.grip}"
+exec python3 "$GRIP_DIR/lib/skill_lint.py" "$@"

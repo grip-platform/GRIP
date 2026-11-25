@@ -1,0 +1,928 @@
+#!/usr/bin/env python3
+"""grip-meet — one-command live meeting intelligence.
+
+The packaged product wrapping GRIP's live-meeting stack (2026-06-09 novel
+tech): room mic -> whisper transcript (scripts/intel_listen.py, capability-
+locked to one file) -> HAL gateway comprehension + auto-action
+(scripts/intel_act_loop.py, capability-locked to post-text-and-exit).
+
+    grip-meet start [--device :1] [--title "..."] [--window-secs 3600]
+                    [--group <jid>]   # required if you intend to use --post
+    grip-meet status
+    grip-meet doctor                # enumerate audio devices + recommend capture device
+    grip-meet tail [-n 20]
+    grip-meet summary [--post]      # digest via HAL -> drafts/ (post is OPT-IN)
+    grip-meet stop
+
+Design rules baked in:
+- stop signals ONLY pids this tool started (state/meet/*.pid) — it never
+  pattern-kills processes (feedback_never_kill_parent_processes).
+- summary --post is opt-in and sends ONE message with the GRIP identity
+  prefix; default is draft-only (feedback_no_channel_respam_silent_expiry).
+- summary --post REFUSES if no group JID was configured for this meeting
+  (H5 — no silent wrong-recipient, no hardcoded fallback).
+- cmd_start REFUSES if ffmpeg or whisper is missing (H6 dep pre-flight).
+- watchdog AUTO-RESTARTS a crashed listener up to RESTART_CAP times (H1).
+"""
+from __future__ import annotations
+
+# Windows consoles default to cp1252, which cannot encode the glyphs below.
+# Located from __file__, not sys.path[0]: the tests load these commands with
+# SourceFileLoader, which does not put bin/ on the path.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from _grip_console import ensure_utf8_stdio  # noqa: E402
+
+ensure_utf8_stdio()
+
+import argparse
+import datetime as _dt
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+CLAUDE_DIR = Path.home() / ".claude"
+STATE_DIR = CLAUDE_DIR / "state" / "meet"
+ONBOARD_MARKER = STATE_DIR / ".onboarded"  # first-run orientation is shown once
+HAL_BASE_URL = "http://127.0.0.1:3850"
+HAL_INFER_URL = f"{HAL_BASE_URL}/api/infer"
+HAL_HEALTH_URL = f"{HAL_BASE_URL}/api/health"
+WHISPER_MODEL = "small.en"  # matches scripts/intel_listen.py --model default
+WHISPER_CACHE = Path.home() / ".cache" / "whisper"  # openai-whisper download root
+CHUNK_LINE = re.compile(r"^\*\*\[\d{2}:\d{2}\]\*\*", re.M)
+# A LIVE listener whose transcript has not grown in this many seconds is
+# silently failing to capture (deaf device — wrong input / no loopback /
+# headphones): the 2026-06-17 failure mode (15 min lost). 2.5x the 60s chunk
+# window. See feedback_grip_meet_device_and_liveness.
+SILENCE_GRACE_SECS = 150
+# Below this mean volume (dB) over a ~5s start probe, the device carried no
+# audio — a deaf device (the 2026-06-17 Scarlett). Real speech is -30..-10 dB;
+# true silence ~-91 dB. -55 is a conservative deaf/live boundary.
+SILENCE_FLOOR_DB = -55.0
+# H1: cap on auto-restarts to avoid crash→restart→crash storm.
+RESTART_CAP = 3
+
+_SUMMARY_PROMPT = """You are GRIP's meeting summariser. Below is a live-captured
+transcript (speech-to-text, errors expected). Produce a plain-English digest:
+
+## Summary (<=120 words)
+## Decisions
+## Action items (owner -> action)
+## Open questions
+
+Transcript:
+"""
+
+
+# ── state helpers ────────────────────────────────────────────────────────────
+
+def pid_file(name: str) -> Path:
+    return STATE_DIR / f"{name}.pid"
+
+
+def read_pid(name: str) -> int | None:
+    try:
+        return int(pid_file(name).read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def pid_alive(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def meta_path() -> Path:
+    return STATE_DIR / "meta.json"
+
+
+def load_meta() -> dict:
+    try:
+        return json.loads(meta_path().read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def count_chunks(transcript: Path) -> int:
+    if not transcript.exists():
+        return 0
+    return len(CHUNK_LINE.findall(transcript.read_text()))
+
+
+def default_transcript() -> Path:
+    return CLAUDE_DIR / "drafts" / f"meeting-transcript-{_dt.date.today().isoformat()}.md"
+
+
+def build_summary_prompt(transcript_text: str, limit: int = 24000) -> str:
+    """Prompt for the HAL digest; transcript tail-trimmed to stay in budget."""
+    return _SUMMARY_PROMPT + transcript_text[-limit:]
+
+
+# ── commands ─────────────────────────────────────────────────────────────────
+
+def _parse_mean_volume(stderr: str) -> float | None:
+    """Extract mean_volume (dB) from ffmpeg volumedetect stderr; None if absent.
+    Pure + testable (the I/O lives in device_hears_audio)."""
+    m = re.search(r"mean_volume:\s*(-?\d+(?:\.\d+)?) dB", stderr)
+    return float(m.group(1)) if m else None
+
+
+def device_hears_audio(device: str, secs: int = 5) -> bool | None:
+    """Record a short probe on `device`; report whether it carried real audio.
+
+    True = audio present · False = SILENT (deaf device) · None = could not probe
+    (ffmpeg/volumedetect absent or errored) -> FAIL-OPEN: never block start on a
+    probe failure, only on a confirmed-silent device. Fixes B4 (start used to
+    declare "live" on a device it had never heard — the 2026-06-17 root cause)."""
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostdin", "-f", "avfoundation",
+             "-i", device, "-t", str(secs), "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=secs + 15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    mean = _parse_mean_volume(proc.stderr)
+    return None if mean is None else mean > SILENCE_FLOOR_DB
+
+
+# ── N1: device enumeration + loopback detection (for `doctor`) ────────────────
+
+# Name fragments that mark a system-audio loopback / aggregate — a device that
+# captures app/meeting audio (the call downlink), not just the room via a mic.
+_LOOPBACK_HINTS = (
+    "blackhole", "aggregate", "loopback", "soundflower",
+    "vb-cable", "vb-audio", "multi-output",
+)
+
+
+def is_loopback_device(name: str) -> bool:
+    """True if the device name looks like a system-audio loopback/aggregate.
+
+    Pure + testable. A microphone only hears the ROOM (your speakers); a
+    loopback hears the meeting's downlink directly. This is the distinction
+    the 2026-06-17 demo surfaced (a headphone call is inaudible to a mic).
+    """
+    low = name.lower()
+    return any(h in low for h in _LOOPBACK_HINTS)
+
+
+def _parse_audio_devices(stderr: str) -> list[tuple[int, str]]:
+    """Parse `ffmpeg -f avfoundation -list_devices true` stderr → [(index, name), …]
+    for the AUDIO section only (video indices are a separate namespace).
+
+    Pure + testable; the I/O lives in list_audio_devices. The audio index maps
+    directly to grip-meet's `--device :<index>` (avfoundation `:audio` spec).
+    """
+    devices: list[tuple[int, str]] = []
+    in_audio = False
+    for line in stderr.splitlines():
+        low = line.lower()
+        if "audio devices:" in low:
+            in_audio = True
+            continue
+        if "video devices:" in low:
+            in_audio = False
+            continue
+        if not in_audio:
+            continue
+        # Each line is e.g. "[AVFoundation indev @ 0x..] [1] BlackHole 2ch";
+        # the leading bracket holds no digits, so \[(\d+)\] binds to the index.
+        m = re.search(r"\[(\d+)\]\s+(.+?)\s*$", line)
+        if m:
+            devices.append((int(m.group(1)), m.group(2)))
+    return devices
+
+
+def list_audio_devices() -> list[tuple[int, str]] | None:
+    """Enumerate avfoundation audio inputs via ffmpeg.
+
+    None if ffmpeg is absent or the probe errors (fail-open — doctor degrades
+    to advice, never crashes). The list-devices call exits non-zero by design
+    (`-i ""` is not a real input); the device list is on stderr regardless, so
+    the return code is intentionally ignored.
+    """
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-f", "avfoundation",
+             "-list_devices", "true", "-i", ""],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return _parse_audio_devices(proc.stderr)
+
+
+# ── H6: dependency pre-flight ─────────────────────────────────────────────────
+
+def check_deps() -> list[str]:
+    """Return a list of missing required binaries (empty = all present).
+
+    Pure (no side effects): callers decide whether to abort or warn.
+    """
+    missing = []
+    if not shutil.which("ffmpeg"):
+        missing.append("ffmpeg")
+    if not shutil.which("whisper"):
+        missing.append("whisper")
+    return missing
+
+
+def _dep_install_hint(name: str) -> str:
+    hints = {
+        "ffmpeg": "  brew install ffmpeg",
+        "whisper": "  pip install openai-whisper",
+    }
+    return hints.get(name, f"  # install {name}")
+
+
+def whisper_model_present(model: str = WHISPER_MODEL, cache: Path | None = None) -> bool:
+    """True if the whisper model is already cached (no slow first-run download).
+
+    openai-whisper caches models at ~/.cache/whisper/<model>.pt. A missing model
+    is not a HARD blocker (it auto-downloads on first transcribe) but the ~244 MB
+    download silently stalls the first real meeting — doctor surfaces it so the
+    user can pre-warm it via grip-meet-setup. Pure (one filesystem stat); `cache`
+    is injectable for tests.
+    """
+    root = cache if cache is not None else WHISPER_CACHE
+    return (root / f"{model}.pt").exists()
+
+
+# ── H1: should_restart — pure predicate, fully testable ─────────────────────
+
+def should_restart(
+    verdict: str,
+    sentinel: dict | None,
+    restarts_so_far: int,
+    cap: int = RESTART_CAP,
+) -> bool:
+    """Decide whether the watchdog should attempt a listener restart.
+
+    True iff ALL of:
+    - verdict is "died" (crash, not a clean stop)
+    - the exit sentinel is absent or is a "crash" sentinel (no clean stop)
+    - restarts_so_far < cap (storm-prevention limit)
+
+    A "stopped" or "window" or "silence" sentinel means the user (or the
+    listener itself) triggered a clean shutdown — restarting would be wrong.
+    """
+    if verdict != "died":
+        return False
+    if restarts_so_far >= cap:
+        return False
+    # sentinel is None (no file) or contains reason="crash" → restart warranted.
+    # Any other reason (stopped/window/silence) = intentional stop → don't restart.
+    if sentinel is not None and sentinel.get("reason") != "crash":
+        return False
+    return True
+
+
+# ── H5: post-group guard — pure predicate, fully testable ────────────────────
+
+def post_group_configured(meta: dict) -> bool:
+    """True iff an explicit group JID was saved for this meeting session.
+
+    `summary --post` MUST refuse when this returns False — no hardcoded
+    fallback, ever (H5: no silent wrong-recipient).
+    """
+    return bool(meta.get("group_jid", "").strip())
+
+
+def _spawn_listener(meta: dict) -> subprocess.Popen:
+    """Re-spawn the listener from saved meta args (DRY — reuses cmd_start logic).
+
+    Used by the watchdog on auto-restart (H1) so we never duplicate the
+    Popen incantation.
+    """
+    transcript = Path(meta["transcript"])
+    return subprocess.Popen(
+        [sys.executable, str(CLAUDE_DIR / "scripts" / "intel_listen.py"),
+         "--device", meta["device"],
+         "--window-secs", str(meta["window_secs"]),
+         "--transcript", str(transcript),
+         "--title", meta.get("title", "")],
+        stdout=(STATE_DIR / "listener.log").open("a"),
+        stderr=subprocess.STDOUT, start_new_session=True,
+    )
+
+
+def first_run_banner() -> str:
+    """The one-time orientation printed on the very first `grip-meet start`.
+
+    Pure (returns the text); the caller prints it + drops the marker. It is
+    PRINTED guidance, not a wizard — channels-enabled sessions suppress every
+    interactive HITL prompt, so a deterministic banner is the KISS-correct way to
+    onboard. W3 (#2153): a new user must be able to go transcript-live on a
+    HEADPHONE call from this guidance alone.
+    """
+    return (
+        "\n"
+        "  ┌─ grip-meet · first run — 30-second orientation ─────────────────┐\n"
+        "  1. Check readiness:   grip-meet doctor   (deps · model · devices)\n"
+        "  2. Pick your input with  --device :N .  A loopback (BlackHole /\n"
+        "     Aggregate) captures a HEADPHONE call; a plain mic only hears the\n"
+        "     ROOM (your speakers) — it will NOT hear a headphone meeting.\n"
+        "  3. Post a digest to your team:  start --group <whatsapp-jid>  then\n"
+        "     summary --post   (opt-in; default is draft-only, no posting).\n"
+        "  4. Watch it live in a browser:  grip-meet-dash   (127.0.0.1:8675)\n"
+        "\n"
+        "  Headphone-meeting recipe (the #1 gotcha):\n"
+        "    brew install blackhole-2ch, then in Audio MIDI Setup make a\n"
+        "    Multi-Output Device = BlackHole + your headphones. Set THAT as the\n"
+        "    call's output (you still hear everyone), and start --device with the\n"
+        "    BlackHole index that  grip-meet doctor  prints.\n"
+        "  └──────────────────────────────────────────────────────────────────┘\n"
+    )
+
+
+def maybe_first_run() -> None:
+    """Print the orientation ONCE, on the first ever start, then drop a marker.
+
+    Best-effort: a marker-write failure is non-fatal (worst case the banner shows
+    again) and never blocks a meeting from starting.
+    """
+    if ONBOARD_MARKER.exists():
+        return
+    print(first_run_banner())
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        ONBOARD_MARKER.write_text(_dt.datetime.now().isoformat(timespec="seconds"))
+    except OSError:
+        pass
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    if pid_alive(read_pid("listener")) or pid_alive(read_pid("actloop")):
+        print("grip-meet: already running — `grip-meet status`")
+        return 1
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    maybe_first_run()  # W3: one-time orientation on the very first start
+
+    # H6: refuse immediately if required binaries are missing.
+    missing = check_deps()
+    if missing:
+        for name in missing:
+            print(f"grip-meet: '{name}' not found — cannot start.")
+            print(_dep_install_hint(name))
+        return 2
+
+    transcript = Path(args.transcript) if args.transcript else default_transcript()
+    title = args.title or f"Live meeting transcript — {_dt.date.today().isoformat()}"
+
+    # B4: prove the device actually hears audio BEFORE declaring "live". A deaf
+    # device (wrong input / no loopback / headphones) used to spawn fine and
+    # lose the whole meeting silently. Fail-fast at second 5, not minute 15.
+    if not args.no_probe:
+        print(f"grip-meet: probing {args.device} for audio (~5s)…")
+        if device_hears_audio(args.device) is False:
+            print(f"grip-meet: device {args.device} is SILENT on a 5s probe — NOT starting.")
+            print( "  The audio device is deaf (wrong input / no loopback / headphones).")
+            print( "  Pick a device that hears the call — e.g. --device :1 (built-in mic,")
+            print( "  on laptop SPEAKERS). List inputs:")
+            print( '    ffmpeg -f avfoundation -list_devices true -i ""')
+            print( "  Override (start anyway) with: grip-meet start --no-probe")
+            return 2
+        # True (audio) or None (could not probe → fail-open, proceed)
+
+    # Clear any stale exit sentinel from a previous run so the watchdog
+    # starts with a clean slate (avoids a false "died" on immediate poll).
+    (STATE_DIR / "listener.exit").unlink(missing_ok=True)
+
+    listener = subprocess.Popen(
+        [sys.executable, str(CLAUDE_DIR / "scripts" / "intel_listen.py"),
+         "--device", args.device, "--window-secs", str(args.window_secs),
+         "--transcript", str(transcript), "--title", title],
+        stdout=(STATE_DIR / "listener.log").open("a"),
+        stderr=subprocess.STDOUT, start_new_session=True,
+    )
+    actloop = subprocess.Popen(
+        [sys.executable, str(CLAUDE_DIR / "scripts" / "intel_act_loop.py"),
+         "--transcript", str(transcript)],  # B1: brain MUST read the listener's file
+        stdout=(STATE_DIR / "actloop.log").open("a"),
+        stderr=subprocess.STDOUT, start_new_session=True,
+        cwd=str(CLAUDE_DIR),
+    )
+    # B3: spawn watchdog as a third child — alerts locally on silence or crash
+    # without any network call (wrong-recipient risk avoided; separate finding H5).
+    # Fix #3: add cwd=CLAUDE_DIR so __file__/relative resolution in the re-spawned
+    # `grip-meet _watchdog` is robust from any calling CWD (AGORA fix #3).
+    watchdog = subprocess.Popen(
+        [sys.executable, __file__, "_watchdog"],
+        stdout=(STATE_DIR / "watchdog.log").open("a"),
+        stderr=subprocess.STDOUT, start_new_session=True,
+        cwd=str(CLAUDE_DIR),
+    )
+    pid_file("listener").write_text(str(listener.pid))
+    pid_file("actloop").write_text(str(actloop.pid))
+    pid_file("watchdog").write_text(str(watchdog.pid))
+    meta_payload: dict = {
+        "transcript": str(transcript), "title": title,
+        "started_at": _dt.datetime.now().isoformat(timespec="seconds"),
+        "device": args.device, "window_secs": args.window_secs,
+    }
+    # H5: persist group JID only when explicitly provided; never fill a default.
+    if args.group:
+        meta_payload["group_jid"] = args.group
+    meta_path().write_text(json.dumps(meta_payload, indent=2))
+    print(f"grip-meet: live — listener {listener.pid}, brain {actloop.pid}, watchdog {watchdog.pid}")
+    print(f"  transcript: {transcript}")
+    if args.group:
+        print(f"  group:      {args.group}")
+    else:
+        print("  group:      (none — `summary --post` disabled for this session)")
+    return 0
+
+
+def terminate_tree(pid: int) -> None:
+    """SIGTERM the whole process GROUP led by `pid`, not just `pid` (H4).
+
+    The listener/actloop/watchdog are each spawned with start_new_session=True,
+    so each is its own process-group leader; the listener runs ffmpeg/whisper as
+    plain children that inherit that group. Signalling the GROUP reaps those
+    children too — without this, stopping mid-capture orphans ffmpeg/whisper
+    (they reparent to init and keep holding the audio device). Falls back to a
+    plain kill if the group is already gone. Only ever called with a pid from OUR
+    state files (never pattern-kill — feedback_never_kill_parent_processes).
+    """
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
+def cmd_stop(_args: argparse.Namespace) -> int:
+    stopped = 0
+    # Fix #2 (defence-in-depth): stop watchdog FIRST so it is not polling when
+    # the listener is killed.  The listener's SIGTERM handler writes a "stopped"
+    # sentinel before exiting; if watchdog were still polling it could see
+    # gone+sentinel(stopped) correctly, but stopping it first is simpler and
+    # avoids any race between sentinel write and the poll read.
+    # ALL pids from OUR state files only — never pattern-kill.
+    for name in ("watchdog", "listener", "actloop"):
+        pid = read_pid(name)
+        if pid_alive(pid):
+            terminate_tree(pid)
+            stopped += 1
+            print(f"grip-meet: stopped {name} ({pid})")
+        pid_file(name).unlink(missing_ok=True)
+    if not stopped:
+        print("grip-meet: nothing running")
+    return 0
+
+
+def is_silent(listener_live: bool, last_write_secs: int | None) -> bool:
+    """A LIVE listener with no transcript growth past the grace window is deaf.
+
+    Pure predicate (no I/O) so it is unit-testable: this is the 2026-06-17
+    failure mode (Scarlett carried no meeting audio; 15 min lost silently).
+    """
+    return bool(listener_live) and last_write_secs is not None and last_write_secs > SILENCE_GRACE_SECS
+
+
+# ── B2: exit sentinel reader ──────────────────────────────────────────────────
+
+def read_exit_sentinel() -> dict | None:
+    """Read intel_listen's exit sentinel (state/meet/listener.exit); None if absent."""
+    p = STATE_DIR / "listener.exit"
+    try:
+        return json.loads(p.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+# ── B3: watchdog verdict (PURE — no I/O, fully testable) ─────────────────────
+
+def watchdog_verdict(
+    listener_live: bool,
+    sentinel: dict | None,
+    last_write_secs: int | None,
+) -> str:
+    """Classify the listener's health so the watchdog can decide what to do.
+
+    Returns one of:
+      "ok"      — listener is alive and capturing normally
+      "silent"  — listener is alive but has written nothing past the grace window
+      "stopped" — listener exited cleanly (window closed or silence exit)
+      "died"    — listener is gone with no sentinel or left a crash sentinel
+    """
+    if listener_live:
+        if is_silent(listener_live, last_write_secs):
+            return "silent"
+        return "ok"
+    # Listener is not running.
+    if sentinel is None:
+        return "died"
+    if sentinel.get("reason") == "crash":
+        return "died"
+    # reason in {"silence", "window", "stopped"} — all are clean exits.
+    return "stopped"
+
+
+# ── B3: watchdog loop (spawned as a child process) ───────────────────────────
+
+def window_warning_due(
+    started_at_iso: str,
+    window_secs: int,
+    now_ts: float,
+    warn_secs: int = 300,
+) -> bool:
+    """H3 — True when the capture window is within `warn_secs` of closing.
+
+    deadline = started_at + window_secs. Returns True only in the final
+    `warn_secs` before that deadline (0 < remaining <= warn_secs), so the
+    watchdog can warn ONCE before the listener hard-stops at --window-secs.
+    Pure + testable. Unparseable/absent started_at -> False (fail-safe: no
+    spurious alert). Past the deadline -> False (the listener has already
+    exited via the 'window' sentinel and status shows "window closed").
+    """
+    try:
+        started = _dt.datetime.fromisoformat(started_at_iso).timestamp()
+    except (ValueError, TypeError):
+        return False
+    remaining = (started + window_secs) - now_ts
+    return 0 < remaining <= warn_secs
+
+
+def run_watchdog(poll_secs: int = 30) -> None:  # pragma: no cover — I/O loop
+    """Active watchdog child.  Runs until the listener pid disappears.
+
+    H1: on a "died" verdict (crash, no clean sentinel) the watchdog attempts
+    to auto-restart the listener up to RESTART_CAP times before giving up and
+    alerting.  On "silent" it alerts but does NOT restart (the process is still
+    alive — a restart would create two listeners fighting for the device).
+    On "stopped" (clean exit) it exits quietly.
+    AGORA #3558 (C1/C2): atexit cleans watchdog.pid; unknown sentinel reasons
+    are logged rather than silently collapsed.
+    """
+    import atexit
+    # C1 (AGORA #3558): never leave a stale watchdog.pid. cmd_stop cleans it on
+    # an external stop; this covers the watchdog's OWN exit (died/stopped break
+    # or an exception) — closes the cosmetic stale-file + the pid-reuse race.
+    atexit.register(lambda: pid_file("watchdog").unlink(missing_ok=True))
+    alert_fired = False
+    restarts = 0
+    window_warned = False  # H3: fire the window-closing heads-up at most once
+
+    def _alert(msg: str) -> None:
+        sys.stdout.write(f"\a[grip-meet watchdog] {msg}\n")
+        sys.stdout.flush()
+        try:
+            subprocess.run(
+                ["osascript", "-e",
+                 f'display notification "{msg}" with title "grip-meet watchdog"'],
+                timeout=5, capture_output=True,
+            )
+        except Exception:  # osascript absent / timed out — bell alone is enough
+            pass
+
+    while True:
+        time.sleep(poll_secs)
+        listener_pid = read_pid("listener")
+        alive = pid_alive(listener_pid)
+        sentinel = read_exit_sentinel()
+
+        # C2 (AGORA #3558): warn on unknown sentinel reason so future reasons aren't
+        # silently collapsed to "down" in cmd_status / watchdog logic.
+        _KNOWN_REASONS = {"silence", "window", "stopped", "crash"}
+        if sentinel is not None:
+            reason = sentinel.get("reason", "")
+            if reason and reason not in _KNOWN_REASONS:
+                sys.stderr.write(
+                    f"[grip-meet watchdog] WARNING: unknown sentinel reason '{reason}' "
+                    f"— treating as clean stop. Update _KNOWN_REASONS if intentional.\n"
+                )
+
+        # Compute last_write_secs from transcript
+        meta = load_meta()
+        transcript = Path(meta.get("transcript", default_transcript()))
+        last_write_secs: int | None = None
+        if transcript.exists():
+            last_write_secs = int(time.time() - transcript.stat().st_mtime)
+
+        verdict = watchdog_verdict(alive, sentinel, last_write_secs)
+
+        # H3: warn ONCE when the capture window is about to close, so a long
+        # meeting is not silently cut off at --window-secs with no notice.
+        if not window_warned and window_warning_due(
+            meta.get("started_at", ""), meta.get("window_secs", 0), time.time()
+        ):
+            _alert(
+                "Capture window closes in under 5 min — it will stop at the "
+                "--window-secs limit. To keep capturing: grip-meet stop, then "
+                "grip-meet start with a longer --window-secs."
+            )
+            window_warned = True
+
+        if verdict == "ok":
+            alert_fired = False  # re-arm: silence episode resolved
+        elif verdict == "silent" and not alert_fired:
+            _alert(
+                f"Capturing NOTHING — ears are alive but no chunk for "
+                f"{last_write_secs}s. "
+                "Run: grip-meet stop && grip-meet start --device :1"
+            )
+            alert_fired = True
+        elif verdict == "died":
+            # H1: attempt auto-restart before giving up.
+            if should_restart(verdict, sentinel, restarts):
+                restarts += 1
+                _alert(f"Listener DIED — auto-restarting (attempt {restarts}/{RESTART_CAP})…")
+                try:
+                    # Clear stale sentinel so next poll starts clean.
+                    (STATE_DIR / "listener.exit").unlink(missing_ok=True)
+                    new_listener = _spawn_listener(meta)
+                    pid_file("listener").write_text(str(new_listener.pid))
+                    alert_fired = False  # re-arm after restart
+                    sys.stdout.write(
+                        f"[grip-meet watchdog] restarted listener as pid {new_listener.pid}\n"
+                    )
+                    sys.stdout.flush()
+                except Exception as exc:
+                    _alert(f"Auto-restart failed: {exc} — giving up.")
+                    sys.exit(0)  # C1: atexit cleans watchdog.pid
+            else:
+                if not alert_fired:
+                    if restarts >= RESTART_CAP:
+                        _alert(
+                            f"Giving up after {RESTART_CAP} restart attempts "
+                            "— manual restart needed: grip-meet start"
+                        )
+                    else:
+                        _alert("Capture process DIED mid-meeting (crash or no exit sentinel).")
+                    alert_fired = True
+                sys.exit(0)  # C1: atexit cleans watchdog.pid
+        elif verdict == "stopped":
+            sys.exit(0)  # C1: atexit cleans watchdog.pid; clean exit — exit quietly
+
+
+def hal_reachable(url: str = HAL_HEALTH_URL, timeout: int = 3) -> bool:
+    """True if the local HAL server answers an HTTP request at all.
+
+    Reachability means the HTTP server responds — even with a non-2xx
+    status. A 404/405 still proves the server is up (just not at that
+    route), so any HTTP reply (including an HTTPError) counts as reachable;
+    only a transport-level failure (connection refused, timeout, DNS)
+    counts as down. Probing /api/health (200 on a healthy hal-server) is
+    the happy path, but the predicate stays correct even if that route is
+    renamed — the prior bug was probing a non-existent /health and treating
+    its 404 as UNREACHABLE while POST /api/infer was serving fine.
+    """
+    try:
+        urllib.request.urlopen(url, timeout=timeout)
+    except urllib.error.HTTPError:
+        return True   # server answered (e.g. 404/405) -> reachable
+    except Exception:
+        # Transport failure (connection refused / timeout / DNS) OR a malformed
+        # URL (ValueError) -> treat as down. A status probe must NEVER crash
+        # cmd_status, so this catch-all is deliberate (fail-safe to UNREACHABLE).
+        return False
+    return True
+
+
+def cmd_status(_args: argparse.Namespace) -> int:
+    meta = load_meta()
+    transcript = Path(meta.get("transcript", default_transcript()))
+    chunks = count_chunks(transcript)
+    age = ""
+    secs: int | None = None
+    if transcript.exists():
+        secs = int(time.time() - transcript.stat().st_mtime)
+        age = f", last write {secs // 60}m{secs % 60:02d}s ago"
+    listener_live = pid_alive(read_pid("listener"))
+
+    # B2: read exit sentinel to give a plain-English "why is ears down?"
+    sentinel = read_exit_sentinel()
+    _SENTINEL_LABEL = {
+        "silence": "stopped (silence)",
+        "window": "window closed",
+        "stopped": "stopped (SIGTERM)",
+        "crash": "DIED (crash)",
+    }
+
+    for name, label in (("listener", "ears"), ("actloop", "brain"), ("watchdog", "watch")):
+        pid = read_pid(name)
+        alive = pid_alive(pid)
+        if alive:
+            state = f"LIVE (pid {pid})"
+        elif name == "listener" and sentinel:
+            reason = sentinel.get("reason", "")
+            if reason in _SENTINEL_LABEL:
+                state = _SENTINEL_LABEL[reason]
+            else:
+                # C2: surface unknown reason rather than silently collapsing to "down".
+                state = f"down (unknown sentinel reason: '{reason}')" if reason else "down"
+        else:
+            state = "down"
+        print(f"  {label:<6} {state}")
+    print(f"  chunks {chunks}{age}")
+    if meta.get("group_jid"):
+        print(f"  group  {meta['group_jid']}")
+    else:
+        print("  group  (none — --post disabled)")
+
+    # Silence alarm — unchanged from before; exit 3 for monitor/cron.
+    silent = is_silent(listener_live, secs)
+    if silent:
+        print(f"  !! SILENT  ears LIVE but no chunk for {secs}s (> {SILENCE_GRACE_SECS}s) —")
+        print( "             capturing NOTHING. The audio device is deaf.")
+        print( "             Fix: grip-meet stop && grip-meet start --device :1")
+        print( "             (built-in mic, on laptop SPEAKERS). List inputs:")
+        print( '             ffmpeg -f avfoundation -list_devices true -i ""')
+    if hal_reachable():
+        print("  hal    reachable")
+    else:
+        print("  hal    UNREACHABLE (act loop on keyword fallback)")
+    return 3 if silent else 0
+
+
+def cmd_doctor(_args: argparse.Namespace) -> int:
+    """Diagnose audio capture: list inputs, RMS-probe each, recommend a device.
+
+    The one-command readiness gate a new user runs FIRST. A microphone only
+    hears the ROOM (your speakers), so a headphone meeting's downlink is captured
+    only via a system-audio loopback (BlackHole/Aggregate). Doctor checks every
+    piece — deps, whisper model, hal-server, audio devices (RMS-probed), loopback
+    — names each missing one with its exact fix, and exits 0 only when FULLY
+    ready (so grip-meet-setup can gate on it).
+    """
+    ready = True
+    # A diagnostic must NEVER traceback: any unexpected error in the checks below
+    # collapses to a clean "status ✗" + exit 1, never an unhandled stack trace.
+    try:
+        missing = check_deps()
+        if missing:
+            print("deps   MISSING:", ", ".join(missing))
+            for m in missing:
+                print(_dep_install_hint(m))
+            ready = False
+        else:
+            print("deps   ffmpeg + whisper present")
+
+        # whisper model — not a hard blocker (auto-downloads) but the ~244 MB
+        # first-run download silently stalls the first meeting; surface it.
+        if whisper_model_present():
+            print(f"model  whisper {WHISPER_MODEL} cached")
+        else:
+            print(f"model  whisper {WHISPER_MODEL} NOT cached — first run downloads ~244 MB")
+            print(f"       pre-warm:  grip-meet-setup   (or: whisper --model {WHISPER_MODEL} <any.wav>)")
+            ready = False
+
+        # hal-server comprehension endpoint — degrades to keyword-only if down.
+        if hal_reachable():
+            print(f"hal    hal-server reachable ({HAL_BASE_URL})")
+        else:
+            print(f"hal    hal-server UNREACHABLE ({HAL_BASE_URL}) — comprehension would")
+            print( "       fall back to keyword-only; start your local hal-server for full AI")
+            ready = False
+
+        # audio devices — ONE branch for both enumeration-failure (None) and
+        # empty: each is "not ready" and flows to the status line (no early exit).
+        devices = list_audio_devices()
+        if not devices:
+            why = ("could not enumerate devices (ffmpeg -list_devices failed)"
+                   if devices is None else "NO input devices found")
+            print(f"audio  {why}")
+            ready = False
+        else:
+            print(f"audio  {len(devices)} input device(s) (probing 3s each):")
+            for idx, name in devices:
+                tag = " [loopback]" if is_loopback_device(name) else ""
+                heard = device_hears_audio(f":{idx}", secs=3)
+                state = {True: "hears audio", False: "SILENT now", None: "probe failed"}[heard]
+                print(f"         :{idx}  {name}{tag}  — {state}")
+
+            loopbacks = [(i, n) for i, n in devices if is_loopback_device(n)]
+            print("")
+            if loopbacks:
+                idx, name = loopbacks[0]
+                print(f"recommend: grip-meet start --device :{idx}  ({name})")
+                print("           — a loopback captures the meeting downlink directly.")
+            else:
+                print("recommend: NO system-audio loopback found.")
+                print("  A microphone only hears the ROOM (your speakers) — it cannot")
+                print("  capture a headphone meeting's downlink. To capture meeting audio:")
+                print("    brew install blackhole-2ch")
+                print("  then in Audio MIDI Setup create a Multi-Output Device combining")
+                print("  BlackHole + your headphones (so you still hear the call), and run:")
+                print("    grip-meet start --device :<blackhole-index>")
+                ready = False
+    except Exception as exc:  # noqa: BLE001 — a diagnostic must never crash
+        print(f"status ✗ doctor hit an unexpected error: {exc}")
+        return 1
+
+    print("")
+    print("status ✓ ready to capture" if ready
+          else "status ✗ fix the items above, then re-run: grip-meet doctor")
+    return 0 if ready else 1
+
+
+def cmd_tail(args: argparse.Namespace) -> int:
+    meta = load_meta()
+    transcript = Path(meta.get("transcript", default_transcript()))
+    if not transcript.exists():
+        print("grip-meet: no transcript yet")
+        return 1
+    lines = transcript.read_text().strip().splitlines()
+    print("\n".join(lines[-args.lines:]))
+    return 0
+
+
+def cmd_summary(args: argparse.Namespace) -> int:
+    meta = load_meta()
+    # H5: refuse --post when no explicit group JID was configured for THIS meeting.
+    # There is no hardcoded fallback — a wrong-recipient post cannot be undone.
+    if args.post and not post_group_configured(meta):
+        print("grip-meet: --post refused: no group JID configured for this meeting.")
+        print("  Re-start with: grip-meet start --group <jid>")
+        return 2
+
+    transcript = Path(meta.get("transcript", default_transcript()))
+    if not transcript.exists():
+        print("grip-meet: no transcript to summarise")
+        return 1
+    prompt = build_summary_prompt(transcript.read_text())
+    req = urllib.request.Request(
+        HAL_INFER_URL,
+        data=json.dumps({"prompt": prompt, "max_tokens": 700}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            body = json.loads(resp.read().decode())
+    except OSError as exc:
+        print(f"grip-meet: HAL unreachable ({exc}) — no summary")
+        return 1
+    text = str(body.get("text") or "").strip()
+    if not body.get("ok") or not text:
+        print("grip-meet: HAL returned no summary")
+        return 1
+    out = transcript.with_name(transcript.stem + "-summary.md")
+    out.write_text(f"# Meeting summary — {meta.get('title', transcript.stem)}\n\n{text}\n")
+    print(f"grip-meet: summary -> {out}")
+    if args.post:
+        sys.path.insert(0, str(CLAUDE_DIR))
+        from lib.wa_delivery_verify import post_verified as post  # capability: one explicit opt-in post (history-verified)
+        group = meta["group_jid"]  # H5: always from meta (never a literal fallback)
+        ok = post(recipient=group, text=f"◈ GRIP here — meeting digest:\n\n{text[:1500]}").get("ok")
+        print(f"grip-meet: posted to group: {bool(ok)}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="grip-meet", description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_start = sub.add_parser("start", help="start listener + brain")
+    p_start.add_argument("--device", default=":1")
+    p_start.add_argument("--title", default=None)
+    p_start.add_argument("--transcript", default=None)
+    p_start.add_argument("--window-secs", type=int, default=3600)
+    p_start.add_argument("--group", default=None, metavar="JID",
+                         help="WhatsApp group JID to use with `summary --post` (H5)")
+    p_start.add_argument("--no-probe", action="store_true",
+                         help="skip the 5s audio probe (start even on a silent device)")
+    p_start.set_defaults(fn=cmd_start)
+
+    sub.add_parser("stop", help="stop both loops").set_defaults(fn=cmd_stop)
+    sub.add_parser("status", help="live status").set_defaults(fn=cmd_status)
+    sub.add_parser("doctor", help="diagnose audio devices + recommend a capture device").set_defaults(fn=cmd_doctor)
+
+    p_tail = sub.add_parser("tail", help="tail transcript")
+    p_tail.add_argument("-n", "--lines", type=int, default=20)
+    p_tail.set_defaults(fn=cmd_tail)
+
+    p_sum = sub.add_parser("summary", help="HAL digest -> drafts (post is opt-in)")
+    p_sum.add_argument("--post", action="store_true",
+                       help="ALSO post one digest message to the configured group (--group at start)")
+    p_sum.set_defaults(fn=cmd_summary)
+
+    # Internal sub-command spawned by cmd_start — not shown in user help.
+    p_wd = sub.add_parser("_watchdog", help=argparse.SUPPRESS)
+    p_wd.add_argument("--poll-secs", type=int, default=30)
+    p_wd.set_defaults(fn=lambda a: (run_watchdog(a.poll_secs), 0)[1])
+
+    args = ap.parse_args(argv)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

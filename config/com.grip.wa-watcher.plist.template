@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  WhatsApp watcher — launchd agent TEMPLATE.
+
+  Install (substitute __GRIP_HOME__ with $HOME/.claude):
+      sed "s|__GRIP_HOME__|$HOME/.claude|g" \
+        config/com.grip.wa-watcher.plist.template \
+        > ~/Library/LaunchAgents/com.grip.wa-watcher.plist
+      launchctl load ~/Library/LaunchAgents/com.grip.wa-watcher.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.grip.wa-watcher</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__GRIP_HOME__/venv/bin/python</string>
+        <string>__GRIP_HOME__/lib/wa_watcher.py</string>
+        <string>--once</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__GRIP_HOME__</string>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>StandardOutPath</key>
+    <string>__GRIP_HOME__/logs/wa-watcher.log</string>
+    <key>StandardErrorPath</key>
+    <string>__GRIP_HOME__/logs/wa-watcher.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CLAUDE_DIR</key>
+        <string>__GRIP_HOME__</string>
+        <key>PYTHONPATH</key>
+        <string>__GRIP_HOME__</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>TimeOut</key>
+    <integer>120</integer>
+</dict>
+</plist>

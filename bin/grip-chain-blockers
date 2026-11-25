@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# grip-chain-blockers — why the public decision chain will not publish, sorted by risk.
+#
+# `bin/grip-chain-sync` fails CLOSED when its leak gate finds a name-shaped
+# phrase in a commit subject that is on neither the redaction denylist nor the
+# allowlist. The shield flags any run of Capitalised Words, so GRIP's own
+# Title-Case commit subjects trip it, and the remedy is an allowlist entry.
+#
+# This turns that refusal list into a decision sheet with the few phrases that
+# could be a real person FIRST and the bulk of ordinary English LAST. Read-only:
+# it runs the same check-leak gate the publish path runs and writes nothing but
+# the sheet.
+#
+# Usage:  grip-chain-blockers                     # sheet to stdout
+#         grip-chain-blockers --out <path>        # write it (must be outside any repo)
+#         grip-chain-blockers --report <file>     # classify a captured report
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+IMPL="$HERE/../lib/chain_blockers.py"
+
+# grip-py refuses a system interpreter, which is the point: the shield and the
+# emitter both need GRIP's deps, and a system python would fail obscurely.
+PY="$HERE/grip-py"
+[ -x "$PY" ] || { echo "[grip-chain-blockers] bin/grip-py not found or not executable" >&2; exit 3; }
+[ -f "$IMPL" ] || { echo "[grip-chain-blockers] missing backend: $IMPL" >&2; exit 3; }
+
+# argv straight through — no re-parsing here, so the flags cannot drift from the
+# backend's own argparse (rules/declared-input-must-reach-the-actor.md).
+exec "$PY" "$IMPL" "$@"

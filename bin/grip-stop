@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""grip-stop — instant global outbound brake (the V>> STOP override).
+
+Engaging the brake makes every GRIP WhatsApp send refuse immediately
+(lib/whatsapp_transport.post checks the marker) and the live-meeting act
+loop stop posting. It does NOT kill processes or limit comprehension —
+GRIP keeps listening, thinking and working; it just cannot speak outward
+until released. Power stays on; the brake is explicit.
+
+    grip-stop on [reason...]   # engage
+    grip-stop off              # release
+    grip-stop status           # show state
+
+Spoken equivalent: saying "GRIP stop" in a live meeting engages the same
+marker via scripts/intel_act_loop.py (HAL action=stop).
+"""
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import sys
+from pathlib import Path
+
+MARKER = Path.home() / ".claude" / "state" / "session" / "outbound-stop.json"
+
+
+def engage(reason: str) -> int:
+    MARKER.parent.mkdir(parents=True, exist_ok=True)
+    MARKER.write_text(json.dumps({
+        "engaged_at": _dt.datetime.now().isoformat(timespec="seconds"),
+        "by": "grip-stop",
+        "reason": reason or "manual",
+    }, indent=2))
+    print("grip-stop: ENGAGED — all WhatsApp outbound refused until `grip-stop off`")
+    return 0
+
+
+def release() -> int:
+    if MARKER.exists():
+        MARKER.unlink()
+        print("grip-stop: released — outbound restored")
+    else:
+        print("grip-stop: was not engaged")
+    return 0
+
+
+def status() -> int:
+    if MARKER.exists():
+        info = json.loads(MARKER.read_text())
+        print(f"grip-stop: ENGAGED since {info.get('engaged_at')} "
+              f"by {info.get('by')} — {info.get('reason')}")
+    else:
+        print("grip-stop: off (outbound live)")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    cmd = argv[0] if argv else "status"
+    if cmd == "on":
+        return engage(" ".join(argv[1:]))
+    if cmd == "off":
+        return release()
+    if cmd == "status":
+        return status()
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""grip-council-picker -- render the AGORA council-picker scorecard flip-cards page.
+
+GRIP#9404 pick 1: a grid of cards, one per candidate model for the judge-fallback,
+technical-speaker and quality-speaker AGORA seats. The front shows the model and its
+vendor; flipping shows its shadow-trial scorecard, read from the real trial records in
+docs/measurements/. Writes ONE self-contained HTML file (no network) to --out, prints its
+path, and opens it only when --open is given (via bin/grip-show). This command only
+writes the page -- a click on a card only proposes a seat change as copyable text; moving
+a seat stays a lib/hal_council_dispatch.py change a human merges (GRIP#9404).
+
+Usage:
+    grip-council-picker [--out PATH] [--open]
+"""
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+_BIN = Path(__file__).resolve().parent
+sys.path.insert(0, str(_BIN))
+from _grip_console import ensure_utf8_stdio  # noqa: E402
+
+ensure_utf8_stdio()
+
+_REPO = _BIN.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
+from lib.council_picker_page import render_page  # noqa: E402
+from lib.council_picker_scorecard import CLAUDE_DIR, build_candidates  # noqa: E402
+
+DEFAULT_OUT = CLAUDE_DIR / "council-picker.html"
+
+
+def build_and_write(out_path: Path) -> Path:
+    """Build every candidate's scorecard, render the page, and write it to
+    ``out_path`` -- the only path this command ever writes."""
+    candidates = build_candidates()
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    rendered = render_page(candidates, generated_at=generated_at)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(rendered, encoding="utf-8")
+    return out_path
+
+
+def _open(path: Path) -> None:
+    grip_show = _BIN / "grip-show"
+    subprocess.run(["bash", str(grip_show), str(path)], check=False)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out", type=Path, default=DEFAULT_OUT,
+                         help=f"where to write the page (default: {DEFAULT_OUT})")
+    parser.add_argument("--open", action="store_true",
+                         help="open the page after writing it (via bin/grip-show)")
+    args = parser.parse_args(argv)
+
+    try:
+        written = build_and_write(args.out)
+    except ValueError as exc:
+        print(f"grip-council-picker: {exc}", file=sys.stderr)
+        return 1
+
+    print(str(written))
+    if args.open:
+        _open(written)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

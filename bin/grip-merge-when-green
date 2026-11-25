@@ -1,0 +1,223 @@
+#!/bin/bash
+# grip-merge-when-green -- poll a PR and admin-squash-merge once its checks
+# genuinely pass.
+#
+# THE RULE THIS SCRIPT EXISTS TO HONOUR: ABSENCE OF SIGNAL IS NOT PASS.
+#
+# CLAUDE.md, "AGORA-Green = Merge": a judge being unavailable, a required check
+# being red, or the review never having run are all NOT a green -- absence of
+# signal never equals PASS. A script that admin-merges has no human between it
+# and the consequences, so it must hold that line more strictly than a person
+# would, not less.
+#
+# The previous version inverted it. It inferred health by string-matching
+# `gh pr checks` output for "fail|pending|error|expected|running", with stderr
+# sent to /dev/null. Measured 2026-09-14: a failing query exits 1 and writes
+# ZERO bytes to stdout, so the grep found no failure-shaped word, the `continue`
+# was skipped, and control fell through to an `--admin` squash-merge having read
+# not one check result. An unreadable check list was indistinguishable from a
+# clean one. Three further defects rode along:
+#
+#   * `set -uo pipefail` without `-e`, so a FAILED `gh pr merge` did not abort --
+#     the next line printed "merged PR N" and the script exited 0, reporting
+#     success for a merge that never happened.
+#   * the guard matched check NAMES as well as states, so a check called
+#     "Failure Injection Tests" would block forever.
+#   * it never required checks to EXIST, so a PR whose checks had not started
+#     produced the same empty output as a passing one, and merged.
+#
+# This version reads the structured `bucket` field instead of grepping prose.
+# `gh pr checks --help` documents bucket as categorising state into exactly:
+# pass, fail, pending, skipping, cancel.
+#
+# The merge is pinned to the commit the checks were read for (GRIP#9068).
+# `gh pr checks` reports the checks of whichever commit heads the PR when it
+# runs, and does not say which commit that was. So every poll reads the head
+# before the checks and again after them, and merges only when the two reads
+# agree, with --match-head-commit naming that commit. Without the pin, a push
+# that landed after the checks were read could be merged with administrator
+# rights on checks that never ran on it.
+#
+# usage: grip-merge-when-green <owner/repo> <pr> [max_polls] [min_passing]
+#   env: GRIP_MERGE_POLL_SECONDS  seconds between polls (default 150)
+#        GRIP_MERGE_REQUIRE       a check name that MUST be present and passing,
+#                                 e.g. leak-check. Absence of it is never a pass.
+
+set -uo pipefail
+
+REPO="${1:?usage: grip-merge-when-green <owner/repo> <pr> [max_polls] [min_passing]}"
+PR="${2:?usage: grip-merge-when-green <owner/repo> <pr> [max_polls] [min_passing]}"
+MAX="${3:-60}"
+MIN_PASS="${4:-1}"
+INTERVAL="${GRIP_MERGE_POLL_SECONDS:-150}"
+REQUIRE="${GRIP_MERGE_REQUIRE:-}"
+
+log() { printf '%s grip-merge-when-green: %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
+
+# is_sha VALUE: true only for a full 40-character lower-case commit id, the form
+# GitHub returns and the only one this script pins a merge to.
+is_sha() { [[ "$1" =~ ^[0123456789abcdef]{40}$ ]]; }
+
+# read_view: one `gh pr view` for the PR's head commit and its mergeStateStatus,
+# into view_head and view_state, with gh's stderr kept in view_err. A field gh
+# did not return stays empty, and nothing below merges on an empty field. The
+# names are lower-case on purpose: an upper-case global shares its name with
+# any exported variable of the caller, and assigning it changes what every
+# child process, gh included, sees.
+read_view() {
+  local line err_path
+  view_head=""
+  view_state=""
+  err_path=$(mktemp)
+  line=$(gh pr view "$PR" --repo "$REPO" --json headRefOid,mergeStateStatus \
+    --jq '(.headRefOid // "") + "\t" + (.mergeStateStatus // "")' 2>"$err_path")
+  view_err=$(tr -d '\r' < "$err_path")
+  rm -f "$err_path"
+  case "$line" in
+    *$'\t'*) view_head=${line%%$'\t'*}; view_state=${line#*$'\t'} ;;
+  esac
+  return 0
+}
+
+for ((i = 1; i <= MAX; i++)); do
+  # (0) THE COMMIT THESE CHECKS BELONG TO, read before the checks. Step (6)
+  # reads it again, and the merge is pinned to it only when the two agree.
+  read_view
+  head=$view_head
+  if ! is_sha "$head"; then
+    log "could not read the PR's head commit${view_err:+: $view_err}. Not merging on an unreadable answer."
+    sleep "$INTERVAL"
+    continue
+  fi
+
+  # Capture stdout and the exit status separately, and KEEP stderr rather than
+  # discarding it -- the discarded stderr is what made a broken query look clean.
+  err_file=$(mktemp)
+  checks=$(gh pr checks "$PR" --repo "$REPO" --json name,bucket 2>"$err_file")
+  rc=$?
+  err=$(tr -d '\r' < "$err_file")
+  rm -f "$err_file"
+
+  # (1) UNREADABLE. A non-zero exit means the QUERY failed -- rate limit, 5xx,
+  # auth, a wrong PR number. Never merge on it, whether or not it emitted bytes.
+  #
+  # This deliberately does NOT also require empty output, and the earlier form
+  # that did (`[ "$rc" -ne 0 ] && [ -z "$checks" ]`) was a hole of exactly the
+  # class this script exists to close. An AGORA seat named it on GRIP#5973:
+  # a failing query that still emits PARTIAL json skipped this branch, parsed
+  # clean, and with MIN_PASS defaulting to 1 a single passing check out of
+  # fourteen satisfied the positivity floor and merged. The original tests only
+  # ever exercised the zero-output case, so nothing caught it.
+  #
+  # Measured 2026-09-14: `gh pr checks --json` exits 0 for an all-pass PR AND
+  # for one carrying failures; only an errored query exits non-zero. So rc != 0
+  # carries no information about check health and every information about the
+  # query having failed. A false wait costs an interval; a false merge cannot
+  # be taken back.
+  if [ "$rc" -ne 0 ]; then
+    log "check query FAILED (rc=$rc, ${#checks} bytes): ${err:-<no stderr>}. Not merging on an unreadable answer."
+    sleep "$INTERVAL"
+    continue
+  fi
+
+  # (2) UNPARSEABLE, or parseable as the WRONG SHAPE. `jq -e .` alone accepts an
+  # object, a string or a number -- and `length` on an object returns its KEY
+  # COUNT while `.[]` iterates its VALUES, so a non-array would be judged as
+  # though it were a check list. Assert the type, not merely the syntax.
+  if ! printf '%s' "$checks" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    log "check output was not a JSON array. Not merging on an unreadable answer."
+    sleep "$INTERVAL"
+    continue
+  fi
+
+  total=$(printf '%s' "$checks" | jq 'length')
+  pass=$(printf '%s' "$checks" | jq '[.[] | select(.bucket == "pass")] | length')
+  fail=$(printf '%s' "$checks" | jq '[.[] | select(.bucket == "fail" or .bucket == "cancel")] | length')
+  pending=$(printf '%s' "$checks" | jq '[.[] | select(.bucket == "pending")] | length')
+
+  # (3) NO CHECKS AT ALL is not a pass. An empty list and a clean list are
+  # different answers, and only one of them is evidence.
+  if [ "$total" -eq 0 ]; then
+    log "the PR reports ZERO checks. Absence of signal is not PASS -- waiting."
+    sleep "$INTERVAL"
+    continue
+  fi
+
+  if [ "$fail" -gt 0 ]; then
+    log "$fail check(s) failing of $total. Not merging."
+    sleep "$INTERVAL"
+    continue
+  fi
+
+  if [ "$pending" -gt 0 ]; then
+    log "$pending of $total still running."
+    sleep "$INTERVAL"
+    continue
+  fi
+
+  # (4) POSITIVE evidence, not merely the absence of bad news.
+  if [ "$pass" -lt "$MIN_PASS" ]; then
+    log "only $pass passing check(s), need at least $MIN_PASS. Waiting."
+    sleep "$INTERVAL"
+    continue
+  fi
+
+  # (5) A named required check must be PRESENT and passing. Its absence is the
+  # exact case CLAUDE.md forbids treating as green.
+  if [ -n "$REQUIRE" ]; then
+    # Case-INSENSITIVE: check names vary in casing between providers, and a
+    # required check missed on capitalisation would read as "absent", which this
+    # script correctly refuses to merge past -- so the failure would be a silent
+    # stall rather than a wrong merge, but a stall on a green PR all the same.
+    req_pass=$(printf '%s' "$checks" \
+      | jq --arg n "$REQUIRE" '[.[] | select((.name | test($n; "i")) and .bucket == "pass")] | length')
+    if [ "$req_pass" -eq 0 ]; then
+      log "required check '$REQUIRE' is absent or not passing. Never merging past it."
+      sleep "$INTERVAL"
+      continue
+    fi
+  fi
+
+  # (6) The head again, read with mergeStateStatus. If it differs from the head
+  # read in step (0), a push landed while the checks were read and the checks
+  # above may belong to either commit, so wait for the next poll.
+  read_view
+  if [ -z "$view_state" ]; then
+    log "could not read mergeStateStatus${view_err:+: $view_err}. Not merging on an unreadable answer."
+    sleep "$INTERVAL"
+    continue
+  fi
+  if [ "$view_head" != "$head" ]; then
+    log "the head moved from ${head:0:12} to ${view_head:0:12} while the checks were read. Waiting for the checks of the new head."
+    sleep "$INTERVAL"
+    continue
+  fi
+  if [ "$view_state" != "CLEAN" ]; then
+    log "mergeStateStatus is $view_state, not CLEAN."
+    sleep "$INTERVAL"
+    continue
+  fi
+
+  log "$pass/$total checks passing on ${head:0:12}, mergeStateStatus CLEAN -- merging that commit."
+  # (7) Gate the success message on the merge's ACTUAL exit status. Without
+  # this the old script announced a merge it had failed to perform. The pin
+  # makes GitHub refuse the merge if the head moved after step (6).
+  if merge_out=$(gh pr merge "$PR" --repo "$REPO" --squash --admin --match-head-commit "$head" 2>&1); then
+    log "merged PR $PR"
+    exit 0
+  fi
+  # A push that landed after step (6) makes GitHub refuse the pinned merge.
+  # That is the pin working, not a failed merge, so poll again while polls
+  # remain and merge the new head once its own checks pass (Codex, GRIP#9124).
+  read_view
+  if is_sha "$view_head" && [ "$view_head" != "$head" ]; then
+    log "GitHub refused the merge: the head moved from ${head:0:12} to ${view_head:0:12}. Waiting for the checks of the new head."
+    sleep "$INTERVAL"
+    continue
+  fi
+  log "MERGE COMMAND FAILED: ${merge_out:-<no output>}"
+  exit 1
+done
+
+log "timeout after $MAX polls; PR $PR not merged"
+exit 1

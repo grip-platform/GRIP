@@ -1,0 +1,135 @@
+name: research
+description: Deep research, evidence synthesis, systematic analysis
+version: 1.0.0
+effort: high
+triggers:
+- /mode research
+- research
+- literature review
+- evidence synthesis
+- investigate
+- analyze sources
+skills:
+  always:
+  - reasoning-with-ai
+  - research-synthesis
+  optional:
+  - evidence-evaluation
+  - chat-history-search
+token_budget: ~3000
+foundation: true
+stacks_with:
+- ut++
+- asking-users
+- creating-wizards
+- hitl
+- context-gate
+prompt_injection: '[MODE: RESEARCH]
+
+
+  Systematic research protocols active. PICO + CRAAP frameworks loaded.
+
+
+  Research workflow:
+
+  1. Question formulation (PICO framework)
+
+  2. Source discovery (multi-type)
+
+  3. Evidence collection (structured extraction)
+
+  4. Evidence evaluation (CRAAP scoring)
+
+  5. Synthesis (weighted by quality)
+
+
+  MANDATORY AskUserQuestion when:
+
+  - Research direction could branch multiple ways
+
+  - Key finding contradicts prior understanding
+
+  - Source quality borderline (CRAAP 10-14)
+
+  - Synthesis ready for validation
+
+
+  Evidence hierarchy:
+
+  1. Peer-reviewed research, formal specs
+
+  2. Official documentation, RFCs
+
+  3. Technical blogs, conference talks
+
+  4. Community consensus
+
+  5. Individual opinions
+
+
+  Always trace claims to sources. Note confidence levels.
+
+
+  ## Broly Auto-Activation
+
+
+  Broly is AUTO-ACTIVE in this mode at CLUSTER level.
+
+  No /broly command needed -- UNLESS the operator has set the trigger to manual (check with `mode-loader.sh broly status`), in which case fan out ONLY on an explicit /broly. Assess task complexity and invoke automatically.
+
+
+  Default: CLUSTER (Agent Team swarm, up to 7 agents)
+
+  Team pattern: swarm | Reasoning: tree-of-thought (tot)
+
+
+  ### Escalation to PIPELINE
+
+  - Research requires synthesis across multiple domains
+
+  - Systematic review with formal evidence evaluation
+
+  - Technology evaluation with hands-on comparison
+
+
+  ### De-escalation to THREAD
+
+  - Single source lookup
+
+  - Quick factual question
+
+  - Simple documentation check
+
+
+  ### Budget
+
+  CLUSTER uses ~5x tokens. De-escalate to THREAD for simple tasks.
+
+  AskUserQuestion if scope is unclear.
+
+  '
+wave:
+  category: wave_aligned
+  w_level: 1
+  phase: ascent
+broly:
+  enabled: true
+  default_level: cluster
+  team_pattern: swarm
+  reasoning_hint: tot
+  escalation:
+    to: pipeline
+    signals:
+    - research requires synthesis across multiple domains
+    - systematic review with formal evidence evaluation
+    - technology evaluation with hands-on comparison
+  context:
+    recommended: 1000000
+    auto_extend: true
+context:
+- Technical research and analysis
+- Literature reviews
+- Competitive analysis
+- Technology evaluation
+- Best practice identification
+welcome_message: Research mode active. PICO framework and CRAAP evidence evaluation available. Deep-dive enabled.

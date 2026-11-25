@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""grip-harness-install — obtain the harnesses gg++ can launch.
+
+The launch menu only ever offers what is on PATH, so "GRIP supports 20 harnesses"
+and "you can open 6 of them" were both true at once and neither was visible. This
+closes that gap from the install side: one command that reads the SAME registry
+the menu reads (lib/grip_harness_picker.HARNESS_REGISTRY) and installs the
+entries whose package was verified against its canonical registry.
+
+    grip-harness-install --list                  what exists, what is on PATH
+    grip-harness-install --dry-run --all         the exact commands, run nothing
+    grip-harness-install --all                   install everything missing
+    grip-harness-install qwen pi goose           install just these
+    grip-harness-install grip-browser --sha <sha> --no-activate   a re-pin trial
+    grip-harness-install grip-browser --prune    reclaim the shas not in use
+
+Two properties matter more than the ergonomics:
+
+INSTALL COMMANDS ARE DATA, NOT RECALL. Every automatic entry names a package
+verified to exist and to ship the binary the registry expects (npm registry JSON,
+PyPI JSON, `brew info`). An entry with no such package is `manual` and is SKIPPED
+with its reason printed — never approximated. That distinction is load-bearing:
+`brew install goose` installs a database-migration tool, and npm `@mariozechner/pi`
+ships `pi-pods`, so a plausible command is not the same as a correct one.
+
+NOTHING IS PIPED FROM THE NETWORK TO A SHELL. `manual` entries print their URL for
+the operator to run themselves. An installer that curls a remote script into bash
+on the operator's behalf is a supply-chain decision, and it is theirs to make.
+
+Idempotent by construction: an entry already present is reported and skipped
+unless --force, so a repeat run is a no-op that installs nothing. Presence is
+"its binary is on PATH" for the package managers, and "the recorded sha equals
+the registry's sha" for a `git-venv` entry (a new pin reads as not installed and
+installs beside the old).
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+_LIB = _ROOT / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+import grip_harness_picker as picker  # noqa: E402
+import grip_tools_dir  # noqa: E402
+
+# manager -> argv builder, taking (package, spec). The manager is the boundary;
+# adding one is a line here plus a verified package in the registry, never a
+# special case at a call site.
+#
+# The pipx builder honours an optional "python" key because the default
+# interpreter is not always a viable one. Measured on this machine
+# (2026-08-19, python3 = CPython 3.14.6): metagpt pins faiss-cpu==1.7.4, whose
+# newest wheel is cp311, and open-interpreter pins tiktoken 0.7.0, which has no
+# cp314 wheel and fails its PyO3 abi3 check when built from source. Both are
+# resolver-level refusals, not transient network errors, so retrying the same
+# command can never succeed — the interpreter is the fix.
+#
+# The npm builder honours an optional "version" key so a registry entry can pin
+# the exact release it was verified against (rea-agents first: upstream ships a
+# release every few hours, and a tool server's advertised surface moves with
+# it). An entry without "version" renders exactly as before.
+#
+# `git-venv` (stealth-browser-mcp first, 2026-10-18) is the one MULTI-STEP
+# manager: an upstream with no package and no console entry point, pinned to a
+# sha, cloned into ${GRIP_TOOLS_DIR:-~/.grip-tools}/<tool>/<sha12>/repo with its
+# own venv beside it, outside every repository. Its builder returns a LIST of
+# argvs; `build_argv` has no single answer for it and returns [] (read
+# `build_steps`). The spec keys: repo, sha, python, expect_sections, expect_tools.
+MANAGERS = {
+    "npm": lambda pkg, spec: ["npm", "install", "-g",
+                              f"{pkg}@{spec['version']}" if spec.get("version") else pkg],
+    "brew": lambda pkg, spec: ["brew", "install", pkg],
+    "pipx": lambda pkg, spec: (
+        ["pipx", "install", "--python", spec["python"], pkg]
+        if spec.get("python") else ["pipx", "install", pkg]
+    ),
+    "git-venv": lambda pkg, spec: _git_venv_steps(spec),
+}
+MULTI_STEP_MANAGERS = frozenset({"git-venv"})
+
+# The binary whose presence proves the manager is usable, where it is not the
+# manager's own name. `git-venv` is driven by git (the clone, and the py2js git
+# pin inside the requirements) plus the pinned interpreter, checked separately.
+MANAGER_BINARIES = {"git-venv": "git"}
+
+# pipx keeps each tool in its own venv. That is deliberate: these agents carry
+# heavy, mutually-incompatible dependency sets, and installing them into GRIP's
+# own venv would let one agent's pin break GRIP itself.
+_C = {"reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
+      "grn": "\033[32m", "yel": "\033[33m", "red": "\033[31m", "cyan": "\033[36m"}
+
+# The line shape of stealth-browser-mcp's `--list-sections`: one section per
+# line ending in "(N tools)". The first git-venv entry; a second entry with a
+# different verify shape moves this into the spec (YSH at N=2, not before).
+_SECTION_COUNT_RE = re.compile(r"\((\d+) tools\)\s*$")
+_VERIFY_TIMEOUT_S = 120
+
+
+def _colour() -> dict:
+    if sys.stdout.isatty() and os.environ.get("TERM", "") not in ("", "dumb"):
+        return _C
+    return {k: "" for k in _C}
+
+
+def _on_path(name: str) -> bool:
+    spec = picker.HARNESS_REGISTRY.get(name) or {}
+    return shutil.which(spec.get("binary", "")) is not None
+
+
+def _manager_available(manager: str) -> bool:
+    return shutil.which(MANAGER_BINARIES.get(manager, manager)) is not None
+
+
+# --- git-venv: a sha-pinned checkout with its own venv -------------------------
+
+def _tool_name(spec: dict) -> str:
+    """`vibheksoni/stealth-browser-mcp` -> `stealth-browser-mcp`: the directory
+    under the tools root."""
+    return (spec.get("package") or "").split("/")[-1]
+
+
+def _venv_python_path(sha_dir: Path) -> Path:
+    """Where the venv's interpreter WILL be (the layout differs on Windows)."""
+    if os.name == "nt":
+        return sha_dir / ".venv" / "Scripts" / "python.exe"
+    return sha_dir / ".venv" / "bin" / "python"
+
+
+def _git_venv_steps(spec: dict) -> list:
+    """The exact argvs, in order. Pure: the dry run prints these and the real
+    run executes these, so they cannot disagree."""
+    sha = spec["sha"]
+    sha_dir = grip_tools_dir.sha_dir(_tool_name(spec), sha)
+    repo = sha_dir / "repo"
+    venv_py = _venv_python_path(sha_dir)
+    return [
+        ["git", "clone", "--quiet", "--no-checkout", spec["repo"], str(repo)],
+        ["git", "-C", str(repo), "checkout", "--quiet", "--detach", sha],
+        [spec.get("python") or "python3", "-m", "venv", str(sha_dir / ".venv")],
+        [str(venv_py), "-m", "pip", "install", "--quiet", "--require-virtualenv",
+         "-r", str(repo / "requirements.txt")],
+    ]
+
+
+def _git_venv_verify_argv(spec: dict) -> list:
+    sha_dir = grip_tools_dir.sha_dir(_tool_name(spec), spec["sha"])
+    return [str(_venv_python_path(sha_dir)),
+            str(sha_dir / "repo" / (spec.get("entry") or "src/server.py")),
+            "--list-sections"]
+
+
+def parse_section_counts(text: str) -> list:
+    """The per-section tool counts in a `--list-sections` listing, in order."""
+    return [int(m.group(1)) for m in
+            (_SECTION_COUNT_RE.search(line) for line in (text or "").splitlines()) if m]
+
+
+def git_venv_listing_ok(text: str, spec: dict) -> str:
+    """'' when the listing matches the spec, else the sentence saying how not."""
+    counts = parse_section_counts(text)
+    want_sections = int(spec.get("expect_sections") or 0)
+    want_tools = int(spec.get("expect_tools") or 0)
+    if want_sections and len(counts) != want_sections:
+        return f"{len(counts)} section lines, expected {want_sections}"
+    if sum(counts) != want_tools:
+        return f"{sum(counts)} tools listed, expected {want_tools}"
+    return ""
+
+
+def _git_venv_present(name: str) -> bool:
+    """Installed means: `current` resolves to a directory whose pin is the
+    registry's sha and whose venv has an interpreter."""
+    spec = picker.install_spec(name)
+    current = grip_tools_dir.resolve_current(_tool_name(spec))
+    return (current is not None
+            and grip_tools_dir.read_pin(current) == spec.get("sha")
+            and grip_tools_dir.venv_python(current) is not None)
+
+
+def _git_venv_prepare(spec: dict, dry_run: bool, C: dict) -> None:
+    """A sha directory that exists here is a partial or superseded install of
+    the SAME sha (a present one was skipped before we got here): clear it so
+    `git clone` has an empty target."""
+    sha_dir = grip_tools_dir.sha_dir(_tool_name(spec), spec["sha"])
+    if not sha_dir.exists():
+        return
+    if dry_run:
+        print(f"  {C['cyan']}would remove{C['reset']} {sha_dir}  (partial or forced reinstall)")
+        return
+    print(f"    removing {sha_dir} (partial or forced reinstall)", flush=True)
+    shutil.rmtree(sha_dir)
+
+
+def _git_venv_verify(name: str, spec: dict, dry_run: bool, C: dict, activate: bool) -> bool:
+    """Run the server's own listing under a throwaway HOME (importing it reads
+    ~/.stealth_browser_pids.json and kills tracked PIDs), check the counts,
+    write the pin, flip `current`. A pip exit code is the resolver's claim; this
+    is the evidence the server starts."""
+    argv = _git_venv_verify_argv(spec)
+    tool = _tool_name(spec)
+    sha_dir = grip_tools_dir.sha_dir(tool, spec["sha"])
+    if dry_run:
+        print(f"  {C['cyan']}would verify{C['reset']}  HOME=<throwaway> {' '.join(argv)}  "
+              f"-> {spec.get('expect_sections')} sections, {spec.get('expect_tools')} tools")
+        print(f"  {C['cyan']}would write{C['reset']}   {sha_dir / grip_tools_dir.PIN_FILE}")
+        if activate:
+            print(f"  {C['cyan']}would point{C['reset']}   "
+                  f"{grip_tools_dir.tool_root(tool) / grip_tools_dir.CURRENT} -> {sha_dir.name}")
+        return True
+    with tempfile.TemporaryDirectory(prefix="grip-harness-verify-") as home:
+        env = dict(os.environ, HOME=home)
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True,
+                                  timeout=_VERIFY_TIMEOUT_S, env=env, cwd=home)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"    {C['red']}verify failed{C['reset']} — {type(exc).__name__}: {exc}",
+                  flush=True)
+            return False
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        print(f"    {C['red']}verify failed{C['reset']} — exit {proc.returncode}: "
+              f"{(tail[-1] if tail else '')[:200]}", flush=True)
+        return False
+    problem = git_venv_listing_ok(proc.stdout, spec)
+    if problem:
+        print(f"    {C['red']}verify failed{C['reset']} — {problem}", flush=True)
+        return False
+    grip_tools_dir.write_pin(sha_dir, spec["sha"])
+    if activate:
+        grip_tools_dir.set_current(tool, sha_dir.name)
+    print(f"    {C['grn']}ok{C['reset']} — {spec.get('expect_tools')} tools listed; "
+          f"{'current -> ' + sha_dir.name if activate else 'installed, not activated'}",
+          flush=True)
+    return True
+
+
+def _git_venv_prune(name: str, dry_run: bool, C: dict) -> int:
+    """Remove every sha directory that `current` does not point at."""
+    spec = picker.install_spec(name)
+    tool = _tool_name(spec)
+    root = grip_tools_dir.tool_root(tool)
+    current = grip_tools_dir.resolve_current(tool)
+    keep = current.name if current is not None else None
+    removed = 0
+    if not root.is_dir():
+        return 0
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or child.is_symlink() or child.name == keep:
+            continue
+        if child.name in (grip_tools_dir.CURRENT, "scratch"):
+            continue
+        if dry_run:
+            print(f"  {C['cyan']}would remove{C['reset']} {child}")
+        else:
+            print(f"  removing {child}", flush=True)
+            shutil.rmtree(child)
+        removed += 1
+    return removed
+
+
+PRESENCE = {"git-venv": _git_venv_present}
+
+
+def _present(name: str) -> bool:
+    manager = picker.install_spec(name).get("manager") or ""
+    return PRESENCE.get(manager, _on_path)(name)
+
+
+# --- planning -------------------------------------------------------------------
+
+def _spec_with(name: str, overrides: dict | None) -> dict:
+    spec = picker.install_spec(name)
+    if overrides:
+        spec.update({k: v for k, v in overrides.items() if v})
+    return spec
+
+
+def build_argv(name: str) -> list:
+    """Install argv for *name*, or [] when it has no automatic path.
+
+    Pure: no I/O, no subprocess — so the dry-run output and the real run are
+    built by the same code and cannot disagree about what would be executed.
+    A multi-step manager has no single argv; `build_steps` carries its list.
+    """
+    spec = picker.install_spec(name)
+    manager = spec.get("manager") or ""
+    builder = MANAGERS.get(manager)
+    pkg = spec.get("package") or ""
+    if not builder or not pkg or manager in MULTI_STEP_MANAGERS:
+        return []
+    return builder(pkg, spec)
+
+
+def build_steps(name: str, overrides: dict | None = None) -> list:
+    """Every argv the install runs, in order; [] for a manual entry."""
+    spec = _spec_with(name, overrides)
+    manager = spec.get("manager") or ""
+    builder = MANAGERS.get(manager)
+    pkg = spec.get("package") or ""
+    if not builder or not pkg:
+        return []
+    if manager in MULTI_STEP_MANAGERS:
+        return list(builder(pkg, spec))
+    return [builder(pkg, spec)]
+
+
+def _render_list() -> int:
+    C = _colour()
+    rows = []
+    for name, spec in picker.HARNESS_REGISTRY.items():
+        inst = picker.install_spec(name)
+        manager = inst.get("manager") or "manual"
+        pkg = inst.get("package") or inst.get("reason", "")
+        present = _present(name)
+        rows.append((name, spec.get("binary", ""), present, manager, pkg,
+                     picker.is_interactive(name)))
+
+    have = sum(1 for r in rows if r[2])
+    print(f"{C['bold']}GRIP harnesses{C['reset']} — {have}/{len(rows)} present\n")
+    print(f"  {'harness':<12} {'binary':<12} {'':<4} {'via':<8} package / why not")
+    print(f"  {'-' * 12} {'-' * 12} {'-' * 4} {'-' * 8} {'-' * 44}")
+    for name, binary, present, manager, pkg, interactive in rows:
+        mark = f"{C['grn']}  ok{C['reset']}" if present else f"{C['dim']}   -{C['reset']}"
+        tag = "" if interactive else f" {C['dim']}(one-shot){C['reset']}"
+        colour = C["dim"] if manager == "manual" else ""
+        print(f"  {name:<12} {binary:<12} {mark} {colour}{manager:<8}{C['reset']} "
+              f"{pkg[:70]}{tag}")
+    print(f"\n  {C['dim']}one-shot = installable and dispatchable via lib/harness/, "
+          f"but it cannot host a session, so gg++ does not offer it{C['reset']}")
+    print(f"  {C['dim']}manual   = no verified package ships that binary; "
+          f"reason shown above{C['reset']}")
+    print(f"  {C['dim']}git-venv = a sha-pinned checkout with its own venv under "
+          f"{grip_tools_dir.tools_root()}; present = pin matches{C['reset']}")
+    return 0
+
+
+def _skip_reason(name: str, force: bool) -> str:
+    """Why *name* will not be installed, or '' when it will be."""
+    spec = picker.install_spec(name)
+    manager = spec.get("manager") or "manual"
+    if not force and _present(name):
+        return ("already installed at the pinned sha"
+                if manager in MULTI_STEP_MANAGERS else "already on PATH")
+    if manager == "manual":
+        reason = spec.get("reason") or "no verified package"
+        url = spec.get("url")
+        return f"manual — {reason}" + (f"  ({url})" if url else "")
+    if not _manager_available(manager):
+        return f"{MANAGER_BINARIES.get(manager, manager)} is not installed on this machine"
+    # A pinned interpreter is a second prerequisite, and it was unchecked: the
+    # manager could be present while the Python it is told to build against was
+    # not, so the run reached `pipx install --python python3.11` and failed deep
+    # inside a subprocess. That failure names pipx, not the missing interpreter,
+    # which sends the reader after the wrong thing. Checked here so it reports
+    # like every other prerequisite — before anything is attempted, naming the
+    # thing to install. (AGORA #4936, concern C1.)
+    pinned = spec.get("python")
+    if pinned and not shutil.which(pinned):
+        return (f"{pinned} is not on PATH, and {spec.get('package', name)} "
+                f"pins it (install it, e.g. `brew install python@"
+                f"{pinned.removeprefix('python')}`)")
+    return ""
+
+
+def _run_step(name: str, argv: list, dry_run: bool, C: dict) -> bool:
+    printable = " ".join(argv)
+    if dry_run:
+        print(f"  {C['cyan']}would run{C['reset']}  {printable}")
+        return True
+    # flush=True because a single install can take minutes and Python
+    # block-buffers a piped stdout: without it a `| tee` run prints nothing at
+    # all until every install has finished, which is indistinguishable from a
+    # hang. Measured on the first real run of this script.
+    print(f"  {C['bold']}{name}{C['reset']}  {C['dim']}{printable}{C['reset']}",
+          flush=True)
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=900)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"    {C['red']}failed{C['reset']} — {type(exc).__name__}: {exc}",
+              flush=True)
+        return False
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        detail = tail[-1] if tail else f"exit {proc.returncode}"
+        print(f"    {C['red']}failed{C['reset']} — {detail[:200]}", flush=True)
+        return False
+    return True
+
+
+def _verify_on_path(name: str, dry_run: bool, C: dict) -> bool:
+    # Verify the binary actually landed. A zero exit code is the package
+    # manager's claim, not evidence that the harness is now launchable — and a
+    # package that installs cleanly while shipping a different binary name is
+    # exactly the failure this whole file is calibrated against.
+    if dry_run:
+        return True
+    if _on_path(name):
+        print(f"    {C['grn']}ok{C['reset']} — "
+              f"{shutil.which(picker.HARNESS_REGISTRY[name]['binary'])}", flush=True)
+        return True
+    binary = picker.HARNESS_REGISTRY[name]["binary"]
+    print(f"    {C['yel']}installed, but `{binary}` is still not on PATH{C['reset']} "
+          f"— check the package's bin name or your PATH", flush=True)
+    return False
+
+
+def _install_one(name: str, steps: list, dry_run: bool, C: dict,
+                 overrides: dict | None = None, activate: bool = True) -> bool:
+    spec = _spec_with(name, overrides)
+    manager = spec.get("manager") or ""
+    if manager in MULTI_STEP_MANAGERS:
+        _git_venv_prepare(spec, dry_run, C)
+    for argv in steps:
+        if not _run_step(name, argv, dry_run, C):
+            return False
+    if manager in MULTI_STEP_MANAGERS:
+        return _git_venv_verify(name, spec, dry_run, C, activate)
+    return _verify_on_path(name, dry_run, C)
+
+
+def main(argv: list) -> int:
+    ap = argparse.ArgumentParser(
+        prog="grip-harness-install",
+        description="Install the harnesses gg++ can launch.")
+    ap.add_argument("names", nargs="*", help="harness names (default: --all)")
+    ap.add_argument("--all", action="store_true",
+                    help="every registry entry with a verified package")
+    ap.add_argument("--list", action="store_true",
+                    help="show every harness, its binary and its install path")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the exact commands and run nothing")
+    ap.add_argument("--force", action="store_true",
+                    help="reinstall even when the binary is already on PATH")
+    ap.add_argument("--sha", default="",
+                    help="git-venv only: install this upstream sha instead of the "
+                         "registry's (a re-pin trial; pair with --no-activate)")
+    ap.add_argument("--no-activate", action="store_true",
+                    help="git-venv only: install beside the active sha without "
+                         "pointing `current` at it")
+    ap.add_argument("--prune", action="store_true",
+                    help="git-venv only: remove the sha directories `current` "
+                         "does not point at, install nothing")
+    args = ap.parse_args(argv)
+
+    if args.list:
+        return _render_list()
+
+    C = _colour()
+    if args.all or not args.names:
+        targets = list(picker.installable())
+    else:
+        unknown = [n for n in args.names if n not in picker.HARNESS_REGISTRY]
+        if unknown:
+            known = ", ".join(picker.HARNESS_REGISTRY)
+            print(f"unknown harness: {', '.join(unknown)}\nknown: {known}",
+                  file=sys.stderr)
+            return 2
+        targets = list(args.names)
+
+    multi = [n for n in targets
+             if (picker.install_spec(n).get("manager") or "") in MULTI_STEP_MANAGERS]
+    if args.prune:
+        pruned = sum(_git_venv_prune(n, args.dry_run, C) for n in multi)
+        print(f"{'would remove' if args.dry_run else 'removed'} {pruned} unused install(s)")
+        return 0
+
+    overrides = {"sha": args.sha} if args.sha else None
+    if overrides and len(multi) != len(targets):
+        print("--sha applies to git-venv entries only; name one", file=sys.stderr)
+        return 2
+    force = args.force or bool(overrides)
+
+    planned, skipped = [], []
+    for name in targets:
+        reason = _skip_reason(name, force)
+        steps = build_steps(name, overrides)
+        if reason or not steps:
+            skipped.append((name, reason or "no automatic install path"))
+        else:
+            planned.append((name, steps))
+
+    if skipped:
+        print(f"{C['bold']}Skipping {len(skipped)}{C['reset']}")
+        for name, reason in skipped:
+            print(f"  {name:<12} {C['dim']}{reason}{C['reset']}")
+        print()
+
+    if not planned:
+        print("Nothing to install.")
+        return 0
+
+    verb = "Would install" if args.dry_run else "Installing"
+    print(f"{C['bold']}{verb} {len(planned)}{C['reset']}")
+    ok = sum(1 for name, steps in planned
+             if _install_one(name, steps, args.dry_run, C, overrides,
+                             activate=not args.no_activate))
+    failed = len(planned) - ok
+
+    print(f"\n{C['bold']}{ok}/{len(planned)}{C['reset']} "
+          f"{'planned' if args.dry_run else 'succeeded'}"
+          + (f", {C['red']}{failed} failed{C['reset']}" if failed else ""))
+    if not args.dry_run:
+        launchable = picker.detect_installed()
+        print(f"gg++ can now launch: {', '.join(launchable)}")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

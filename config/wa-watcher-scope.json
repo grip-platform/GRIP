@@ -1,0 +1,6 @@
+{
+  "scope_groups": [
+    "team-group"
+  ],
+  "always_exclude": ["status@broadcast"]
+}

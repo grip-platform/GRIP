@@ -1,0 +1,33 @@
+name: server
+description: >-
+  Always-on server posture for the second Mac as the WhatsApp/Slack-relay exit-node.
+  Each relay-spawned session opens with WARM per-channel context
+  (lib/server_mode_context.py — this channel's history + the warm-start kernel +
+  KONO recall + cross-machine mesh) instead of starting cold; state is
+  checkpointed on a cadence (saving-state / ultraclear); the session registers
+  in the grip-presence mesh; LLM work is biased to HAL non-Anthropic providers
+  to conserve the Claude weekly limit. Context composition is READ-ONLY; wiring
+  it into the live relay_dispatcher spawn path is an operator-gated flip.
+version: 1.0.0
+effort: medium
+triggers:
+- /mode server
+- /server-mode
+- server mode
+- always-on server
+- relay exit-node
+- weekend server
+skills:
+  always:
+  - recall
+  - concurrent-session-safety
+  optional:
+  - saving-state
+  - ultraclear
+  - syncing-sessions
+  - holistic-memory
+token_budget: ~3000
+foundation: false
+stacks_with:
+- context-gate
+- caveman

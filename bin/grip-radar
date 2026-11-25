@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# bin/grip-radar -- the economical monitor for replies and GRASP activity (lib/radar).
+#
+# One tick: fetch what is due, diff it against state/radar/state.json, send one
+# WhatsApp line per change, log one JSON object per source to logs/radar.jsonl.
+# No language model, free APIs only, GitHub through gh's existing login. The
+# launchd job (config/launchd/com.grip.radar.plist.template) runs the same module
+# every 30 minutes.
+#
+# Usage:
+#   bin/grip-radar --dry-run           # first run: print what it would seed; sends nothing
+#   bin/grip-radar --seed              # record today's baseline, alert on none of it
+#   bin/grip-radar --status            # per source: mode, last run, next due, last skip
+#   bin/grip-radar --once              # one real tick (what launchd runs)
+#   bin/grip-radar --once --dry-run --source mail_replies   # one source now, nothing sent
+#   RADAR_FIXTURES=tests/fixtures/radar/reply bin/grip-radar --once --dry-run --source mail_replies
+#
+# The code runs from the checkout that holds this script, so a worktree exercises
+# its own copy; the venv comes from $CLAUDE_DIR (default ~/.claude), and so do the
+# state and log files, through lib/claude_dir.py.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GRIP_HOME="${CLAUDE_DIR:-$HOME/.claude}"
+
+if [[ "${CLAUDE_CODE_DISABLE_CRON:-0}" == "1" ]]; then
+  echo "[radar] CLAUDE_CODE_DISABLE_CRON=1, skipping." >&2
+  exit 0
+fi
+
+source "$REPO/scripts/lib/venv-utils.sh"
+PY="$(resolve_venv_python "$GRIP_HOME/venv" || true)"
+if [[ "$PY" != "$GRIP_HOME/venv/"* ]]; then
+  PY="$(resolve_venv_python "$REPO/venv" || true)"
+fi
+if [[ "$PY" != */venv/* ]]; then
+  echo "[radar] no GRIP venv Python in $GRIP_HOME/venv or $REPO/venv" >&2
+  exit 1
+fi
+
+cd "$REPO"
+exec env PYTHONPATH="$REPO" "$PY" -m lib.radar.cli "$@"

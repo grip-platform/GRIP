@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""bin/grip-proactive-tick — thin CLI shim over lib.proactive_tick.
+
+Schedulable entrypoint for the propose-not-act InfiniteMachine tick. Default OFF
+(no GRIP_PROACTIVE_TICK flag ⇒ pure no-op). Wire via the opt-in launchd template
+config/launchd/com.grip.proactive-tick.plist.template. Logic + safety invariant
+live in lib/proactive_tick.py (DIP: this shim only resolves the path + delegates).
+"""
+import os
+import sys
+from pathlib import Path
+
+_LIB = Path(os.environ.get("CLAUDE_DIR", str(Path.home() / ".claude"))) / "lib"
+sys.path.insert(0, str(_LIB))
+
+from proactive_tick import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main())

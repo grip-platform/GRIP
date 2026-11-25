@@ -1,0 +1,149 @@
+name: legal
+description: Contract drafting and legal document generation
+version: 1.0.0
+effort: high
+triggers:
+- /mode legal
+- contract
+- legal agreement
+- service terms
+- /contract-formal
+- /contract-simplification
+skills:
+  always:
+  - legal-ops
+  - legal-mode
+  optional:
+  - sanitizing-public-releases
+token_budget: ~2500
+foundation: true
+stacks_with:
+- ut++
+- asking-users
+- creating-wizards
+- hitl
+- context-gate
+prompt_injection: '[MODE: LEGAL]
+
+
+  Legal document generation protocols active.
+
+
+  Available document types:
+
+  - Formal contracts (senior attorney level)
+
+  - Simplified explanatory versions
+
+  - Service agreements
+
+  - NDAs and confidentiality
+
+
+  FIRST: run the activation onboarding - Protocol 0 in skills/legal-mode/SKILL.md.
+
+  It sets the matter frame before any work begins.
+
+
+  - Backend: python3 lib/legal_frame.py status, then plan key=value ...
+
+  - Two questions always (jurisdiction, task), branching to five when the
+
+    answers make the extra questions load-bearing
+
+  - Announce the workflow tier before spending it
+
+
+  CRITICAL: Legal jurisdiction matters.
+
+  - No default jurisdiction - never assume
+
+  - Never pre-fill or pre-select it either - that is a default by anchoring
+
+  - Offer only the operator-configured shortcuts, otherwise ask as free text
+
+  - Always clarify jurisdiction before drafting
+
+  - Include governing law clause
+
+
+  Document standards:
+
+  - Contra proferentem protection
+
+  - Comprehensive IP indemnification
+
+  - Professional boilerplate
+
+  - Clear definitions section
+
+
+  AskUserQuestion triggers:
+
+  - Jurisdiction unclear
+
+  - Liability cap decisions
+
+  - IP ownership terms
+
+  - Termination conditions
+
+
+  ## Broly Auto-Activation
+
+
+  Broly is AUTO-ACTIVE in this mode at FORK level.
+
+  No /broly command needed -- UNLESS the operator has set the trigger to manual (check with `mode-loader.sh broly status`), in which case fan out ONLY on an explicit /broly. Assess task complexity and invoke automatically.
+
+
+  Default: FORK (Task tool subagents, up to 3 agents)
+
+  Team pattern: none | Reasoning: chain-of-thought (cot)
+
+
+  ### Escalation to CLUSTER
+
+  - Multi-party agreement with complex terms
+
+  - Compliance review across multiple jurisdictions
+
+  - Contract suite requiring parallel drafting
+
+
+  ### De-escalation to THREAD
+
+  - Single clause review
+
+  - Quick legal question
+
+  - Minor contract amendment
+
+
+  ### Budget
+
+  FORK uses ~2x tokens. De-escalate to THREAD for simple tasks.
+
+  AskUserQuestion if scope is unclear.
+
+  '
+wave:
+  category: domain_context
+broly:
+  enabled: true
+  default_level: fork
+  team_pattern: null
+  reasoning_hint: cot
+  escalation:
+    to: cluster
+    signals:
+    - multi-party agreement with complex terms
+    - compliance review across multiple jurisdictions
+    - contract suite requiring parallel drafting
+context:
+- Contract drafting
+- Terms of service
+- Privacy policies
+- Partnership agreements
+- Employment agreements
+welcome_message: Legal mode active. Dual-track workflows with jurisdiction awareness.

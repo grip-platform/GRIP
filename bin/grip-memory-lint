@@ -1,0 +1,644 @@
+#!/usr/bin/env python3
+"""grip-memory-lint - deterministic dangling-reference checker for the GRIP corpus.
+
+Earned at N=4 (rules/knowledge-maturation-functor.md): four independently
+observed dangling-reference surfaces, one checker.
+
+  E001 dangling-frontmatter-link  supersedes:/related: naming a missing file
+  E002 dangling-wikilink          [[link]] that resolves to nothing
+  E003 dangling-rule-path         rules/<x>.md cited, file absent
+  W004 unverified-rule-claim      quoted phrase beside a citation, absent there
+  E005 unknown-hypothesis         H#### cited in memory, absent from the ledger
+  E006 dangling-memory-pointer    MEMORY.md pointer whose target is gone
+  W007 overdue-hypothesis         pending hypothesis past its deadline
+  W008 ledger-unreadable          the ledger could not be read (d/f skipped)
+  W009 imprecise-wikilink         [[link]] resolves only once the tier prefix
+                                  is ignored - the literal name is wrong
+
+Pure stdlib, no network, no LLM. Report-only by design - there is no --fix,
+because repairing a reference needs a judgement about which referent was meant,
+and a wrong auto-repair is worse than a reported dangle.
+
+Exit: 0 clean or warnings only, 1 any ERROR, 2 usage/configuration failure.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass, asdict, field
+from datetime import date
+from pathlib import Path
+
+ERROR = "ERROR"
+WARN = "WARN"
+
+WIKILINK_RE = re.compile(r"\[\[([^\]|\n]+?)(?:\|[^\]\n]*)?\]\]")
+RULE_PATH_RE = re.compile(r"(?<![\w/.-])rules/([A-Za-z0-9][A-Za-z0-9._-]*\.md)")
+BACKTICK_MD_RE = re.compile(r"`([a-z0-9][a-z0-9._-]*\.md)`")
+QUOTE_RE = re.compile(r"\"([^\"\n]{6,120})\"|“([^”\n]{6,120})”")
+POINTER_RE = re.compile(r"^\s*[-*]\s*\[[^\]\n]*\]\(([^)\s]+)\)")
+HYP_RE = re.compile(r"\bH(\d{3,4})\b")
+FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
+FM_KEY_RE = re.compile(r"^\s*(supersedes|related|see_also|see-also)\s*:\s*(.*)$")
+FM_ITEM_RE = re.compile(r"^\s*-\s+(.+?)\s*$")
+INLINE_CODE_RE = re.compile(r"`+[^`\n]*`+")
+
+# A wikilink target that cannot be a filename. No memory file has a space in
+# its name and no resolving wikilink in the corpus contains one, so this skip
+# costs nothing while dropping regexes, task numbers (#575) and prose.
+NOT_A_FILENAME_RE = re.compile(r"[\s\\^\[\]{}|*?]|^[#'\"!@]|^$")
+
+# A quoted phrase that is itself a path or filename is a pointer, not a claim.
+CLAIM_SKIP_RE = re.compile(r"(\.md$|/|^\$|^-)")
+CLAIM_WINDOW = 80
+
+# Tier prefixes the corpus puts on memory filenames. 87% of wikilinks (443 of
+# 509 resolvable) carry the full filename; a minority elide or mis-state the
+# prefix. Ignoring it resolves those, and measured across all 417 memory files
+# it is UNAMBIGUOUS - zero bare keys map to two files. The ambiguity guard in
+# resolve_reference keeps that a checked fact rather than a standing assumption.
+TIER_PREFIXES = ("feedback_", "reference_", "project_", "user_")
+
+
+@dataclass
+class Finding:
+    severity: str
+    code: str
+    rule: str
+    file: str
+    line: int
+    message: str
+
+    def location(self) -> str:
+        return f"{self.file}:{self.line}"
+
+
+@dataclass
+class Corpus:
+    root: Path
+    memory_dir: Path
+    ledger_path: Path
+    memory_files: list[Path] = field(default_factory=list)
+    rule_stems: dict[str, str] = field(default_factory=dict)
+    memory_stems: dict[str, str] = field(default_factory=dict)
+    skill_stems: dict[str, str] = field(default_factory=dict)
+    memory_bare: dict[str, list[str]] = field(default_factory=dict)
+
+
+def normalise(stem: str) -> str:
+    """Fold the hyphen/underscore split the corpus uses interchangeably."""
+    return stem.replace("-", "_").lower()
+
+
+def bare_key(stem: str) -> str:
+    """Normalised stem with any leading tier prefix removed."""
+    key = normalise(stem)
+    for prefix in TIER_PREFIXES:
+        if key.startswith(prefix):
+            return key[len(prefix):]
+    return key
+
+
+def blank_fenced_code(lines: list[str]) -> list[str]:
+    """Blank fenced code blocks, preserving line count so line numbers stay true.
+
+    Inline code spans are deliberately KEPT: the corpus writes real citations as
+    `verify-canonical-not-claimed.md`, so blanking them would blind detectors
+    E003 and W004.
+
+    Measured 2026-08-26 on the live corpus: disabling this changes nothing -
+    zero findings are currently suppressed by it, because the inline-code and
+    non-filename skips already cover every fenced example present today. It is
+    kept as a correct-by-construction boundary for the shape that WILL appear
+    (a markdown block demonstrating [[wikilink]] or rules/ syntax), and its
+    test uses filename-shaped bait so it fails if this becomes a no-op. If a
+    year passes with that count still zero and no such example is ever
+    written, delete it rather than keep an inert guard.
+    """
+    out: list[str] = []
+    inside = False
+    for line in lines:
+        if FENCE_RE.match(line):
+            inside = not inside
+            out.append("")
+            continue
+        out.append("" if inside else line)
+    return out
+
+
+def blank_inline_code(lines: list[str]) -> list[str]:
+    r"""Blank inline code spans, preserving length so columns stay meaningful.
+
+    Applied ONLY to the wikilink detector. Rule citations are written inside
+    backticks, so blanking these globally would blind E003 and W004; but a
+    regex or a syntax example inside backticks (`^- \[[^\]]+\]`, `[[cite:ID]]`)
+    is not a link, and three measured false positives lived exactly there.
+    """
+    return [INLINE_CODE_RE.sub(lambda m: " " * len(m.group(0)), line)
+            for line in lines]
+
+
+def read_lines(path: Path) -> list[str]:
+    return path.read_text(encoding="utf-8", errors="replace").splitlines()
+
+
+def frontmatter_links(lines: list[str]) -> list[tuple[int, str, str]]:
+    """Extract (lineno, key, target) from supersedes:/related: frontmatter keys.
+
+    Handles `key: value`, `key: [a, b]`, and a `key:` followed by `- item` lines.
+    """
+    if not lines or lines[0].strip() != "---":
+        return []
+    end = next((i for i, ln in enumerate(lines[1:], 1) if ln.strip() == "---"), None)
+    if end is None:
+        return []
+    found: list[tuple[int, str, str]] = []
+    idx = 1
+    while idx < end:
+        match = FM_KEY_RE.match(lines[idx])
+        if not match:
+            idx += 1
+            continue
+        key, raw = match.group(1), match.group(2).strip()
+        if raw:
+            found.extend((idx + 1, key, t) for t in split_inline_list(raw))
+            idx += 1
+            continue
+        idx += 1
+        while idx < end:
+            item = FM_ITEM_RE.match(lines[idx])
+            if not item:
+                break
+            found.append((idx + 1, key, item.group(1).strip("\"'")))
+            idx += 1
+    return [(ln, k, t) for ln, k, t in found if t]
+
+
+def split_inline_list(raw: str) -> list[str]:
+    raw = raw.strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        raw = raw[1:-1]
+    return [p.strip().strip("\"'") for p in raw.split(",") if p.strip().strip("\"'")]
+
+
+@dataclass
+class Resolution:
+    """Where a bare reference landed, and whether the literal name was right."""
+    target: str | None
+    precise: bool = True
+    note: str = ""
+
+    def __bool__(self) -> bool:
+        return self.target is not None
+
+
+def resolve_reference(target: str, corpus: Corpus) -> Resolution:
+    """Resolve a bare reference against memory, rules, then skills.
+
+    The ladder is ordered by how much the corpus actually uses each namespace,
+    and stops before commands/: measured on the live corpus, skills/ absorbs 4
+    otherwise-dangling links and commands/ absorbs none, so including its 392
+    names would add masking risk and buy nothing.
+    """
+    target = target.strip()
+    if "/" in target:
+        candidate = (corpus.root / target).resolve()
+        try:
+            candidate.relative_to(corpus.root.resolve())
+        except ValueError:
+            return Resolution(None, note="path escapes the GRIP root")
+        return Resolution(target) if candidate.is_file() else Resolution(None)
+    stem = target.removesuffix(".md")
+    key = normalise(stem)
+    if key in corpus.memory_stems:
+        return Resolution(f"memory/{corpus.memory_stems[key]}.md")
+    if key in corpus.rule_stems:
+        return Resolution(f"rules/{corpus.rule_stems[key]}.md")
+    if key in corpus.skill_stems:
+        return Resolution(f"skills/{corpus.skill_stems[key]}/SKILL.md")
+    stripped = bare_key(stem)
+    matches = corpus.memory_bare.get(stripped, [])
+    if len(matches) > 1:
+        return Resolution(None, note="ambiguous once the tier prefix is ignored: "
+                                     + ", ".join(sorted(matches)))
+    if len(matches) == 1:
+        return Resolution(f"memory/{matches[0]}.md", precise=False,
+                          note=f"should read [[{matches[0]}]]")
+    # A memory-tier prefix put on a rule or skill name, e.g.
+    # [[reference_operational_context]] for rules/operational-context.md.
+    if stripped in corpus.rule_stems:
+        name = corpus.rule_stems[stripped]
+        return Resolution(f"rules/{name}.md", precise=False,
+                          note=f"names rules/{name}.md, not a memory file")
+    if stripped in corpus.skill_stems:
+        name = corpus.skill_stems[stripped]
+        return Resolution(f"skills/{name}/SKILL.md", precise=False,
+                          note=f"names skills/{name}, not a memory file")
+    return Resolution(None)
+
+
+def check_frontmatter(corpus: Corpus) -> list[Finding]:
+    out: list[Finding] = []
+    for path in corpus.memory_files:
+        for lineno, key, target in frontmatter_links(read_lines(path)):
+            found = resolve_reference(target, corpus)
+            if found:
+                continue
+            detail = f" ({found.note})" if found.note else ""
+            out.append(Finding(
+                ERROR, "E001", "dangling-frontmatter-link", str(path), lineno,
+                f"frontmatter {key}: '{target}' names no memory, rule "
+                f"or skill{detail}",
+            ))
+    return out
+
+
+def check_wikilinks(corpus: Corpus) -> list[Finding]:
+    out: list[Finding] = []
+    for path in corpus.memory_files:
+        lines = blank_inline_code(blank_fenced_code(read_lines(path)))
+        for lineno, line in enumerate(lines, 1):
+            for match in WIKILINK_RE.finditer(line):
+                target = match.group(1).strip()
+                if NOT_A_FILENAME_RE.search(target):
+                    continue
+                found = resolve_reference(target, corpus)
+                if found and found.precise:
+                    continue
+                if found:
+                    out.append(Finding(
+                        WARN, "W009", "imprecise-wikilink", str(path), lineno,
+                        f"[[{target}]] resolves only with the tier prefix "
+                        f"ignored - {found.note}",
+                    ))
+                    continue
+                detail = f" ({found.note})" if found.note else ""
+                out.append(Finding(
+                    ERROR, "E002", "dangling-wikilink", str(path), lineno,
+                    f"[[{target}]] resolves to no memory, rule or skill"
+                    f"{detail}",
+                ))
+    return out
+
+
+def cited_rule_paths(line: str) -> list[tuple[int, str]]:
+    """Rule citations on one line as (match_end, filename)."""
+    hits = [(m.end(), m.group(1)) for m in RULE_PATH_RE.finditer(line)]
+    hits += [(m.end(), m.group(1)) for m in BACKTICK_MD_RE.finditer(line)]
+    return hits
+
+
+def check_rule_paths(corpus: Corpus) -> list[Finding]:
+    """E003 - an explicit rules/<x>.md path that does not exist.
+
+    Only the explicit `rules/` form is an ERROR. A bare `foo.md` in backticks is
+    ambiguous (it may name a lib module or a doc), so it is left to W004.
+    """
+    out: list[Finding] = []
+    targets = list(corpus.memory_files) + sorted((corpus.root / "rules").glob("*.md"))
+    for path in targets:
+        lines = blank_fenced_code(read_lines(path))
+        for lineno, line in enumerate(lines, 1):
+            for match in RULE_PATH_RE.finditer(line):
+                name = match.group(1)
+                if not (corpus.root / "rules" / name).is_file():
+                    out.append(Finding(
+                        ERROR, "E003", "dangling-rule-path", str(path), lineno,
+                        f"cites rules/{name} which does not exist",
+                    ))
+    return out
+
+
+def quoted_after(line: str, start: int) -> tuple[str, int] | None:
+    """First quoted phrase beginning within CLAIM_WINDOW chars after start."""
+    for match in QUOTE_RE.finditer(line, start):
+        if match.start() - start > CLAIM_WINDOW:
+            return None
+        phrase = (match.group(1) or match.group(2) or "").strip()
+        if phrase and not CLAIM_SKIP_RE.search(phrase):
+            return phrase, match.start()
+    return None
+
+
+def check_rule_claims(corpus: Corpus) -> list[Finding]:
+    """W004 - a rule cited beside a quoted phrase that is absent from that rule.
+
+    WARN, never ERROR, and deliberately so. The heuristic reads a quoted phrase
+    near a citation as a claim attributed to it, which is an approximation: the
+    quote may be the author's own wording, a paraphrase, or a phrase drawn from
+    a third source. A measured instance shows why - a memory file attributes
+    "secondaccount accepting an invite" to exogenous-anchor-law.md, which does
+    discuss secondaccount but never in those words. That is worth a human's eye,
+    not a build failure.
+    """
+    out: list[Finding] = []
+    rules_dir = corpus.root / "rules"
+    cache: dict[str, str] = {}
+    for path in list(corpus.memory_files) + sorted(rules_dir.glob("*.md")):
+        for lineno, line in enumerate(blank_fenced_code(read_lines(path)), 1):
+            for end, name in cited_rule_paths(line):
+                target = rules_dir / name
+                if not target.is_file() or target.resolve() == path.resolve():
+                    continue
+                hit = quoted_after(line, end)
+                if hit is None:
+                    continue
+                phrase, _ = hit
+                body = cache.setdefault(name, flatten(target.read_text(
+                    encoding="utf-8", errors="replace")))
+                if flatten(phrase) not in body:
+                    out.append(Finding(
+                        WARN, "W004", "unverified-rule-claim", str(path), lineno,
+                        f"cites {name} beside \"{phrase}\" - that phrase is not "
+                        f"in {name} (may be a paraphrase, not a misattribution)",
+                    ))
+    return out
+
+
+def flatten(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def load_ledger(path: Path) -> tuple[dict[int, dict], Finding | None]:
+    if not path.is_file():
+        return {}, Finding(
+            WARN, "W008", "ledger-unreadable", str(path), 0,
+            "hypothesis ledger not found - E005 and W007 were NOT run",
+        )
+    entries: dict[int, dict] = {}
+    bad = 0
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            bad += 1
+            continue
+        match = HYP_RE.search(str(record.get("id", "")))
+        if match:
+            entries[int(match.group(1))] = record
+    if not entries:
+        return {}, Finding(
+            WARN, "W008", "ledger-unreadable", str(path), 0,
+            f"ledger held no parseable hypothesis ids ({bad} bad lines) - "
+            "E005 and W007 were NOT run",
+        )
+    return entries, None
+
+
+def check_hypotheses(corpus: Corpus, ledger: dict[int, dict]) -> list[Finding]:
+    top = max(ledger)
+    out: list[Finding] = []
+    for path in corpus.memory_files:
+        for lineno, line in enumerate(blank_fenced_code(read_lines(path)), 1):
+            for match in HYP_RE.finditer(line):
+                num = int(match.group(1))
+                if num not in ledger:
+                    out.append(Finding(
+                        ERROR, "E005", "unknown-hypothesis", str(path), lineno,
+                        f"cites H{match.group(1)}, absent from the ledger "
+                        f"(highest id held: H{top:03d})",
+                    ))
+    return out
+
+
+def check_overdue(ledger: dict[int, dict], ledger_path: Path, today: date) -> list[Finding]:
+    out: list[Finding] = []
+    for num in sorted(ledger):
+        record = ledger[num]
+        status = str(record.get("status", "")).lower()
+        if status not in {"pending", "registered", "open", ""}:
+            continue
+        deadline = parse_date(str(record.get("deadline", "")))
+        if deadline is None or deadline >= today:
+            continue
+        out.append(Finding(
+            WARN, "W007", "overdue-hypothesis", str(ledger_path), 0,
+            f"H{num:03d} still '{status or 'unset'}' - deadline "
+            f"{deadline.isoformat()} passed {(today - deadline).days} days ago",
+        ))
+    return out
+
+
+def parse_date(raw: str) -> date | None:
+    try:
+        return date.fromisoformat(raw[:10])
+    except ValueError:
+        return None
+
+
+def check_memory_pointers(corpus: Corpus) -> list[Finding]:
+    index = corpus.memory_dir / "MEMORY.md"
+    if not index.is_file():
+        return [Finding(ERROR, "E006", "dangling-memory-pointer", str(index), 0,
+                        "MEMORY.md not found in the memory directory")]
+    out: list[Finding] = []
+    for lineno, line in enumerate(blank_fenced_code(read_lines(index)), 1):
+        match = POINTER_RE.match(line)
+        if not match:
+            continue
+        target = match.group(1)
+        if target.startswith(("http://", "https://", "#", "mailto:")):
+            continue
+        if not (corpus.memory_dir / target).is_file():
+            out.append(Finding(
+                ERROR, "E006", "dangling-memory-pointer", str(index), lineno,
+                f"pointer target '{target}' does not exist",
+            ))
+    return out
+
+
+def build_corpus(root: Path, memory_dir: Path, ledger: Path) -> Corpus:
+    corpus = Corpus(root=root, memory_dir=memory_dir, ledger_path=ledger)
+    corpus.memory_files = sorted(memory_dir.glob("*.md"))
+    corpus.memory_stems = {normalise(p.stem): p.stem for p in corpus.memory_files}
+    corpus.rule_stems = {normalise(p.stem): p.stem
+                         for p in sorted((root / "rules").glob("*.md"))}
+    corpus.skill_stems = {normalise(p.parent.name): p.parent.name
+                          for p in sorted((root / "skills").glob("*/SKILL.md"))}
+    corpus.memory_bare = {}
+    for path in corpus.memory_files:
+        corpus.memory_bare.setdefault(bare_key(path.stem), []).append(path.stem)
+    return corpus
+
+
+def gather(corpus: Corpus, today: date) -> tuple[list[Finding], list[str]]:
+    findings = check_frontmatter(corpus)
+    findings += check_wikilinks(corpus)
+    findings += check_rule_paths(corpus)
+    findings += check_rule_claims(corpus)
+    findings += check_memory_pointers(corpus)
+    ledger, problem = load_ledger(corpus.ledger_path)
+    skipped: list[str] = []
+    if problem is not None:
+        findings.append(problem)
+        skipped = ["E005", "W007"]
+    else:
+        findings += check_hypotheses(corpus, ledger)
+        findings += check_overdue(ledger, corpus.ledger_path, today)
+    findings.sort(key=lambda f: (f.code, f.file, f.line))
+    return findings, skipped
+
+
+def corpus_stats(corpus: Corpus) -> dict:
+    tiers: dict[str, int] = {}
+    inbound: set[str] = set()
+    for path in corpus.memory_files:
+        tiers[tier_of(path)] = tiers.get(tier_of(path), 0) + 1
+        for line in blank_inline_code(blank_fenced_code(read_lines(path))):
+            for match in WIKILINK_RE.finditer(line):
+                if NOT_A_FILENAME_RE.search(match.group(1).strip()):
+                    continue
+                found = resolve_reference(match.group(1).strip(), corpus)
+                if found and found.target.startswith("memory/"):
+                    inbound.add(found.target[len("memory/"):-len(".md")])
+    pointed = pointer_targets(corpus)
+    total = len(corpus.memory_files)
+    reachable = {p.stem for p in corpus.memory_files if p.stem in pointed
+                 or p.stem in inbound}
+    return {
+        "memory_files": total,
+        "rule_files": len(corpus.rule_stems),
+        "files_by_tier": dict(sorted(tiers.items())),
+        "pointer_lines": len(pointed),
+        "pointer_coverage_pct": round(100.0 * len(pointed) / total, 1) if total else 0.0,
+        "inbound_wikilink_targets": len(inbound),
+        "orphans": total - len(reachable),
+    }
+
+
+def tier_of(path: Path) -> str:
+    lines = read_lines(path)
+    if lines and lines[0].strip() == "---":
+        for line in lines[1:40]:
+            if line.strip() == "---":
+                break
+            match = re.match(r"^\s*type\s*:\s*(\S+)", line)
+            if match:
+                return match.group(1).strip("\"'")
+    return path.stem.split("_")[0].split("-")[0] or "untyped"
+
+
+def pointer_targets(corpus: Corpus) -> set[str]:
+    index = corpus.memory_dir / "MEMORY.md"
+    if not index.is_file():
+        return set()
+    out: set[str] = set()
+    for line in read_lines(index):
+        match = POINTER_RE.match(line)
+        if match and match.group(1).endswith(".md"):
+            out.add(Path(match.group(1)).stem)
+    return out
+
+
+def render(findings: list[Finding], skipped: list[str], stats: dict | None) -> str:
+    lines: list[str] = []
+    errors = [f for f in findings if f.severity == ERROR]
+    warns = [f for f in findings if f.severity == WARN]
+    for group, label in ((errors, ERROR), (warns, WARN)):
+        if not group:
+            continue
+        lines.append(f"{label}S ({len(group)})")
+        for finding in group:
+            lines.append(f"  {finding.code} {finding.location()}")
+            lines.append(f"       {finding.message}")
+        lines.append("")
+    if skipped:
+        lines.append(f"NOT RUN: {', '.join(skipped)} - see W008 above.")
+        lines.append("")
+    if stats is not None:
+        lines.append("CORPUS STATS")
+        for key, value in stats.items():
+            lines.append(f"  {key:<26} {value}")
+        lines.append("")
+    lines.append(f"{len(errors)} error(s), {len(warns)} warning(s)."
+                 if findings else "Clean: 0 errors, 0 warnings.")
+    return "\n".join(lines)
+
+
+def default_root() -> Path:
+    env = os.environ.get("CLAUDE_DIR", "").strip()
+    return Path(env or (Path.home() / ".claude"))
+
+
+def default_memory_dir(root: Path) -> Path:
+    """Derive the operator memory dir from the root's realpath slug.
+
+    The harness encodes a cwd as path.replace('/', '-').replace('.', '-'), so
+    ~/.grip becomes -Users-x--grip. The root is resolved first because
+    ~/.claude is usually a symlink and the symlink's own slug names a different,
+    near-empty directory.
+    """
+    real = root.resolve()
+    slug = str(real).replace("/", "-").replace(".", "-")
+    return real / "projects" / slug / "memory"
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="grip-memory-lint",
+        description="Deterministic dangling-reference checker for the GRIP corpus.")
+    parser.add_argument("--root", type=Path, default=None,
+                        help="GRIP root holding rules/ and learning/ "
+                             "(default: $CLAUDE_DIR, else ~/.claude)")
+    parser.add_argument("--memory-dir", type=Path, default=None,
+                        help="memory directory (default: derived from --root)")
+    parser.add_argument("--ledger", type=Path, default=None,
+                        help="hypothesis ledger jsonl "
+                             "(default: <root>/learning/hypotheses.jsonl)")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    parser.add_argument("--stats", action="store_true", help="also print corpus counts")
+    parser.add_argument("--strict", action="store_true",
+                        help="treat warnings as errors for the exit code")
+    parser.add_argument("--today", default=None,
+                        help="ISO date used for deadline comparison (testing)")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    root = (args.root or default_root()).expanduser()
+    memory_dir = (args.memory_dir or default_memory_dir(root)).expanduser()
+    ledger = (args.ledger or root.resolve() / "learning" / "hypotheses.jsonl").expanduser()
+    if not (root / "rules").is_dir():
+        print(f"grip-memory-lint: no rules/ under {root}", file=sys.stderr)
+        return 2
+    if not memory_dir.is_dir():
+        print(f"grip-memory-lint: no memory directory at {memory_dir}", file=sys.stderr)
+        return 2
+    today = parse_date(args.today) if args.today else date.today()
+    if today is None:
+        print(f"grip-memory-lint: --today '{args.today}' is not an ISO date",
+              file=sys.stderr)
+        return 2
+
+    corpus = build_corpus(root, memory_dir, ledger)
+    findings, skipped = gather(corpus, today)
+    stats = corpus_stats(corpus) if args.stats else None
+
+    if args.json:
+        print(json.dumps({
+            "root": str(root), "memory_dir": str(memory_dir),
+            "ledger": str(ledger), "detectors_not_run": skipped,
+            "errors": sum(1 for f in findings if f.severity == ERROR),
+            "warnings": sum(1 for f in findings if f.severity == WARN),
+            "findings": [asdict(f) for f in findings],
+            "stats": stats,
+        }, indent=2))
+    else:
+        print(render(findings, skipped, stats))
+
+    if any(f.severity == ERROR for f in findings):
+        return 1
+    if args.strict and findings:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

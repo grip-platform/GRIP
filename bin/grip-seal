@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# grip-seal — HAPPIverse Seal of Approval
+#
+# Renders a self-contained, offline, witness-able welcome seal for a teammate
+# joining the HAPPIverse (the .claude → .grip junction). The seal fingerprint is
+# DERIVED (SEAL- + first 6 uppercase hex of sha256 over the inductee's details),
+# and the page prints the exact recompute one-liner — don't trust it, witness it.
+#
+# Pure pass-through to the deterministic renderer (lib/seal_of_approval.py):
+# stdlib only, no network, no wall-clock — the induction date is an explicit arg.
+#
+# Usage:
+#   grip-seal gen --name Fabio --sig "F>>" --handle Fubzzz \
+#       --home "C:\users\user" --date 2026-07-01 \
+#       --joined "pending live-join" --out apps/seal-of-approval/fabio.html
+#
+#   grip-seal gen --name "<Your Name>" --sig "A>>" --handle AndreTheart \
+#       --home "C:\Users\<Your Name>" --date 2026-07-01 \
+#       --joined "joined - 100.64.0.10" --out apps/seal-of-approval/andre.html
+#
+# Omit --out to write the HTML to stdout.
+set -euo pipefail
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+cd "$CLAUDE_DIR"
+exec python3 -m lib.seal_of_approval "$@"

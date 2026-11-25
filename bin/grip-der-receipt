@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""grip-der-receipt — build a Decision Evidence Receipt from a sealed decision.
+
+Usage:
+  grip-der-receipt <sealed-record.json> [--out receipt.json] [--no-stamp]
+
+Reads a sealed sovereign-council record (state/sovereign-council/<seal>.json) and
+emits a DER receipt: the decision + belief-state, an Ed25519 signature, and an
+OpenTimestamps Bitcoin anchor. Verify it with grip-der-verify. Task #546.
+"""
+import argparse
+import json
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+from lib.der_receipt import build_receipt  # noqa: E402
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="Build a Decision Evidence Receipt")
+    ap.add_argument("record", help="sealed decision record JSON")
+    ap.add_argument("--out", help="output receipt path (default: <record>.der.json)")
+    ap.add_argument("--no-stamp", action="store_true",
+                    help="skip the OpenTimestamps Bitcoin anchor (offline)")
+    a = ap.parse_args(argv)
+    receipt = build_receipt(json.loads(Path(a.record).read_text()),
+                            do_stamp=not a.no_stamp)
+    out = Path(a.out) if a.out else Path(a.record).with_suffix(".der.json")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(receipt, indent=2, ensure_ascii=False))
+    anc = receipt["anchor"]
+    print(f"receipt   : {out}")
+    print(f"payload   : {receipt['payload_sha256']}")
+    print(f"signature : ed25519 · pub {receipt['signature']['pubkey_b64'][:20]}...")
+    print(f"anchor    : {anc['status']}"
+          + (f" · block {anc['block']}" if anc.get("block") else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+# agora-convergence-tick — One-shot AGORA review-driven convergence sweep.
+#
+# Origin: 2026-05-26. V>>'s ask after PR #3244 fix: "set up a true /loop to
+# make sure all CI Convergence for AGORA reviews on PRs across all repositories
+# where it is enabled, runs without fault."
+#
+# WHAT IT DOES (idempotent, one-shot, no state between ticks):
+#   1. Reads state/agora-convergence-repos.json for the list of enabled repos.
+#   2. For each enabled repo, enumerates open PRs via gh REST API (gh pr list
+#      is silent-empty on Projects-classic-deprecated repos — REST is canonical
+#      per rules/gh-repo-resolution.md / operational-context.md).
+#   3. For each PR, fetches issue comments + extracts the latest AGORA verdict
+#      via lib/agora_verdict_router.py (pure-function module — testable, no I/O).
+#   4. Routes each PR to one action label:
+#        - merge_ready      → log + (future) Slack notify
+#        - loop_fixes       → log + (future) Slack notify (V>> drives fix loop)
+#        - defer            → log only (AGORA self-creates sprint-loop issue)
+#        - rerun            → workflow_dispatch the AGORA workflow (autonomous
+#                             recovery from HAL Council infra failure / AGORA
+#                             hallucination-fail)
+#        - wait             → no action (AGORA hasn't posted yet, or PR fresh)
+#   5. Appends one summary line per tick to data/agora-convergence-tick.jsonl.
+#
+# IDEMPOTENCY:
+#   - No state file between ticks. Each invocation re-reads everything.
+#   - Rerun decision is based ONLY on (a) AGORA verdict == FAIL/ERROR or
+#     (b) PR is older than stale_after_minutes AND no AGORA comment yet.
+#   - A `merge_ready` / `loop_fixes` / `defer` PR triggers ONLY logging, not
+#     workflow_dispatch — so re-running this tick repeatedly is safe.
+#
+# CRON SCHEDULING:
+#   Use Claude Code's CronCreate (durable=true) every ~15min, OR a launchd /
+#   GH Actions cron for full laptop-independence. See docs/agora-convergence-loop.md.
+#
+# USAGE:
+#   bin/agora-convergence-tick                  # all enabled repos
+#   bin/agora-convergence-tick grip-platform/GRIP   # one specific repo
+#   AGORA_TICK_DRY_RUN=1 bin/agora-convergence-tick  # log decisions, no gh write ops
+#
+# EXIT CODES:
+#   0 — tick completed (per-PR failures isolated, do not fail the tick)
+#   1 — config missing / unparseable
+#   2 — gh auth failure / catastrophic infra failure
+
+set -uo pipefail
+
+# Temp-file reaper (AGORA DEFER on PR #4139, issue #4143). The payload temp
+# files below are removed inline after use, but an abrupt kill (CI timeout, OOM)
+# or an early `return` between mktemp and rm would leak them into
+# ${TMPDIR:-/tmp}. That accumulates WORST during the very re-dispatch storm this
+# script's fix addresses — a signal-safety gap turning into a storage one.
+#
+# One script-level trap over a tracked list, NOT a trap per function: bash traps
+# are per-shell, so setting one inside a function would clobber this handler.
+# `rm -f` is idempotent, so the inline removals stay as the fast path.
+_TICK_TMPFILES=()
+
+_tick_cleanup() {
+    if (( ${#_TICK_TMPFILES[@]} > 0 )); then
+        rm -f "${_TICK_TMPFILES[@]}"
+    fi
+}
+trap _tick_cleanup EXIT INT TERM
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+# Config resolution: local-canonical .json (operator-edited, gitignored) wins
+# over the committed .example.json reference template.
+_DEFAULT_CONFIG_LOCAL="$CLAUDE_DIR/state/agora-convergence-repos.json"
+_DEFAULT_CONFIG_EXAMPLE="$CLAUDE_DIR/state/agora-convergence-repos.example.json"
+if [[ -n "${AGORA_TICK_CONFIG:-}" ]]; then
+    CONFIG_FILE="$AGORA_TICK_CONFIG"
+elif [[ -f "$_DEFAULT_CONFIG_LOCAL" ]]; then
+    CONFIG_FILE="$_DEFAULT_CONFIG_LOCAL"
+else
+    CONFIG_FILE="$_DEFAULT_CONFIG_EXAMPLE"
+fi
+TELEMETRY_FILE="${AGORA_TICK_TELEMETRY:-$CLAUDE_DIR/data/agora-convergence-tick.jsonl}"
+DRY_RUN="${AGORA_TICK_DRY_RUN:-0}"
+NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+PYTHON="${AGORA_TICK_PYTHON:-python3}"
+
+log_info()  { echo "[agora-tick] $*" >&2; }
+log_error() { echo "[agora-tick] ERROR: $*" >&2; }
+
+# ---------------------------------------------------------------------------
+# Preflight
+# ---------------------------------------------------------------------------
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    log_error "config not found: $CONFIG_FILE"
+    log_error "Create it from the example or run: cp state/agora-convergence-repos.example.json $CONFIG_FILE"
+    exit 1
+fi
+
+if ! command -v gh >/dev/null 2>&1; then
+    log_error "gh CLI not on PATH"
+    exit 2
+fi
+
+if ! gh auth status >/dev/null 2>&1; then
+    log_error "gh not authenticated (run 'gh auth login')"
+    exit 2
+fi
+
+mkdir -p "$(dirname "$TELEMETRY_FILE")"
+
+# ---------------------------------------------------------------------------
+# Per-PR processing (extracted so per-PR failures are isolated)
+# ---------------------------------------------------------------------------
+
+process_pr() {
+    local org="$1" repo="$2" workflow="$3" pr_number="$4" pr_head_branch="$5" pr_opened_at="$6" stale_min="$7" pr_head_sha="$8"
+
+    # Fetch comments via REST.
+    local comments_json
+    if ! comments_json=$(gh api "repos/$org/$repo/issues/$pr_number/comments" --paginate 2>/dev/null); then
+        log_error "$org/$repo#$pr_number: gh api comments failed"
+        echo "{\"ts\":\"$NOW_ISO\",\"repo\":\"$org/$repo\",\"pr\":$pr_number,\"action\":\"error\",\"reason\":\"comments_fetch_failed\"}" >> "$TELEMETRY_FILE"
+        return
+    fi
+
+    # Hand the comments + metadata to the Python router. Output is JSON.
+    # #4058 Defect 1: the payload MUST NOT travel on stdin. `python3 -` reads
+    # its PROGRAM from stdin, and a heredoc is the LAST stdin redirection, so
+    # it silently WINS over the `echo ... |` pipe: the pipe is discarded and
+    # `sys.stdin.read()` returns "" (the program text is already consumed).
+    # The router therefore saw ZERO comments on every tick, concluded "no
+    # AGORA verdict yet", and the stale rule promoted WAIT -> RERUN — one
+    # `gh workflow run` per open PR every 15 minutes, forever (27 councils in
+    # 6.5h on PR #4050). Pass the payload by FILE PATH in argv: the comment
+    # payload can exceed 1 MB (PR #4050: 1,342,962 bytes), so argv/env are
+    # not viable (ARG_MAX ~1 MB) — a temp file is the only size-safe channel.
+    local decision comments_file
+    comments_file=$(mktemp "${TMPDIR:-/tmp}/agora-tick-comments.XXXXXX") || {
+        log_error "$org/$repo#$pr_number: mktemp failed"
+        return
+    }
+    printf '%s' "$comments_json" > "$comments_file"
+    decision=$(PYTHONPATH="$CLAUDE_DIR" "$PYTHON" - "$pr_opened_at" "$NOW_ISO" "$stale_min" "$comments_file" "$pr_head_sha" <<'PYEOF'
+import json, sys
+from lib.agora_verdict_router import (
+    latest_agora_verdict, route_action, should_rerun_stale, genuine_verdict_for_sha,
+    ACTION_WAIT, ACTION_RERUN,
+)
+
+pr_opened_at = sys.argv[1]
+now_iso = sys.argv[2]
+stale_min = int(sys.argv[3])
+head_sha = sys.argv[5]
+
+# Payload arrives by path (NOT stdin — stdin carries this program). Fail
+# CLOSED on an unreadable/empty payload: an empty read must never be taken
+# for "no AGORA comment", which is exactly what re-armed the rerun loop.
+try:
+    with open(sys.argv[4], encoding="utf-8") as fh:
+        raw = fh.read()
+except OSError:
+    print(json.dumps({"verdict": None, "action": "error", "reason": "comments_read_failed"}))
+    sys.exit(0)
+if not raw.strip():
+    print(json.dumps({"verdict": None, "action": "error", "reason": "comments_payload_empty"}))
+    sys.exit(0)
+try:
+    comments = json.loads(raw)
+except json.JSONDecodeError:
+    print(json.dumps({"verdict": None, "action": "error", "reason": "comments_parse_failed"}))
+    sys.exit(0)
+
+latest = latest_agora_verdict(comments)
+verdict = latest["verdict"] if latest else None
+action = route_action(verdict)
+
+# Promote WAIT → RERUN when PR is stale + no AGORA yet (workflow_dispatch eligible).
+if action == ACTION_WAIT and should_rerun_stale(pr_opened_at, now_iso, latest, stale_min):
+    action = ACTION_RERUN
+    reason = "stale_no_agora"
+else:
+    reason = "verdict_routed" if verdict else "agora_pending"
+
+print(json.dumps({
+    "verdict": verdict,
+    "action": action,
+    "reason": reason,
+    "latest_agora_created_at": latest["created_at"] if latest else None,
+    "latest_agora_comment_id": latest["comment_id"] if latest else None,
+    # The verdict AGORA stamped for the commit this sweep listed as the head,
+    # or None (GRIP#9068). The latest verdict above may be for an older commit.
+    "verdict_for_head": genuine_verdict_for_sha(comments, head_sha),
+}))
+PYEOF
+    )
+
+    rm -f "$comments_file"
+
+    local verdict action reason
+    verdict=$(echo "$decision" | "$PYTHON" -c "import json,sys; d=json.load(sys.stdin); print(d.get('verdict') or '')")
+    action=$(echo "$decision"  | "$PYTHON" -c "import json,sys; d=json.load(sys.stdin); print(d.get('action') or '')")
+    reason=$(echo "$decision"  | "$PYTHON" -c "import json,sys; d=json.load(sys.stdin); print(d.get('reason') or '')")
+
+    # Take action based on the routed label.
+    case "$action" in
+        rerun)
+            if [[ "$DRY_RUN" == "1" ]]; then
+                log_info "$org/$repo#$pr_number: DRY_RUN would rerun $workflow on $pr_head_branch (reason=$reason)"
+            else
+                log_info "$org/$repo#$pr_number: rerunning $workflow on $pr_head_branch (reason=$reason)"
+                if ! gh workflow run "$workflow" --repo "$org/$repo" --ref "$pr_head_branch" -f "pr_number=$pr_number" >/dev/null 2>&1; then
+                    log_error "$org/$repo#$pr_number: gh workflow run failed"
+                    reason="${reason}__workflow_dispatch_failed"
+                fi
+            fi
+            ;;
+        auto_merge)
+            # AGORA PASS == exogenous ratification (V>> 2026-05-26) per
+            # rules/exogenous-anchor-law.md RSI-loop merge carve-out. Gate
+            # on (b) CI-checks-green AND (c) NOT bootstrap-excepted before
+            # admin-bypass merge. Conditions enforced by
+            # lib/agora_verdict_router.py::auto_merge_eligible (pure).
+            #
+            # GRIP#9068: the merge is pinned to the commit this sweep listed as
+            # the PR's head, needs a MERGE verdict stamped for that same commit,
+            # and needs green checks read for it. The latest verdict may be for
+            # an older commit, so on its own it could merge a newer head AGORA
+            # never reviewed. The checks and their head come from ONE read, and
+            # that head must be the listed one: `gh pr checks` takes a PR, not a
+            # commit, so a head moved away and back while it ran could lend this
+            # commit another commit's green checks, and the pin would still
+            # match (Codex on GRIP#9124).
+            local checks_view files_json eligibility verdict_for_head
+            verdict_for_head=$(echo "$decision" | "$PYTHON" -c "import json,sys; print(json.load(sys.stdin).get('verdict_for_head') or '')")
+            checks_view=$(gh pr view "$pr_number" --repo "$org/$repo" --json headRefOid,statusCheckRollup 2>/dev/null || echo "{}")
+            files_json=$(gh api "repos/$org/$repo/pulls/$pr_number/files" --paginate 2>/dev/null || echo "[]")
+            # #4058: same heredoc-over-pipe bug as the router call above — the
+            # changed-file list never reached Python, so `files` was always []
+            # and is_bootstrap_excepted([]) fail-closed True, silently blocking
+            # EVERY auto-merge. Pass by file path in argv.
+            local files_file
+            files_file=$(mktemp "${TMPDIR:-/tmp}/agora-tick-files.XXXXXX") || {
+                log_error "$org/$repo#$pr_number: mktemp failed"
+                return
+            }
+            printf '%s' "$files_json" > "$files_file"
+            eligibility=$(PYTHONPATH="$CLAUDE_DIR" "$PYTHON" - "$checks_view" "$files_file" "$pr_head_sha" "$verdict_for_head" <<'PYEOF'
+import json, re, sys
+from lib.agora_verdict_router import auto_merge_eligible
+
+view_raw = sys.argv[1]
+head_sha = sys.argv[3]
+verdict_for_head = sys.argv[4]
+try:
+    with open(sys.argv[2], encoding="utf-8") as fh:
+        files_raw = fh.read()
+except OSError:
+    print(json.dumps({"eligible": False, "reason": "files_read_failed", "ci_green": False}))
+    sys.exit(0)
+try:
+    view = json.loads(view_raw) if view_raw.strip() else {}
+    files = json.loads(files_raw) if files_raw.strip() else []
+except json.JSONDecodeError:
+    print(json.dumps({"eligible": False, "reason": "parse_error", "ci_green": False}))
+    sys.exit(0)
+if not isinstance(view, dict):
+    view = {}
+
+
+def check_state(c):
+    """What `gh pr checks` reported as a check's state: a check run's
+    conclusion once it has completed, else its status; a commit status's state."""
+    if c.get("__typename") == "StatusContext" or ("state" in c and "status" not in c):
+        return (c.get("state") or "").upper()
+    status = (c.get("status") or "").upper()
+    return (c.get("conclusion") or "").upper() if status == "COMPLETED" else status
+
+
+# CI-green: all checks in {SUCCESS, NEUTRAL, SKIPPED}; any IN_PROGRESS,
+# QUEUED, FAILURE, ERROR, TIMED_OUT, CANCELLED, ACTION_REQUIRED ⇒ not green.
+GREEN = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+states = [check_state(c) for c in (view.get("statusCheckRollup") or []) if isinstance(c, dict)]
+ci_green = bool(states) and all(s in GREEN for s in states)
+checks_head = view.get("headRefOid") or ""
+
+changed = [f.get("filename") for f in files if f.get("filename")]
+# GRIP#9068: no merge without a full commit id to pin it to, none on checks
+# read for any other commit, and none on a verdict for any other commit.
+if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+    ok, reason = False, "head_unreadable"
+elif checks_head != head_sha:
+    ok, reason = False, "head_moved"
+elif verdict_for_head != "MERGE":
+    ok, reason = False, f"verdict_not_for_head:{verdict_for_head or 'none'}"
+else:
+    ok, reason = auto_merge_eligible(verdict="MERGE", ci_checks_green=ci_green, changed_paths=changed)
+print(json.dumps({"eligible": ok, "reason": reason, "ci_green": ci_green, "n_files": len(changed)}))
+PYEOF
+            )
+            rm -f "$files_file"
+            local eligible elig_reason ci_green
+            eligible=$(echo "$eligibility" | "$PYTHON" -c "import json,sys; print(json.load(sys.stdin).get('eligible'))")
+            elig_reason=$(echo "$eligibility" | "$PYTHON" -c "import json,sys; print(json.load(sys.stdin).get('reason'))")
+            ci_green=$(echo "$eligibility" | "$PYTHON" -c "import json,sys; print(json.load(sys.stdin).get('ci_green'))")
+            if [[ "$eligible" == "True" ]]; then
+                if [[ "$DRY_RUN" == "1" ]]; then
+                    log_info "$org/$repo#$pr_number: DRY_RUN would auto-merge ${pr_head_sha:0:12} (MERGE verdict for that commit, CI green, not bootstrap)"
+                    reason="dry_run_eligible_for_admin_merge"
+                else
+                    log_info "$org/$repo#$pr_number: AUTO-MERGE ${pr_head_sha:0:12} (MERGE verdict for that commit, CI green, not bootstrap)"
+                    local merge_out merge_why
+                    if merge_out=$(gh pr merge "$pr_number" --repo "$org/$repo" --admin --squash --match-head-commit "$pr_head_sha" 2>&1); then
+                        reason="auto_merged_admin_squash"
+                    else
+                        # A head that moved after the PR list was read refuses here.
+                        merge_why=${merge_out%%$'\n'*}
+                        log_error "$org/$repo#$pr_number: gh pr merge --admin failed: ${merge_why:-gh gave no reason}"
+                        reason="auto_merge_attempted_failed"
+                    fi
+                fi
+            else
+                log_info "$org/$repo#$pr_number: MERGE verdict but NOT auto-mergeable (reason=$elig_reason, ci_green=$ci_green)"
+                reason="merge_verdict_blocked:$elig_reason"
+            fi
+            ;;
+        loop_fixes)
+            log_info "$org/$repo#$pr_number: REQUEST_CHANGES — fix loop required"
+            ;;
+        defer)
+            log_info "$org/$repo#$pr_number: DEFER_CHANGES — AGORA self-created sprint-loop issue"
+            ;;
+        wait)
+            log_info "$org/$repo#$pr_number: WAIT (AGORA pending, PR fresh)"
+            ;;
+        error|*)
+            log_error "$org/$repo#$pr_number: action=$action reason=$reason"
+            ;;
+    esac
+
+    # Telemetry one-liner.
+    cat >> "$TELEMETRY_FILE" <<TELEOF
+{"ts":"$NOW_ISO","repo":"$org/$repo","pr":$pr_number,"branch":"$pr_head_branch","verdict":"$verdict","action":"$action","reason":"$reason","dry_run":$DRY_RUN}
+TELEOF
+}
+
+# ---------------------------------------------------------------------------
+# Main sweep
+# ---------------------------------------------------------------------------
+
+# Read config: enabled repos + stale threshold.
+stale_min=$("$PYTHON" -c "import json; c=json.load(open('$CONFIG_FILE')); print(c.get('stale_after_minutes', 30))")
+filter_repo="${1:-}"
+
+repos_json=$("$PYTHON" -c "
+import json
+c = json.load(open('$CONFIG_FILE'))
+out = []
+filt = '$filter_repo'
+for r in c.get('repos', []):
+    if not r.get('enabled'):
+        continue
+    key = f\"{r['org']}/{r['repo']}\"
+    if filt and key != filt:
+        continue
+    out.append(r)
+print(json.dumps(out))
+")
+
+repo_count=$(echo "$repos_json" | "$PYTHON" -c "import json,sys; print(len(json.load(sys.stdin)))")
+if [[ "$repo_count" == "0" ]]; then
+    log_info "no enabled repos in $CONFIG_FILE${filter_repo:+ matching '$filter_repo'}"
+    exit 0
+fi
+
+log_info "sweep start: $repo_count repo(s), stale_after_minutes=$stale_min, dry_run=$DRY_RUN"
+
+# Iterate repos. Per-repo failures must not abort the whole sweep.
+echo "$repos_json" | "$PYTHON" -c "
+import json, sys
+for r in json.load(sys.stdin):
+    print(f\"{r['org']}\t{r['repo']}\t{r['workflow']}\")
+" | while IFS=$'\t' read -r org repo workflow; do
+    log_info "$org/$repo: enumerating open PRs"
+    prs_json=$(gh api "repos/$org/$repo/pulls?state=open&per_page=100" 2>/dev/null || echo "[]")
+    pr_count=$(echo "$prs_json" | "$PYTHON" -c "import json,sys; print(len(json.load(sys.stdin) or []))")
+    log_info "$org/$repo: $pr_count open PR(s)"
+
+    if [[ "$pr_count" == "0" ]]; then
+        continue
+    fi
+
+    echo "$prs_json" | "$PYTHON" -c "
+import json, sys
+for p in json.load(sys.stdin):
+    head = p.get('head') or {}
+    ref = head.get('ref') or ''
+    sha = head.get('sha') or ''
+    print(f\"{p['number']}\t{ref}\t{p['created_at']}\t{sha}\")
+" | while IFS=$'\t' read -r pr_number pr_head pr_opened pr_sha; do
+        process_pr "$org" "$repo" "$workflow" "$pr_number" "$pr_head" "$pr_opened" "$stale_min" "$pr_sha" || \
+            log_error "$org/$repo#$pr_number: process_pr exited non-zero"
+    done
+done
+
+log_info "sweep done at $NOW_ISO (telemetry → $TELEMETRY_FILE)"
+exit 0

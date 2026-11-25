@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""grip-input-watch -- absorb everything dropped into the INPUT folder.
+
+The mechanical half of the INPUT watcher (see docs/input-watcher.md). On each
+run it scans ``PARAMOUNT_BACKUPS/INPUT`` and, per entry:
+
+  - text file        -> absorb-knowledge (deterministic syscall)
+  - git repository   -> queue a grip-anywhere ticket
+  - other directory  -> queue an absorb-graph ticket
+  - anything else    -> backup-only (already saved by being in INPUT)
+
+Every entry is then MOVED into ``INPUT/processed/`` and logged, never deleted, so
+a re-run is a no-op and nothing is lost. The skill tickets (grip-anywhere,
+absorb-graph) sit in ``INPUT/queue.jsonl`` for a /broly session to consume -- this
+script cannot run an agent and does not pretend it did.
+
+Usage:
+    bin/grip-input-watch            scan + process INPUT once
+    bin/grip-input-watch --where    print the INPUT path and exit
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from lib.input_watch import process  # noqa: E402
+from lib.paramount_backups import ParamountBackupError, backups_root  # noqa: E402
+
+INPUT_DIR_NAME = "INPUT"
+
+
+def input_dir() -> Path:
+    try:
+        return backups_root() / INPUT_DIR_NAME
+    except ParamountBackupError as exc:
+        print(f"[grip-input-watch] {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--where", action="store_true", help="print the INPUT path and exit")
+    args = ap.parse_args(argv)
+
+    directory = input_dir()
+    if args.where:
+        print(f"[grip-input-watch] INPUT: {directory}")
+        return 0
+
+    directory.mkdir(parents=True, exist_ok=True)
+    summary = process(directory)
+    print(f"[grip-input-watch] {directory}")
+    print(
+        f"[grip-input-watch] absorbed={summary['knowledge']} "
+        f"graph_tickets={summary['graph']} anywhere_tickets={summary['anywhere']} "
+        f"backup_only={summary['backup_only']} failed={summary['failed']}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""grip-tree-check -- is the shared GRIP tree serving canonical code?
+
+``~/.claude`` symlinks to a shared working tree that launchd agents execute from,
+so the branch left checked out there decides what production runs and what any
+verification read returns. It is a valid checkout answering correct questions about
+the wrong ref, which is why being parked on a feature branch for days announces
+nothing (observed 2026-08-03: eight days off main, three silently wrong reads).
+
+Usage:
+    bin/grip-tree-check [--tree PATH] [--canonical REF] [--json] [--quiet]
+
+Exit codes -- note that 3 is NOT success, because "git could not answer" must never
+be indistinguishable from "the tree is fine":
+    0  on main and level with the canonical ref
+    1  OFF CANONICAL -- serving some other branch
+    2  on main but behind the canonical ref
+    3  INDETERMINATE -- git could not report
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+from shared_tree_state import (  # noqa: E402
+    CANONICAL_REF, INDETERMINATE, OFF_CANONICAL, OK, tree_state,
+)
+
+_DEFAULT_TREE = Path.home() / ".claude"
+
+_PREFIX = {
+    OK: "ok",
+    OFF_CANONICAL: "OFF CANONICAL",
+    INDETERMINATE: "UNKNOWN",
+}
+
+
+def _human(state) -> str:
+    label = _PREFIX.get(state.verdict, state.verdict.lower())
+    head = state.head or "?"
+    return f"[grip-tree-check] {label} - {state.detail} (HEAD {head})"
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(add_help=True, description=__doc__)
+    ap.add_argument("--tree", type=Path, default=_DEFAULT_TREE)
+    ap.add_argument("--canonical", default=CANONICAL_REF)
+    ap.add_argument("--json", action="store_true", dest="as_json")
+    ap.add_argument("--quiet", action="store_true",
+                    help="print nothing when the tree is canonical")
+    args = ap.parse_args(argv)
+
+    state = tree_state(args.tree, canonical=args.canonical)
+
+    if args.as_json:
+        print(json.dumps({
+            "branch": state.branch, "head": state.head,
+            "canonical_head": state.canonical_head, "behind": state.behind,
+            "verdict": state.verdict, "detail": state.detail,
+        }))
+    elif not (args.quiet and state.is_canonical):
+        stream = sys.stdout if state.is_canonical else sys.stderr
+        print(_human(state), file=stream)
+
+    return state.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

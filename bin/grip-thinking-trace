@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+"""grip-thinking-trace — CLI over lib/thinking_trace.py (the reasoning-trace
+diagnostic store).
+
+    grip-thinking-trace preserve [session_id]   # harvest a session's thinking
+                                                # blocks into the durable store
+    grip-thinking-trace list <session_id>       # list preserved specimens
+    grip-thinking-trace read <session_id> <addr># read ONE specimen (examination)
+    grip-thinking-trace stats                   # corpus-wide counts
+
+A thin shim: it only puts the sibling ``lib/`` on the path and delegates to
+``thinking_trace._main``, so the CLI and ``python3 -m lib.thinking_trace``
+cannot drift apart. GRIP convention for CLIs is a ``bin/grip-*`` shim on PATH
+(``pyproject.toml`` declares no console scripts) — the "expose a minimal CLI
+entry point" item AGORA deferred on GRIP#5393 (GRIP#5395).
+
+Everything this prints is a NON-AUTHORITATIVE diagnostic specimen: examine it,
+never feed it back as a premise (see the fence in ``lib/thinking_trace.py``).
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+from thinking_trace import _main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(_main(sys.argv[1:]))

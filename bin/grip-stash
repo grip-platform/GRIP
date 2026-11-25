@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""grip-stash -- stashes that carry their owner: grip-stash:<sid>:<branch>:<reason>.
+
+Every linked worktree shares one stash stack, so a bare `git stash pop` takes
+whatever is on top -- quite possibly another session's work. grip-stash makes
+the owner part of the stash itself and addresses stashes by commit SHA, never
+by stash@{n}, which shifts whenever any session pushes.
+
+    grip-stash push -m REASON [-u] [-k] [-S] [-q] [--] [pathspec...]
+    grip-stash list [--json] [--mine]
+    grip-stash show SHA [git-stash-show options...]
+    grip-stash apply SHA [--index]
+    grip-stash pop SHA [--index] [--force]
+    grip-stash drop SHA [--force]
+
+`push` refuses (exit 2) without a session id or a non-empty reason: an
+unattributed stash is the thing this tool exists to prevent. `pop` and `drop`
+refuse (exit 2) a stash that is not this session's unless --force is given;
+`apply` warns but proceeds, since it destroys nothing. SHA may be any unique
+prefix of at least 4 hex digits (see `grip-stash list`). Stashes made by bare
+git list as UNATTRIBUTED with a best-guess kind.
+
+Exit codes: git's own for push/show/apply/pop/drop; 0 for list; 2 refused or
+bad usage; 3 when the repository or ledger cannot be read.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Optional, Sequence
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+import grip_dirty_snapshot as ledger  # noqa: E402
+import grip_ownership as ownership  # noqa: E402
+
+_SHA_PREFIX = re.compile(r"[0-9a-fA-F]{4,40}")
+
+
+class Refused(Exception):
+    """A request grip-stash declines, with the reason as the message (exit 2)."""
+
+
+def _say(message: str) -> None:
+    print(f"[grip-stash] {message}", file=sys.stderr)
+
+
+def _you() -> Optional[str]:
+    try:
+        return ledger.resolve_session_id()
+    except ledger.InvalidSessionId:
+        return None
+
+
+def _require_you() -> str:
+    try:
+        sid = ledger.resolve_session_id()
+    except ledger.InvalidSessionId as exc:
+        raise Refused(str(exc)) from exc
+    if not sid:
+        raise Refused("no session id: export GRIP_SESSION_ID=<id> (Claude Code "
+                      "sets CLAUDE_CODE_SESSION_ID itself)")
+    return sid
+
+
+def _ctx() -> ledger.GitCtx:
+    return ledger.GitCtx([ledger.real_git()], os.getcwd())
+
+
+def find_stash(ctx: ledger.GitCtx, token: str) -> dict:
+    """The one stash whose SHA starts with `token`; Refused otherwise."""
+    if not _SHA_PREFIX.fullmatch(token or ""):
+        raise Refused(f"{token!r}: address stashes by SHA or a unique hex prefix "
+                      "(stash@{n} shifts under concurrent sessions; see `grip-stash list`)")
+    hits = [s for s in ledger.list_stashes(ctx) if s["sha"].startswith(token.lower())]
+    if len(hits) != 1:
+        raise Refused(f"{token}: {'no' if not hits else len(hits)} matching stash(es)")
+    return hits[0]
+
+
+def owner_of(entry: dict) -> Optional[str]:
+    parsed = ledger.parse_stash_subject(entry["subject"])
+    return parsed["sid"] if parsed else None
+
+
+def guard_foreign(entry: dict, you: Optional[str], force: bool, verb: str) -> None:
+    """Refuse to destroy a stash that is not provably this session's."""
+    owner = owner_of(entry)
+    if force or (owner is not None and owner == you):
+        return
+    who = f"owned by {owner[:8]}" if owner else "no recorded owner"
+    raise Refused(f"will not {verb} {entry['sha'][:10]} ({who}): it is not this "
+                  "session's stash. Re-run with --force if you mean it.")
+
+
+def _split_flag(args: Sequence[str], flag: str) -> tuple[list[str], bool]:
+    kept = [a for a in args if a != flag]
+    return kept, len(kept) != len(args)
+
+
+def _one_target(args: Sequence[str], verb: str) -> tuple[str, list[str]]:
+    targets = [a for a in args if not a.startswith("-")]
+    if len(targets) != 1:
+        raise Refused(f"{verb} needs exactly one stash SHA")
+    return targets[0], [a for a in args if a.startswith("-")]
+
+
+def mark_dropped(ctx: ledger.GitCtx, sid: Optional[str], sha: str) -> None:
+    """Note the drop in this session's manifest, if it recorded the stash."""
+    if not sid:
+        return
+    path = ledger.manifest_path(ctx.ledger_dir(), sid)
+    if not path.exists():
+        return
+
+    def mutate(data: dict) -> None:
+        record = data["stashes"].get(sha)
+        if record is not None:
+            record["dropped_at"] = ledger.utc_now()
+
+    ledger.update_manifest(path.parent, sid, mutate)
+
+
+def drop_by_sha(ctx: ledger.GitCtx, sha: str) -> int:
+    """`git stash drop` needs a reflog selector: find it for this exact SHA now."""
+    for entry in ledger.list_stashes(ctx):
+        if entry["sha"] == sha:
+            return ledger.run_git(ctx, ["stash", "drop", "-q", entry["ref"]], None,
+                                  subprocess.call, _say)
+    _say(f"stash {sha[:10]} is already gone")
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# verbs
+# ---------------------------------------------------------------------------
+
+def cmd_push(args: Sequence[str]) -> int:
+    sid = _require_you()
+    options, reason, paths = ledger.split_stash_push(args)
+    if not " ".join(reason.split()):
+        raise Refused("push needs a reason: grip-stash push -m \"why this is parked\"")
+    ctx = _ctx()
+    message = ledger.stash_message(sid, ctx.branch_label(), reason)
+    return ledger.stamped_call(ctx, ["stash", "push", "-m", message, *options, *paths],
+                               sid, op="stash", warn=_say)
+
+
+def cmd_list(args: Sequence[str]) -> int:
+    ctx = _ctx()
+    manifests, corrupt = ownership.load_manifests(ctx.ledger_dir())
+    stashes = ownership.scan_stashes(ctx, manifests)
+    you = _you()
+    if "--mine" in args:
+        stashes = [s for s in stashes if s["sid"] and s["sid"] == you]
+    if "--json" in args:
+        print(json.dumps({"session_id": you, "stashes": stashes,
+                          "corrupt_manifests": corrupt}, indent=1))
+    else:
+        print("\n".join(ownership.render_stashes(stashes, you)))
+    return 0
+
+
+def cmd_show(args: Sequence[str]) -> int:
+    ctx = _ctx()
+    target, options = _one_target(args, "show")
+    entry = find_stash(ctx, target)
+    return ledger.run_git(ctx, ["stash", "show", *options, entry["sha"]], None,
+                          subprocess.call, _say)
+
+
+def _apply(ctx: ledger.GitCtx, entry: dict, options: Sequence[str],
+           sid: Optional[str]) -> int:
+    git_args = ["stash", "apply", *options, entry["sha"]]
+    if sid is None:
+        return ledger.run_git(ctx, git_args, None, subprocess.call, _say)
+    return ledger.stamped_call(ctx, git_args, sid, op="stash", warn=_say)
+
+
+def cmd_apply(args: Sequence[str]) -> int:
+    ctx = _ctx()
+    target, options = _one_target(args, "apply")
+    entry = find_stash(ctx, target)
+    you = _you()
+    owner = owner_of(entry)
+    if owner != you:
+        _say(f"note: {entry['sha'][:10]} is not this session's stash "
+             f"(owner {owner[:8] if owner else 'unknown'}); applying a copy")
+    return _apply(ctx, entry, options, you)
+
+
+def cmd_pop(args: Sequence[str]) -> int:
+    args, force = _split_flag(args, "--force")
+    ctx = _ctx()
+    target, options = _one_target(args, "pop")
+    entry = find_stash(ctx, target)
+    you = _you()
+    guard_foreign(entry, you, force, "pop")
+    rc = _apply(ctx, entry, options, you)
+    if rc != 0:
+        _say("apply did not succeed, so the stash is kept (as git stash pop does)")
+        return rc
+    rc = drop_by_sha(ctx, entry["sha"])
+    if rc == 0:
+        mark_dropped(ctx, you, entry["sha"])
+    return rc
+
+
+def cmd_drop(args: Sequence[str]) -> int:
+    args, force = _split_flag(args, "--force")
+    ctx = _ctx()
+    target, _options = _one_target(args, "drop")
+    entry = find_stash(ctx, target)
+    you = _you()
+    guard_foreign(entry, you, force, "drop")
+    rc = drop_by_sha(ctx, entry["sha"])
+    if rc == 0:
+        mark_dropped(ctx, you, entry["sha"])
+    return rc
+
+
+VERBS = {"push": cmd_push, "list": cmd_list, "show": cmd_show,
+         "apply": cmd_apply, "pop": cmd_pop, "drop": cmd_drop}
+
+
+def main(argv: Sequence[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0 if argv else 2
+    handler = VERBS.get(argv[0])
+    if handler is None:
+        _say(f"unknown verb {argv[0]!r}; expected one of: {', '.join(VERBS)}")
+        return 2
+    try:
+        return handler(list(argv[1:]))
+    except Refused as exc:
+        _say(str(exc))
+        return 2
+    except ledger.LedgerError as exc:
+        _say(str(exc))
+        return 3
+
+
+if __name__ == "__main__":
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(errors="backslashreplace")
+    raise SystemExit(main(sys.argv[1:]))

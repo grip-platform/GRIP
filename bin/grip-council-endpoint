@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""grip-council-endpoint — expose the GRIP sovereign council as an OpenAI-compat model.
+
+The shim that turns the Pool-B sovereign council (lib/sovereign_council.py) into a
+selectable "provider/model": a POST /v1/chat/completions endpoint whose ONE model
+id ("council" / "sovereign-council") convenes the non-Anthropic council internally
+(fan-out N speakers -> exogenous judge -> sha256 + signed IDR seal) and returns the
+judged synthesis in a standard OpenAI ChatCompletion — so opencode (or any
+OpenAI-compat client) sees one model while a whole sealed council runs behind it.
+
+Design (deliberated 2026-07-13, sovereign-council seal b959faae + gentner gate):
+  - Model id is literally "council"/"sovereign-council" — NOT marketed as "a HAL".
+    The Gentner enforcer DENIED "canonical HAL of the HALs" as a surface analogy
+    (HAL = reactive failover; a council = deliberative exogenous judgment — different
+    causal structures). The narrow, sound mapping (one-request -> N-fan -> single
+    judged reduction, multiplicity hidden behind one interface) is why an
+    OpenAI-compat "council" MODEL slots into the picker at all; the slogan is dropped.
+  - Serves ONLY the council model. Any other id -> 404 with an honest error; it never
+    pretends to route models it does not serve (feature-complete-input-domain.md).
+  - Provider keys resolve in-process via provider_secret (env -> Keychain -> /proc);
+    on the VPS the /proc rung reads the hal-server env. Never printed, never in argv.
+  - Binds 127.0.0.1 by default (a sidecar behind hal-server:3850, never public).
+
+  grip-council-endpoint                 # 127.0.0.1:8791
+  grip-council-endpoint --port 8791 --host 127.0.0.1
+  GRIP_COUNCIL_SPEAKERS=deepseek,gemini,groq GRIP_COUNCIL_JUDGE=gemini-pro grip-council-endpoint
+
+Provenance travels end-to-end: response headers X-Grip-Council-Sha / X-Grip-Idr-Leaf
++ a body x_grip_council block; re-verify any reply with
+`grip-sovereign-council --verify <sha>`.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import sys
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+_ROOT = pathlib.Path(__file__).resolve().parent.parent
+for _p in (str(_ROOT), str(_ROOT / "lib")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from sovereign_council import (  # noqa: E402
+    DEFAULT_JUDGE,
+    DEFAULT_SPEAKERS,
+    REGISTRY,
+    run_council,
+)
+
+COUNCIL_MODEL_IDS = {"council", "sovereign-council"}
+DEFAULT_PORT = 8791  # sidecar port; registered in rules/port-registry.md
+
+
+def _as_text(content) -> str:
+    """OpenAI message content may be a string OR a list of parts. Flatten to text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            p.get("text", "") for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        )
+    return str(content) if content else ""
+
+
+def _prompt_from_messages(messages) -> str:
+    """Last user message -> the council prompt (fall back to the last non-empty msg)."""
+    if not isinstance(messages, list):
+        return ""
+    for m in reversed(messages):
+        if isinstance(m, dict) and m.get("role") == "user" and m.get("content"):
+            return _as_text(m["content"]).strip()
+    for m in reversed(messages):
+        if isinstance(m, dict) and m.get("content"):
+            return _as_text(m["content"]).strip()
+    return ""
+
+
+def _speakers_judge() -> "tuple[list | None, str | None]":
+    """Roster overrides from env, validated against REGISTRY; else the defaults.
+
+    An unknown speaker in GRIP_COUNCIL_SPEAKERS is NOT silently dropped: it is
+    warned loudly to stderr (honest-failure principle, AGORA #3995 R0). If every
+    configured speaker is unknown the roster falls back to the defaults so the
+    council never runs with zero speakers.
+    """
+    spk = os.environ.get("GRIP_COUNCIL_SPEAKERS")
+    speakers = None
+    if spk:
+        requested = [s.strip() for s in spk.split(",") if s.strip()]
+        speakers = [s for s in requested if s in REGISTRY]
+        dropped = [s for s in requested if s not in REGISTRY]
+        if dropped:
+            print(f"[grip-council-endpoint] WARNING: GRIP_COUNCIL_SPEAKERS dropped "
+                  f"unknown speaker(s) {dropped}; running with "
+                  f"{speakers or DEFAULT_SPEAKERS}", file=sys.stderr)
+        speakers = speakers or None  # all-unknown -> defaults, never zero speakers
+    jn = os.environ.get("GRIP_COUNCIL_JUDGE")
+    judge = jn if jn in REGISTRY else None
+    return speakers, judge
+
+
+def council_to_openai(body: dict, *, runner=None) -> "tuple[int, dict, dict]":
+    """Pure request -> (status, OpenAI-compat payload, extra headers).
+
+    ``runner`` is injected (DIP) so tests drive it offline; it defaults to the
+    module-level ``run_council`` resolved at CALL time (so a monkeypatch of
+    ``run_council`` is honoured, not captured once at def-time). A model id outside
+    COUNCIL_MODEL_IDS returns 404 with an honest error — this endpoint serves only
+    the council model and never fakes coverage of others (no-stubs / feature-complete).
+    """
+    runner = runner or run_council
+    model = (body or {}).get("model", "")
+    if model not in COUNCIL_MODEL_IDS:
+        return 404, {"error": {
+            "message": f"model '{model}' is not served by grip-council-endpoint; "
+                       f"this endpoint serves only {sorted(COUNCIL_MODEL_IDS)}",
+            "type": "model_not_found", "code": "model_not_found"}}, {}
+    prompt = _prompt_from_messages((body or {}).get("messages"))
+    if not prompt:
+        return 400, {"error": {
+            "message": "no user message content to deliberate",
+            "type": "invalid_request_error"}}, {}
+
+    speakers, judge = _speakers_judge()
+    out = runner(prompt, speakers, judge)
+    verdict = out["verdict"]
+    content = verdict.get("synthesis") or "(council produced no synthesis)"
+    sha = out["sha"]
+    idr = out.get("idr_id") or ""
+    anthropic_calls = out["record"].get("anthropic_calls", 0)
+    # Honest token ESTIMATE (rough len/4 heuristic) beats a hardcoded 0 that would
+    # mislead a client's budget monitor; flagged usage_estimated in x_grip_council so
+    # no caller mistakes it for a metered count (AGORA #3995 R0).
+    est_prompt = max(1, len(prompt) // 4)
+    est_completion = max(1, len(content) // 4)
+    payload = {
+        "id": f"chatcmpl-{sha[:24]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0, "finish_reason": "stop",
+            "message": {"role": "assistant", "content": content},
+        }],
+        "usage": {"prompt_tokens": est_prompt, "completion_tokens": est_completion,
+                  "total_tokens": est_prompt + est_completion},
+        "x_grip_council": {
+            "sha256": sha,
+            "idr_leaf": idr,
+            "anthropic_calls": anthropic_calls,
+            "best": verdict.get("best"),
+            "judge_model": verdict.get("judge_model"),
+            "speakers_ok": out.get("speakers_ok"),
+            "usage_estimated": True,
+            "sealed": True,
+            "reverify": f"grip-sovereign-council --verify {sha[:16]}",
+        },
+    }
+    headers = {
+        "X-Grip-Council-Sha": sha,
+        "X-Grip-Idr-Leaf": idr or "none",
+        "X-Grip-Anthropic-Calls": str(anthropic_calls),
+    }
+    return 200, payload, headers
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "grip-council-endpoint/1.0"
+
+    def _send(self, status: int, payload: dict, headers: "dict | None" = None) -> None:
+        raw = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler contract)
+        if self.path.rstrip("/") == "/health":
+            self._send(200, {"ok": True, "service": "grip-council-endpoint",
+                             "models": sorted(COUNCIL_MODEL_IDS), "pool": "B", "anthropic_calls": 0})
+        else:
+            self._send(404, {"error": {"message": "not found", "type": "not_found"}})
+
+    def do_POST(self):  # noqa: N802
+        if self.path.rstrip("/") != "/v1/chat/completions":
+            self._send(404, {"error": {"message": f"no route {self.path}", "type": "not_found"}})
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            self._send(400, {"error": {"message": "invalid JSON body", "type": "invalid_request_error"}})
+            return
+        try:
+            status, payload, headers = council_to_openai(body)
+        except Exception as e:  # noqa: BLE001 — a dead council must not crash the server
+            self._send(502, {"error": {"message": f"council failed: {type(e).__name__}: {e}",
+                                       "type": "upstream_error"}})
+            return
+        self._send(status, payload, headers)
+
+    def log_message(self, *args):  # noqa: A002 — silence per-request stderr spam
+        pass
+
+
+def main(argv: "list | None" = None) -> int:
+    ap = argparse.ArgumentParser(prog="grip-council-endpoint", description=__doc__.splitlines()[0])
+    ap.add_argument("--port", type=int,
+                    default=int(os.environ.get("GRIP_COUNCIL_ENDPOINT_PORT", DEFAULT_PORT)))
+    ap.add_argument("--host", default=os.environ.get("GRIP_COUNCIL_ENDPOINT_HOST", "127.0.0.1"))
+    ns = ap.parse_args(argv)
+    srv = ThreadingHTTPServer((ns.host, ns.port), Handler)
+    print(f"grip-council-endpoint: POST http://{ns.host}:{ns.port}/v1/chat/completions "
+          f"(model in {sorted(COUNCIL_MODEL_IDS)}, speakers={DEFAULT_SPEAKERS}, judge={DEFAULT_JUDGE}) "
+          f"· Pool-B · sealed · GET /health", file=sys.stderr)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        srv.shutdown()
+    return 0
+
+
+if __name__ == "__main__":
+    # This shebang is `/usr/bin/env python3`, which need not be an interpreter
+    # that can dual-sign. Without this the tool still runs and still records --
+    # it just writes a forgeable demo-sealed record when a real seal was one
+    # interpreter away (lib/pq_reexec.py).
+    #
+    # Imported as top-level `pq_reexec` off THIS checkout, never as
+    # `lib.pq_reexec`: by now `lib` may already be bound to another tree's
+    # package, and the import would miss the file or read another branch's copy.
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "lib"))
+    from pq_reexec import reexec_if_incapable as _reexec
+
+    _reexec(_Path(__file__))
+    raise SystemExit(main())

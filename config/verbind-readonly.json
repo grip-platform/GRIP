@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "doc": "The operations a Verbind v1 binding may target (docs/VERBIND.md, decision 4: bound only to existing read-only operations). Allowlist, never denylist: an operation is bindable only if it is named here, still exists in the catalogue, and -- for an agent -- declares only Read, Grep and Glob in its frontmatter, which lib/verbind/catalogue.readonly_operations checks at run time. A skill declares no enforced tools, so each skill entry is a reviewed claim and its why says what the review found. Excluded after review: meter (may shell out to npx), view-changelog (writes a last-viewed marker), llm-usage (touches a signed usage ledger). Add an entry only after reading the skill and finding no write path.",
+  "entries": [
+    {"kind": "skill", "slug": "check-reachable", "why": "Runs lib/skill_reachability.py, which only prints the skill, mode and agent catalogue."},
+    {"kind": "skill", "slug": "chat-history-search", "why": "Runs lib/history_search.py over the operator's own local session history and prints matches."},
+    {"kind": "skill", "slug": "kono-memory", "why": "Its documented subcommands (dashboard, compact-stats, session-summary) print statistics."},
+    {"kind": "skill", "slug": "grip-haiku", "why": "Deterministic render of the genome snapshot to a haiku; no network, no writes."},
+    {"kind": "skill", "slug": "aegis", "why": "Renders the safety-gate roster; --live only reads existing logs."},
+    {"kind": "skill", "slug": "plain-language", "why": "Rewrites text into plain English; it acts on nothing outside the reply."},
+    {"kind": "skill", "slug": "truth-lens", "why": "Renders an existing probe result JSON as a card; no LLM, no network."},
+    {"kind": "agent", "slug": "dependency-guardian", "why": "Declared tools: Glob, Grep, Read."},
+    {"kind": "agent", "slug": "design-reviewer", "why": "Declared tools: Read, Grep, Glob."},
+    {"kind": "agent", "slug": "dry-kiss-enforcer", "why": "Declared tools: Read, Grep."},
+    {"kind": "agent", "slug": "gentner-enforcer", "why": "Declared tools: Read, Grep."},
+    {"kind": "agent", "slug": "grasp-enforcer", "why": "Declared tools: Read, Grep."},
+    {"kind": "agent", "slug": "solid-enforcer", "why": "Declared tools: Read, Grep."},
+    {"kind": "agent", "slug": "yagni-enforcer", "why": "Declared tools: Read."}
+  ]
+}

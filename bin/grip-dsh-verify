@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# grip-dsh-verify — prove that a DeepSeek Harness profile can load its plugin tree.
+#
+# A composed configuration does not import plugins, so it cannot expose a
+# missing runtime dependency. This separate command performs a real, bounded
+# boot while keeping verification off the normal launcher path.
+#
+# Usage: grip-dsh-verify [<profile>]      default: web
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROBE="$SCRIPT_DIR/../lib/dsh_boot_probe.py"
+
+# GRIP's dependencies live in its venv. The shared-tree fallbacks matter when
+# CLAUDE_DIR names a worktree, because worktrees do not carry their own venv.
+# resolve_venv_python knows both layouts (Windows Scripts/python.exe, POSIX
+# bin/python3) but falls back to the SYSTEM python, so a candidate counts only
+# inside its own venv.
+source "$SCRIPT_DIR/../scripts/lib/venv-utils.sh"
+for venv in "$CLAUDE_DIR/venv" "$HOME/.grip/venv" "$HOME/.claude/venv"; do
+    candidate="$(resolve_venv_python "$venv" || true)"
+    [[ "$candidate" == "$venv/"* ]] && PY="$candidate" && break
+done
+if [[ -z "${PY:-}" ]]; then
+    >&2 echo "[grip-dsh-verify] no GRIP venv found; system python3 is not used."
+    >&2 echo "[grip-dsh-verify] looked in: \$CLAUDE_DIR/venv, ~/.grip/venv, ~/.claude/venv"
+    exit 2
+fi
+
+if [[ ! -r "$PROBE" ]]; then
+    >&2 echo "[grip-dsh-verify] boot probe is not readable: $PROBE"
+    exit 2
+fi
+
+exec "$PY" "$PROBE" "$@"

@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""aide-ideate — AIDE's overnight ideation + prediction digest loop.
+
+Runs the predictive substrate on a schedule (launchd: every 4h, mirrors the
+overnight-loop cadence). Each run:
+
+1. ABSORB  — learns routines from the decision-log timestamps + recorded
+   rituals (RoutineLearner / PreferenceLearner), so AIDE tracks what happens.
+2. PREDICT — PrecogEngine.predict(horizon_hours=48): falsifiable predictions
+   from learned cadences + registered forecasts.
+3. SURFACE — posts the attention digest to Slack (codetonight workspace,
+   #daily-chat) ONLY when there is something to say: due predictions, due
+   routines, or overdue-ungraded predictions needing judgment.
+
+Honest by construction: predictions carry falsifiers + confidence; nothing is
+invented. Grades are never auto-written — an ungraded prediction is surfaced
+for human judgment instead.
+
+Usage:
+    aide-ideate [--horizon 48] [--slack] [--dry-run]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR", Path.home() / ".claude"))
+if str(CLAUDE_DIR) not in sys.path:
+    sys.path.insert(0, str(CLAUDE_DIR))
+
+from lib.aide.adaptive_engine import PreferenceLearner, RoutineLearner, PredictionRegistry  # noqa: E402
+from lib.aide.precog import PrecogEngine  # noqa: E402
+
+DECISION_LOG = CLAUDE_DIR / "data" / "aide" / "decision-log.jsonl"
+RITUALS_DIR = CLAUDE_DIR / "data" / "aide" / "rituals"
+SLACK_CHANNEL = "C0EXAMPLE01"  # #daily-chat, codetonight workspace
+SLACK_WORKSPACE = "codetonight"
+
+# REVERSIBLE (dojo-v2, 2026-10-01): #daily-chat is now tip-of-the-day, so Aide
+# no longer posts its attention digest there. Set back to True to re-enable.
+SLACK_POST_ENABLED = False
+
+
+def _absorb_activity(now: datetime) -> dict:
+    """Learn routines from decision-log timestamps + ritual run history."""
+    learned = {"decisions_seen": 0, "ritual_runs": 0}
+    learner = RoutineLearner()
+
+    # 1. Decision-log timestamps → routine sightings by hour-of-day
+    if DECISION_LOG.exists():
+        hour_counts: dict[int, int] = {}
+        for line in DECISION_LOG.read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+                ts = rec.get("timestamp", "")
+                if not ts:
+                    continue
+                hour = datetime.fromisoformat(ts).hour
+                hour_counts[hour] = hour_counts.get(hour, 0) + 1
+                learned["decisions_seen"] += 1
+            except (json.JSONDecodeError, ValueError):
+                continue
+        # Learn only the strongest rhythms — top 3 hours with >= 3 sightings.
+        # Anything less is noise, and flooding the learner with 20 hourly
+        # "routines" would flood the digest with near-identical predictions.
+        for hour, count in sorted(hour_counts.items(), key=lambda kv: -kv[1])[:3]:
+            if count >= 3:
+                learner.record(
+                    f"decision-work-{hour:02d}h",
+                    cadence="weekday", hour_local=hour,
+                )
+
+    # 2. Ritual run history → routine sightings
+    if RITUALS_DIR.exists():
+        for rf in sorted(RITUALS_DIR.glob("*.json*")):
+            try:
+                data = json.loads(rf.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            runs = data.get("runs") if isinstance(data, dict) else None
+            if not runs:
+                continue
+            learned["ritual_runs"] += len(runs)
+            last = runs[-1]
+            ts = last.get("timestamp") or last.get("completed_at") or ""
+            if ts:
+                try:
+                    learner.record(
+                        f"ritual-{rf.stem}",
+                        cadence="daily", hour_local=datetime.fromisoformat(ts).hour,
+                    )
+                except ValueError:
+                    pass
+
+    return learned
+
+
+def _digest(horizon_hours: int, now: datetime) -> dict:
+    """Compose the attention digest: predictions + due routines + overdue grades."""
+    engine = PrecogEngine()
+    preds = engine.predict(horizon_hours=horizon_hours)
+
+    # Due routines in the horizon (confidence >= 0.5)
+    routines = [r for r in RoutineLearner().all() if r.confidence >= 0.5]
+
+    # Overdue ungraded predictions → need human judgment
+    overdue: list[dict] = []
+    for r in PredictionRegistry().all(limit=200):
+        if r.get("outcome") is not None:
+            continue
+        check = r.get("check_at_utc", "")
+        if check:
+            try:
+                if datetime.fromisoformat(check) < now:
+                    overdue.append(r)
+            except ValueError:
+                continue
+
+    return {"predictions": preds, "routines": routines, "overdue": overdue}
+
+
+def _slack_post(text: str, blocks: list | None = None) -> dict:
+    from lib.slack_transport import post
+    return post(workspace=SLACK_WORKSPACE, channel_id=SLACK_CHANNEL,
+                text=text, blocks=blocks)
+
+
+def _clip(s: str, n: int = 90) -> str:
+    """Clip to n chars at a word boundary; never split mid-sentence."""
+    s = " ".join(s.split())
+    if len(s) <= n:
+        return s
+    return s[:n].rsplit(" ", 1)[0].rstrip(",.;:") + "…"
+
+
+def _render_text(d: dict, now: datetime) -> str:
+    """One-line plain fallback (Slack always wants a text param)."""
+    preds, routines, overdue = d["predictions"], d["routines"], d["overdue"]
+    n = len(preds) + len(routines) + len(overdue)
+    if n == 0:
+        return ""
+    bits = []
+    if preds:
+        bits.append(f"{len(preds)} expectation{'s' if len(preds) != 1 else ''}")
+    if routines:
+        bits.append(f"{len(routines)} rhythm{'s' if len(routines) != 1 else ''}")
+    if overdue:
+        bits.append(f"{len(overdue)} overdue need{'s' if len(overdue) == 1 else ''} your call")
+    line = "AIDE digest: " + ", ".join(bits)
+    if preds:
+        line += f" — top: {_clip(preds[0].claim, 55)}"
+    return line
+
+
+def _render_blocks(d: dict, now: datetime) -> list:
+    """Neat Block Kit digest: plain language, one tldr fact per item."""
+    preds = sorted(d["predictions"], key=lambda p: -p.confidence)
+    routines = sorted(d["routines"], key=lambda r: -r.confidence)
+    overdue = d["overdue"]
+    blocks: list = [
+        {"type": "header",
+         "text": {"type": "plain_text", "text": ":sunrise: AIDE attention digest", "emoji": True}},
+    ]
+
+    # tldr summary line
+    bits = []
+    if preds:
+        bits.append(f"{len(preds)} expectation{'s' if len(preds) != 1 else ''}")
+    if routines:
+        bits.append(f"{len(routines)} rhythm{'s' if len(routines) != 1 else ''}")
+    if overdue:
+        bits.append(f"{len(overdue)} overdue need{'s' if len(overdue) == 1 else ''} your call")
+    summary = "Nothing needs you right now. Quiet." if not bits else (
+        "Next 48h: " + ", ".join(bits) + "."
+    )
+    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f":sparkles: {summary}"}})
+
+    if preds:
+        blocks.append({"type": "divider"})
+        # Group routine-derived predictions (one per hour) into ONE line each;
+        # hand-registered predictions (source != "routine") get individual cards.
+        routines_seen: dict = {}
+        individual: list = []
+        for p in preds:
+            # Routine-derived forecasts are registered by PrecogEngine and come
+            # back with source="upcoming", so classify by the claim's shape:
+            # routine forecasts start with "Routine '...'".
+            if p.claim.startswith("Routine '"):
+                key = p.claim.split("'")[1] if "'" in p.claim else p.claim
+                routines_seen.setdefault(key, []).append(p)
+            else:
+                individual.append(p)
+
+        # Only meaningful when there is at least one real prediction; pure
+        # routine noise alone stays in the rhythms section, not here.
+        if individual or len(routines_seen) == 1:
+            if individual:
+                blocks.append({
+                    "type": "section",
+                    "text": {"type": "mrkdwn",
+                             "text": f":crystal_ball: *What AIDE expects* ({len(individual)})"},
+                })
+                for p in individual[:4]:
+                    blocks.append({
+                        "type": "section",
+                        "fields": [
+                            {"type": "mrkdwn",
+                             "text": f"*{_clip(p.claim, 70)}*\n_How you'd know it's wrong:_ {_clip(p.falsifier, 70)}"},
+                            {"type": "mrkdwn",
+                             "text": f":clock1: check {p.check_at_utc[:16]}\n:bar_chart: {p.confidence:.0%} sure"},
+                        ],
+                    })
+                    # Grade buttons — only on ungraded predictions; the pid
+                    # travels in value, action_id stays fixed for the handler.
+                    if getattr(p, "outcome", None) is None:
+                        blocks.append({
+                            "type": "actions",
+                            "elements": [
+                                {"type": "button",
+                                 "text": {"type": "plain_text", "text": ":white_check_mark: Confirmed", "emoji": True},
+                                 "style": "primary",
+                                 "action_id": "grade_confirmed",
+                                 "value": str(p.pid)},
+                                {"type": "button",
+                                 "text": {"type": "plain_text", "text": ":x: Falsified", "emoji": True},
+                                 "style": "danger",
+                                 "action_id": "grade_falsified",
+                                 "value": str(p.pid)},
+                            ],
+                        })
+            if routines_seen:
+                rlines = []
+                for name, plist in sorted(routines_seen.items()):
+                    hours = sorted({p.check_at_utc[11:16] for p in plist})
+                    rlines.append(f"• {_clip(name, 40)} — next: {', '.join(hours[:3])} UTC ({len(plist)} in 48h)")
+                blocks.append({
+                    "type": "section",
+                    "text": {"type": "mrkdwn",
+                             "text": f":repeat: *Rhythms in the next 48h* ({len(routines_seen)})\n" + "\n".join(rlines)},
+                })
+
+    if overdue:
+        blocks.append({"type": "divider"})
+        lines = []
+        for r in overdue[:5]:
+            lines.append(f"• {r['pid']}: {_clip(r['claim'], 65)}")
+        if len(overdue) > 5:
+            lines.append(f"…and {len(overdue) - 5} more")
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn",
+                     "text": f":rotating_light: *Overdue — your call* ({len(overdue)})\n" + "\n".join(lines)},
+        })
+
+    blocks.append({"type": "context", "elements": [
+        {"type": "mrkdwn",
+         "text": f":robot_face: AIDE · learned from {d.get('_absorbed', 0)} decisions · {now.strftime('%Y-%m-%d %H:%M UTC')}"},
+    ]})
+    return blocks
+
+
+def _render(d: dict, now: datetime) -> str:
+    """Legacy plain-text render — kept for --dry-run readability."""
+    lines = [f"AIDE attention digest — {now.strftime('%Y-%m-%d %H:%M UTC')}"]
+    preds = d["predictions"]
+    if preds:
+        lines.append(f"\n*Predictions ({len(preds)}):*")
+        for p in preds:
+            lines.append(
+                f"  • [{p.pid}] ({p.confidence:.0%}) {p.claim}\n"
+                f"      falsifier: {p.falsifier}\n"
+                f"      check: {p.check_at_utc}"
+            )
+    routines = d["routines"]
+    if routines:
+        lines.append(f"\n*Routines active ({len(routines)}):*")
+        for r in routines:
+            lines.append(f"  • {r.name} ({r.cadence} @{r.hour_local:02d}h, conf {r.confidence:.0%})")
+    overdue = d["overdue"]
+    if overdue:
+        lines.append(f"\n*Overdue predictions needing your judgment ({len(overdue)}):*")
+        for r in overdue[:10]:
+            lines.append(f"  • {r['pid']}: {r['claim']}")
+    if not (preds or routines or overdue):
+        return ""
+    return "\n".join(lines)
+
+
+def main(argv: list | None = None) -> int:
+    ap = argparse.ArgumentParser(description="AIDE ideation + prediction digest")
+    ap.add_argument("--horizon", type=int, default=48)
+    ap.add_argument("--slack", action="store_true", help="post digest to Slack")
+    ap.add_argument("--dry-run", action="store_true", help="print digest, do not post")
+    args = ap.parse_args(argv)
+
+    now = datetime.now(timezone.utc)
+
+    # Auto-grade due predictions BEFORE digesting. The digest reads the registry
+    # for "overdue needing your call" — so grading must happen first, else the
+    # digest can surface predictions the machine just graded.
+    grading = None
+    try:
+        from lib.aide.autograder import auto_grade
+        grading = auto_grade(now)
+    except Exception as exc:  # noqa: BLE001 — grading is a bonus, never a blocker
+        print(f"[aide-ideate] autograde skipped: {exc}")
+
+    absorbed = _absorb_activity(now)
+    digest = _digest(args.horizon, now)
+    digest["_absorbed"] = absorbed.get("decisions_seen", 0)
+
+    if grading is not None:
+        print(f"[aide-ideate] autograde={grading['graded']} graded "
+              f"({grading['confirmed']} confirmed / {grading['falsified']} falsified) "
+              f"mech={grading['mechanical']} sem={grading['semantic']} "
+              f"human={grading['left_for_human']}")
+    print(f"[aide-ideate] absorbed={absorbed}")
+    print(f"[aide-ideate] predictions={len(digest['predictions'])} "
+          f"routines={len(digest['routines'])} overdue={len(digest['overdue'])}")
+
+    text = _render_text(digest, now)
+    if not text:
+        print("[aide-ideate] nothing to surface — quiet night.")
+        return 0
+
+    if args.dry_run:
+        print(_render(digest, now))
+        print("\n--- Slack blocks ---")
+        print(json.dumps(_render_blocks(digest, now), indent=1))
+        return 0
+
+    if not SLACK_POST_ENABLED:
+        print("[aide-ideate] #daily-chat posting disabled (SLACK_POST_ENABLED=False); not posting.")
+        return 0
+
+    result = _slack_post(text, blocks=_render_blocks(digest, now))
+    if result.get("ok"):
+        print(f"[aide-ideate] posted to Slack ts={result.get('ts')}")
+        return 0
+    print(f"[aide-ideate] Slack post failed: {result.get('error')}")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

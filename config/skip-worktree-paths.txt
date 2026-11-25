@@ -1,0 +1,45 @@
+# Paths that carry the git skip-worktree bit on every clone.
+#
+# WHAT THE BIT DOES. It tells git "the working-tree copy is intentionally ahead
+# of HEAD -- do not touch this file, and do not report it as modified." The file
+# stays tracked, so a fresh clone still receives it; an explicit `git add` still
+# works when a version genuinely needs committing.
+#
+# WHY THESE FILES. Every path below is an append-only accumulator that a running
+# GRIP process writes to continuously. Without the bit they are dirty within
+# minutes of any clone, forever, which is not cosmetic: a permanently-dirty tree
+# is one `grip-tree-sync` refuses to merge (GRIP#6346), and it trains everyone to
+# ignore the dirty warning -- the same warning that protects real uncommitted
+# work.
+#
+# WHY A LIST RATHER THAN A GLOB. It used to be the glob `learning/*.jsonl`,
+# written when every accumulator lived in that one directory. They no longer do:
+# measured on the shared tree 2026-09-22, five of them had moved to `data/` and
+# to the repo root, and each was permanently dirty because the glob could not
+# reach it. A declared list is reviewable and cannot quietly stop covering a file
+# that moves.
+#
+# WHAT IS DELIBERATELY NOT HERE.
+#   * Sealed records and eval artefacts (docs/measurements/seals/*.idr.jsonl,
+#     eval/results*.jsonl). They are .jsonl and they are written once. Setting
+#     the bit means git stops updating them on pull, so a stale local seal would
+#     silently disagree with the one everyone else verifies against.
+#   * Regenerated JSON state (data/genome-shared.json,
+#     apps/grip-web/public/snapshot.json, data/aide/company.json). These are
+#     rewritten wholesale rather than appended, so "the working copy is ahead of
+#     HEAD" is not true of them, and never receiving an upstream update is a
+#     real risk rather than the point. They need their own decision.
+#
+# Blank lines and lines starting with # are ignored. Globs expand; a pattern
+# matching nothing is not an error, because the file may not exist yet on a
+# fresh clone.
+
+# The original accumulator directory.
+learning/*.jsonl
+
+# The same class, living elsewhere. Each is appended to by the module named.
+data/converge-fixed-points.jsonl      # lib/gate_heuristics.py
+data/dispatch-failures.jsonl          # hooks/agent-dispatch-validator-hook.py
+data/dispatch-failures-debug.jsonl    # hooks/agent-dispatch-validator-hook.py
+data/risc-history.jsonl               # lib/risc_pattern_validator.py
+skill-usage.jsonl                     # lib/rsi_auto_collector.py

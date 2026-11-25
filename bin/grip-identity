@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""grip-identity — the session-start gate: prove a session knows it is GRIP.
+
+WHY THIS EXISTS
+    Measured 2026-09-17: a cold-started OpenCode session with no GRIP identity
+    and no doctrine took a stale file path and reconstructed *intent* from it —
+    concluded the operator was deceiving it, then lectured him for hours. That
+    is the exact inversion of the rule this whole system is built on: *the
+    mirror yields to the operator*. The failure was context-loading, not the
+    operator.
+
+    A ladder of three sessions on the same handoff proved it: the two with
+    context loaded behaved; the one without spun out. So the precondition is
+    mechanical, not a scolding: a session that cannot show it loaded the
+    identity + doctrine must flag itself before reasoning onward.
+
+USAGE
+    grip-identity --emit      print the identity block (harness injects at start)
+    grip-identity --check     exit 0 when identity sources are present/readable
+    grip-identity --mark      record that this session loaded identity
+    grip-identity --is-marked exit 0 when the marker exists
+
+The marker is advisory evidence, not enforcement — a harness that does not call
+the gate cannot be forced. Enforcement belongs in the harness/hook seam; this
+script is the primitive every seam can call. Exit 1 on --check means: the
+session has NOT been told it is GRIP, and proceeding is the failure mode above.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+GRIP_DIR = Path(os.environ.get("CLAUDE_DIR") or os.path.expanduser("~/.grip"))
+STATE_DIR = GRIP_DIR / "state" / "session"
+MARKER = STATE_DIR / "identity-loaded.json"
+
+#: The identity block, compact. AGENTS.md / CLAUDE.md are the authority; this is
+#: the minimum a cold session must absorb before it may reason about a matter.
+IDENTITY_BLOCK = """\
+You are GRIP (General Reasoning & Intelligence Platform) — the operator's own
+system: his machine, his record, his matter. You stand BESIDE the operator, not
+outside him. Your instruction files are ~/.grip/AGENTS.md and ~/.grip/CLAUDE.md.
+
+The four rules that govern every matter, and that a cold session must absorb
+before it reasons or concludes ANYTHING:
+
+1. Contradictions, never "lies". A dated statement against a dated statement is
+   findable. Intent is not established by text.
+2. Both sides, always. Report every countable measure for both parties, including
+   where it does not help the operator.
+3. The mirror yields to the operator. The record is PARTIAL (WhatsApp only, no
+   calls, a bounded window, authorised threads). When the operator says
+   something the record does not show, the mirror is wrong, blind or too young.
+   ASK him. NEVER correct him. Concluding the operator is deceiving you is not
+   reachable from partial evidence; the only move from ambiguity is a question.
+4. Verify-canonical, never claimed. Trust the record and a live probe, not a
+   summary, a label, or your own inference. A stale path is a stale path — a
+   fact to check, never evidence of intent.
+
+If you cannot show that you loaded these, say so, and do not proceed.
+"""
+
+
+def identity_sources_present() -> bool:
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        path = GRIP_DIR / name
+        if not path.is_file() or path.stat().st_size == 0:
+            return False
+    return True
+
+
+def mark_loaded() -> None:
+    import json
+    import time
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    MARKER.write_text(json.dumps({
+        "loaded_at": int(time.time()),
+        "sources": ["AGENTS.md", "CLAUDE.md"],
+    }, indent=1) + "\n", encoding="utf-8")
+
+
+def is_marked() -> bool:
+    return MARKER.is_file()
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--emit", action="store_true")
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("--mark", action="store_true")
+    ap.add_argument("--is-marked", action="store_true")
+    a = ap.parse_args(argv)
+
+    if a.emit:
+        print(IDENTITY_BLOCK, end="")
+        return 0
+    if a.mark:
+        mark_loaded()
+        print(f"identity marked loaded for {GRIP_DIR}")
+        return 0
+    if a.is_marked:
+        return 0 if is_marked() else 1
+    if a.check:
+        ok = identity_sources_present()
+        if not ok:
+            print(f"GRIP identity sources missing/unreadable in {GRIP_DIR}: "
+                  "AGENTS.md and CLAUDE.md must be present — the session has not "
+                  "been told it is GRIP", file=sys.stderr)
+            return 1
+        print(f"GRIP identity sources present in {GRIP_DIR}")
+        return 0
+
+    ap.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

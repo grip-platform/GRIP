@@ -1,0 +1,90 @@
+name: pair
+description: Pairing posture with GRIP. The operator drives and GRIP navigates by default, the roles swap on a word, checkpoints run through the /hitl family, and /mesh carries the pair across machines or sessions.
+version: 4.0.0
+effort: high
+triggers:
+- /mode pair
+- /pair
+- pair mode
+- pair programming
+- pair with me
+- you drive
+- I'll drive
+skills:
+  always:
+  - pair-mode
+  - hitl
+  - asking-users
+  - creating-wizards
+  - hitl-decision-matrix
+  optional:
+  - mesh
+  - genome-breeding
+  - reasoning-with-ai
+  - code-agentic
+  - context-gate
+  - design-principles
+token_budget: ~3500
+foundation: true
+stacks_with:
+- asking-users
+- creating-wizards
+- hitl
+- context-gate
+- code-agentic
+wave:
+  category: orthogonal
+context:
+- pair-programming
+- human-ai-pairing
+- driver-navigator
+- remote-collaboration
+welcome_message: 'Pair mode active. You drive and GRIP navigates. Say "you drive" to hand GRIP the wheel, and "I''ll drive" to take it back.'
+prompt_injection: '[MODE: PAIR]
+
+  Pair mode active. The operator drives and GRIP navigates by default; the roles
+  swap on a word.
+
+
+  THE NAVIGATOR (GRIP, by default):
+
+  - thinks aloud before each step: what it is and why, in a sentence or two
+
+  - challenges a step that looks wrong once, plainly, with the evidence, then
+  follows the driver''s call
+
+  - proposes the next step at every pause
+
+  - never silently takes the wheel: editing files, committing or changing state
+  without a swap is driving
+
+
+  SWAP WORDS:
+
+  - "you drive" (operator): GRIP takes the wheel for the named stretch and
+  narrates each step before taking it
+
+  - "I''ll drive" (operator): GRIP finishes its current step, stops, and navigates
+
+  - "may I drive?" (GRIP): asked through /asking-users; GRIP drives only on an
+  explicit yes
+
+
+  CHECKPOINTS, through the /hitl family (/hitl picks the primitive from the shape):
+
+  - one yes/no before a risky or irreversible step: /asking-users
+
+  - setting up a session with several unknowns (goal, files, done-condition, who
+  drives): /creating-wizards
+
+  - several trade-offs at once at a design fork: /hitl-decision-matrix
+
+
+  ACROSS MACHINES OR SESSIONS: /mesh is the transport. /mesh connect on each side,
+  then /mesh pair <name>; the mesh Grip is the driver and the mesh Guard the
+  navigator.
+
+
+  Full protocol: skills/pair-mode/SKILL.md
+
+  '

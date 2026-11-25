@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""grip-quote-check -- check quotes against the text a web page serves, word for word.
+
+  grip-quote-check find URL "QUOTE" ["QUOTE" ...]   FOUND (visible|raw) or NOT FOUND per quote
+  grip-quote-check text URL [--grep REGEX] [--raw]  the page's visible text, or raw-text matches
+  grip-quote-check check ROWS.json OUT.json         check every row's quote on its url
+
+No model is involved. A page that keeps its text in script data shows almost no
+visible text; the tool says so, and its quotes are still found in the raw text.
+Exit codes: 0 all found, 1 a quote not found or nothing to check, 2 a page could not
+be fetched (and no quote was missing), 64 usage.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from lib import quote_check as qc  # noqa: E402
+
+_SCRIPT_NOTE = ("note: this page keeps its text in script data ({visible_chars} visible "
+                "characters, {raw_chars} raw); quotes are checked against the raw text too, "
+                "and `text --raw --grep` searches it")
+_RAW_MATCH_CAP = 50
+
+
+class _Parser(argparse.ArgumentParser):
+    """argparse exits 2 on a usage error; this tool keeps 2 for a page it could not
+    fetch, so usage errors exit 64 as the docstring says (AGORA on GRIP#9581)."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        raise SystemExit(64)
+
+
+def _fetch_or_exit(url: str) -> str:
+    try:
+        return qc.fetch(url)
+    except Exception as exc:  # noqa: BLE001 -- reported to the operator, exit 2
+        print(f"FETCH FAILED: {type(exc).__name__}: {str(exc)[:160]}", file=sys.stderr)
+        raise SystemExit(2)
+
+
+def _note_if_rendered(raw: str) -> None:
+    report = qc.page_report(raw)
+    if report["script_rendered"]:
+        print(_SCRIPT_NOTE.format(**report), file=sys.stderr)
+
+
+def cmd_find(args) -> int:
+    raw = _fetch_or_exit(args.url)
+    _note_if_rendered(raw)
+    visible, everything = qc.haystacks(raw)
+    missing = 0
+    for quote in args.quotes:
+        where = qc.where_found(quote, visible, everything)
+        print(f"FOUND ({where}): {quote[:160]}" if where else f"NOT FOUND: {quote[:160]}")
+        missing += 0 if where else 1
+    return 1 if missing else 0
+
+
+def _raw_matches(raw: str, pattern: str) -> list:
+    text = qc.haystacks(raw)[1]
+    return [text[max(m.start() - 160, 0): m.end() + 160]
+            for m in re.finditer(pattern, text, re.I)]
+
+
+def cmd_text(args) -> int:
+    raw = _fetch_or_exit(args.url)
+    _note_if_rendered(raw)
+    if args.raw:
+        matches = _raw_matches(raw, args.grep or ".{0,400}")
+        if len(matches) > _RAW_MATCH_CAP:  # no silent caps
+            print(f"note: showing {_RAW_MATCH_CAP} of {len(matches)} raw matches", file=sys.stderr)
+        lines = matches[:_RAW_MATCH_CAP]
+    else:
+        lines = qc.visible_lines(raw)
+        if args.grep:
+            lines = [line for line in lines if re.search(args.grep, line, re.I)]
+    print("\n".join(lines))
+    return 0
+
+
+def _check_exit(result: dict) -> int:
+    """0 only when every row was found; 2 when the rest only failed to fetch; 1 for a
+    missing quote, an empty check (AGORA on GRIP#9581) or any status this tool does not
+    know, so a new status can never read as success (AGORA on GRIP#9600)."""
+    statuses = set(result)
+    if statuses and statuses <= {qc.FOUND}:
+        return 0
+    if statuses and statuses <= {qc.FOUND, qc.FETCH_FAILED}:
+        return 2
+    return 1
+
+
+def cmd_check(args) -> int:
+    result = qc.check_file(args.rows, args.out)
+    print(json.dumps(result))
+    if not result:
+        print("nothing checked: the rows list is empty", file=sys.stderr)
+    return _check_exit(result)
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = _Parser(prog="grip-quote-check", description=__doc__,
+                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+    find = sub.add_parser("find", help="check quotes on one page")
+    find.add_argument("url")
+    find.add_argument("quotes", nargs="+")
+    find.set_defaults(func=cmd_find)
+    text = sub.add_parser("text", help="print a page's visible text, or raw-text matches")
+    text.add_argument("url")
+    text.add_argument("--grep", help="only lines (or raw matches) matching this regex, ignoring case")
+    text.add_argument("--raw", action="store_true", help="search the raw text, scripts included")
+    text.set_defaults(func=cmd_text)
+    check = sub.add_parser("check", help="check every row of a rows JSON file")
+    check.add_argument("rows")
+    check.add_argument("out")
+    check.set_defaults(func=cmd_check)
+    return parser
+
+
+def main(argv=None) -> int:
+    args = _parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

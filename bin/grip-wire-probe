@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""grip-wire-probe -- InfiniteMachine v2 Step-1 wire probe (thin CLI).
+
+A thin front door over ``lib/wire_probe.py``. It passes the operator's argv
+straight through to ``wire_probe.main`` (which owns the argparse surface, so
+``--arm``, ``--case``, ``--wait`` and ``--json`` reach the actor that acts on
+them), and propagates its exit code.
+
+Usage:
+    grip-wire-probe --arm {base-url,direct,tunnel,intercept} --case <name>
+                    [--wait S] [--json]
+
+This harness only probes; the operator runs the live arms. See the module
+docstring in lib/wire_probe.py for the arms, the cases, and the login-isolation
+and redaction guarantees.
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+from wire_probe import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

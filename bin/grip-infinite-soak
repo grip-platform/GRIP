@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Read-only InfiniteMachine T4 report; see --help for scope and windows."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from infinite_soak import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main())

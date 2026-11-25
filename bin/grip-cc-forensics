@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+"""grip-cc-forensics — enumerate every in-flight Claude Code task and
+regenerate the always-ready harness handover.
+
+Deterministic, stdlib-only, no network, no LLM. One command for the three jobs:
+
+    grip-cc-forensics --scan            print the inventory as JSON
+    grip-cc-forensics --regenerate      rewrite drafts/HARNESS-HANDOVER-CANONICAL.md
+    grip-cc-forensics --verify [--fields]
+                                        exit 0 iff the doc covers every item
+                                        a fresh scan discovers (--fields: and
+                                        every session section carries the four
+                                        recovery fields)
+
+Fail-closed by construction: --verify re-scans and compares, it never trusts
+the doc's own claims. A stale or partial handover fails the check loudly.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR", str(Path.home() / ".claude"))).resolve()
+WORKTREES = Path.home() / ".grip-worktrees"
+DOC = CLAUDE_DIR / "drafts" / "HARNESS-HANDOVER-CANONICAL.md"
+STALE = CLAUDE_DIR / "drafts" / "HANDOVER-STALE"
+# Product repos whose unmerged branches are also CC work surfaces. Missing
+# dirs are skipped silently — the kernel must not fail on a machine that
+# does not carry them.
+PRODUCT_REPOS = {
+    "antepaste": str(Path.home() / "CodeTonight" / "antepaste"),
+    "twr": str(Path.home() / "CodeTonight" / "twr"),
+}
+LIMIT_PAT = re.compile(r"(session limit|weekly limit|usage-credits|resets .*SAST|rate limit)", re.I)
+BOT_PREFIX = ("chlog/pr-", "dependabot/", "origin/HEAD", "origin/main")
+SNIP = 160
+# Tail-read geometry. 64 KB covers most transcripts' last 200 lines in one
+# read; the growth factor bounds the re-read cost for the long-record files
+# that need more (measured: 1.6 GB total against a 20.4 GB whole-file read).
+TAIL_LINES = 200
+TAIL_START = 64 * 1024
+TAIL_GROWTH = 8
+
+
+def sh(cmd, cwd=None):
+    try:
+        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=20)
+    except Exception as exc:  # noqa: BLE001
+        return type("R", (), {"stdout": "", "returncode": 1, "stderr": str(exc)})()
+
+
+def _snip(text, limit=SNIP):
+    """Collapse whitespace and cut to `limit` characters (SNIP by default).
+
+    scan_workers() passes a shorter limit; until 2026-10-15 this took one
+    argument, so that call raised TypeError on any machine with a live
+    worker process and the whole forensics document failed.
+    """
+    text = " ".join(text.split())
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def _tail_lines(path, max_lines=TAIL_LINES, window=TAIL_START):
+    """The last `max_lines` lines of a file, read backwards from its end.
+
+    A transcript is append-only JSONL and only its tail is ever inspected, so
+    reading the whole file to see its last 200 lines is pure waste — measured
+    at 20.4 GB across 488 in-flight transcripts, 109s of it. The window grows
+    until it holds enough COMPLETE lines or reaches the start of the file, so
+    the result is identical to `read_text().splitlines()[-max_lines:]` rather
+    than an approximation of it: a fixed window silently lost the last action
+    on 10 of those 488 files, because their final records carry no plain text.
+    """
+    size = path.stat().st_size
+    while True:
+        off = max(0, size - window)
+        with path.open("rb") as fh:
+            fh.seek(off)
+            blob = fh.read()
+        if off:
+            blob = blob.split(b"\n", 1)[-1]  # drop the partial leading line
+        lines = blob.decode("utf-8", errors="replace").splitlines()
+        if len(lines) >= max_lines or off == 0:
+            return lines[-max_lines:]
+        window *= TAIL_GROWTH
+
+
+def _git_dir(wt):
+    """A worktree's private git dir, resolved without spawning a process.
+
+    `.git` is a directory in a normal checkout and a `gitdir:` pointer file in
+    a linked worktree. `git rev-parse --git-path` answers this too, but costs
+    one process per marker per worktree; the file on disk is authoritative.
+    Returns None when neither form is readable — the caller then reports no
+    rebase rather than guessing one.
+    """
+    dot = wt / ".git"
+    if dot.is_dir():
+        return dot
+    try:
+        text = dot.read_text(errors="replace").strip()
+    except OSError:
+        return None
+    if not text.startswith("gitdir:"):
+        return None
+    p = Path(text.split(":", 1)[1].strip())
+    return p if p.is_absolute() else (wt / p)
+
+
+def scan_worktrees():
+    rows = []
+    if not WORKTREES.is_dir():
+        return rows
+    for wt in sorted(WORKTREES.iterdir()):
+        if not (wt / ".git").exists():
+            continue  # .git is a FILE in a worktree (gitdir pointer) — both forms count
+        name = wt.name
+        branch = sh(["git", "branch", "--show-current"], cwd=wt).stdout.strip() or "?"
+        # `git log --oneline -1` IS "<short-sha> <subject>", so one process
+        # answers both; asking rev-parse for the sha separately cost a second.
+        subject = sh(["git", "log", "-1", "--format=%h %s"], cwd=wt).stdout.strip() or ""
+        head = subject.split(" ", 1)[0] if subject else "?"
+        dirty = len([l for l in sh(["git", "status", "--porcelain"], cwd=wt).stdout.splitlines() if l.strip()])
+        ahead = behind = "?"
+        if branch and branch != "?":
+            # refspec direction: A..B counts commits in B missing from A.
+            # branch..origin/main = how far the branch is BEHIND origin/main;
+            # origin/main..branch = how many unshipped commits it is AHEAD.
+            # `--left-right --count A...B` prints both in one process: the left
+            # count is "in A, not B" (behind) and the right "in B, not A"
+            # (ahead), so the pair below is that same direction, not its mirror.
+            lr = sh(["git", "rev-list", "--left-right", "--count",
+                     f"origin/main...{branch}"], cwd=wt).stdout.split()
+            if len(lr) == 2:
+                behind, ahead = lr[0], lr[1]
+        gd = _git_dir(wt)
+        rebase = bool(gd) and any((gd / m).exists()
+                                  for m in ("rebase-merge", "rebase-apply"))
+        next_step = []
+        if rebase:
+            next_step.append("rebase in progress — resolve or `git rebase --abort`, then PR the branch")
+        if dirty:
+            next_step.append("dirty tree — commit churn explicitly (never git stash) or WIP-branch")
+        if ahead not in ("0", "?"):
+            next_step.append(f"{ahead} unshipped commit(s) — PR after verify-canonical")
+        if not next_step:
+            next_step.append("clean and level — nothing to recover; prune if stale")
+        rows.append({
+            "kind": "worktree", "name": name, "branch": branch, "head": head,
+            "subject": _snip(subject), "dirty": dirty, "ahead": ahead, "behind": behind,
+            "last_action": _snip(subject), "next_step": "; ".join(next_step),
+        })
+    return rows
+
+
+def _tail_action(lines):
+    """Last substantive assistant/user utterance, or the limit marker."""
+    last = ""
+    limit = False
+    for line in lines[-200:]:
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        msg = obj.get("message") or {}
+        content = msg.get("content")
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            for c in content:
+                if isinstance(c, dict) and c.get("type") == "text":
+                    text += c.get("text", "")
+        if text.strip():
+            last = text
+        if LIMIT_PAT.search(text):
+            limit = True
+    return _snip(last), limit
+
+
+def scan_transcripts():
+    rows = []
+    proj = CLAUDE_DIR / "projects"
+    if not proj.is_dir():
+        return rows
+    for pdir in sorted(proj.iterdir()):
+        files = sorted(pdir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+        if not files:
+            continue
+        latest = files[-1]
+        st = latest.stat()
+        age_h = (time.time() - st.st_mtime) / 3600
+        if age_h > 7 * 24:
+            continue  # stale project, not in-flight
+        try:
+            lines = _tail_lines(latest)
+        except OSError:
+            continue
+        last_action, limit = _tail_action(lines)
+        next_step = ("CC limit hit — resume via this handover and re-run pending probes"
+                     if limit else "resume from last-action above; check its worktree/branch rows")
+        rows.append({
+            "kind": "cc-session", "name": pdir.name, "session": latest.stem,
+            # Size, not a line count: the count needed the whole file, and this
+            # already sits in the stat() taken for the mtime above.
+            "size_mb": round(st.st_size / 1e6, 1), "age_h": round(age_h, 1),
+            "last_action": last_action or "(empty transcript)", "limit_hit": limit,
+            "next_step": next_step,
+        })
+    return rows
+
+
+def scan_plans():
+    rows = []
+    globs = (
+        ("plans", "ULTRAGOAL-*.md"),
+        ("drafts", "ULTRAPROMPT-*.md"),
+        ("drafts", "HARNESS-HANDOVER-*.md"),
+    )
+    for sub, pattern in globs:
+        for p in sorted((CLAUDE_DIR / sub).glob(pattern)):
+            if p.name == DOC.name:
+                continue
+            open_items = 0
+            try:
+                open_items = len([l for l in p.read_text(errors="replace").splitlines()
+                                  if l.startswith("- [ ]")])
+            except OSError:
+                pass
+            rows.append({
+                "kind": "plan", "name": str(p.relative_to(CLAUDE_DIR)),
+                "open_items": open_items,
+                "next_step": "run /ultragoal run" if "ULTRAGOAL" in p.name else
+                             "execution check — fold-check before re-running",
+            })
+    return rows
+
+
+def _product_repos():
+    """Extra repos from GRIP_FORENSICS_REPOS (colon-separated), defaulting to
+    the two product repos when the var is unset. Empty value = none (tests)."""
+    raw = os.environ.get("GRIP_FORENSICS_REPOS")
+    if raw is None:
+        return list(PRODUCT_REPOS.items())
+    if not raw.strip():
+        return []
+    out = []
+    for p in raw.split(":"):
+        p = p.strip()
+        if p:
+            out.append((Path(p).name, p))
+    return out
+
+
+def _remote_branches_per_ref(root):
+    """(name, ahead, subject) per remote branch, three processes each.
+
+    The correct-and-slow path, kept whole as the fallback for a git without
+    the ahead-behind atom rather than left as a raising placeholder. It
+    ENUMERATES only: bot and origin/main filtering belongs to scan_branches,
+    so that both helpers answer the same question and the caller holds the
+    single copy of the policy.
+    """
+    out = []
+    for line in sh(["git", "branch", "-r"], cwd=root).stdout.splitlines():
+        b = line.strip().lstrip("* ")
+        if not b:
+            continue
+        contained = sh(["git", "merge-base", "--is-ancestor", b, "origin/main"], cwd=root)
+        ahead = "0" if contained.returncode == 0 else (
+            sh(["git", "rev-list", "--count", f"origin/main..{b}"], cwd=root).stdout.strip() or "?")
+        subject = sh(["git", "log", "-1", "--format=%s", b], cwd=root).stdout.strip()
+        out.append((b, ahead, subject))
+    return out
+
+
+def _remote_branches(root):
+    """(name, ahead, subject) per remote branch, in ONE process.
+
+    `ahead == 0` is exactly `merge-base --is-ancestor <branch> origin/main`:
+    both say every commit on the branch is already in main. Asking per branch
+    cost three processes each — 1,967 spawns and 49.7s over 680 refs here,
+    against 0.2s for the single for-each-ref below. The atom landed in git
+    2.41, so an older git errors and takes the per-ref path instead.
+    """
+    fmt = "%(refname:short)%09%(ahead-behind:origin/main)%09%(contents:subject)"
+    r = sh(["git", "for-each-ref", f"--format={fmt}", "refs/remotes"], cwd=root)
+    if r.returncode != 0:
+        return _remote_branches_per_ref(root)
+    out = []
+    for line in r.stdout.splitlines():
+        name, _, rest = line.partition("\t")
+        counts, _, subject = rest.partition("\t")
+        parts = counts.split()
+        out.append((name.strip(), parts[0] if parts else "?", subject))
+    return out
+
+
+def scan_branches():
+    rows = []
+    repos = [("GRIP", CLAUDE_DIR)] + _product_repos()
+    for label, root in repos:
+        root = Path(root)
+        if not root.is_dir():
+            continue
+        for b, ahead, raw_subject in _remote_branches(root):
+            if not b or b.startswith(BOT_PREFIX):
+                continue
+            if ahead == "0":
+                continue  # fully contained in main — merged or superseded
+            subject = _snip(raw_subject)
+            rows.append({
+                "kind": "branch", "name": f"{label}/{b}",
+                "ahead": ahead, "last_subject": subject,
+                "next_step": ("triage: NOT contained in main — diff origin/main...branch; "
+                              "merge if real work, delete if stale"),
+            })
+    return rows
+
+
+def scan_workers():
+    rows = []
+    # Only REAL worker processes: the broad 'claude' pattern matched shell
+    # snapshot zsh lines, whose unstable command text broke the doc's
+    # section-name stability (verify vs regenerate).
+    r = sh(["pgrep", "-fl", "grip-wa-transcribe|codex exec"])
+    for line in r.stdout.splitlines():
+        pid, sep, rest = line.partition(" ")
+        if not sep or not rest.strip():
+            continue  # malformed pgrep line — skip, never emit a malformed section
+        # No pid in the name: pids rotate across restarts and would make the
+        # doc flap between two scans. The command prefix is the stable key;
+        # identical commands collapse to one worker section (same logical unit).
+        rows.append({"kind": "worker", "name": _snip(rest, 40),
+                     "next_step": "leave running — do not kill mid-transcription"})
+    return rows
+
+
+def scan():
+    return (scan_worktrees() + scan_transcripts() + scan_plans()
+            + scan_branches() + scan_workers())
+
+
+def _section_slug(item):
+    return re.sub(r"[^a-z0-9]+", "-", item["name"].lower()).strip("-")
+
+
+def regenerate():
+    items = scan()
+    lines = [
+        "# HARNESS-HANDOVER — canonical, always ready",
+        "",
+        f"Generated {time.strftime('%Y-%m-%d %H:%M %Z')} by `bin/grip-cc-forensics --regenerate`.",
+        "Fail-closed: verify with `grip-cc-forensics --verify`; a stale doc fails loudly.",
+        f"Items discovered: {len(items)}.",
+        "",
+    ]
+    groups = {}
+    for it in items:
+        groups.setdefault(it["kind"], []).append(it)
+    for kind in ("worktree", "cc-session", "plan", "branch", "worker"):
+        if kind not in groups:
+            continue
+        lines.append(f"## {kind.upper()}S")
+        for it in groups[kind]:
+            lines.append("")
+            lines.append(f"### {it['name']}")
+            for k in ("branch", "head", "dirty", "ahead", "behind", "session",
+                      "size_mb", "age_h", "open_items", "limit_hit"):
+                if k in it:
+                    lines.append(f"- {k}: {it[k]}")
+            lines.append(f"- last-action: {it.get('last_action', '')}")
+            lines.append(f"- next-step: {it['next_step']}")
+    DOC.parent.mkdir(parents=True, exist_ok=True)
+    DOC.write_text("\n".join(lines) + "\n")
+    STALE.unlink(missing_ok=True)
+    return len(items)
+
+
+def _sections(doc):
+    """Split the doc into per-item blocks keyed by their '### name' header."""
+    out = {}
+    cur = None
+    for line in doc.splitlines():
+        if line.startswith("### "):
+            cur = line[4:].strip()
+            out[cur] = []
+        elif cur is not None:
+            out[cur].append(line)
+    return out
+
+
+def verify(require_fields=False):
+    items = scan()
+    if not DOC.exists():
+        print(f"FAIL: {DOC} missing", file=sys.stderr)
+        return 1
+    doc = DOC.read_text(errors="replace")
+    sections = _sections(doc)
+    missing = []
+    for it in items:
+        block = "\n".join(sections.get(it["name"], []))
+        if it["name"] not in sections:
+            missing.append(f"missing section: {it['name']}")
+        elif require_fields and it["kind"] in ("worktree", "cc-session"):
+            # Section-scoped, never global: one complete section must not
+            # satisfy every other section (the council-caught kitchen bug).
+            for field in ("last-action", "next-step"):
+                if f"- {field}:" not in block:
+                    missing.append(f"{it['name']} (missing field {field})")
+    if missing:
+        # Live churn: new items can appear between regenerate and verify (bots,
+        # other sessions). A missing SECTION is repairable — regenerate and
+        # re-check. Field omissions are real defects and always fail.
+        field_defects = [m for m in missing if "missing field" in m]
+        if field_defects:
+            print(f"FAIL: {len(field_defects)} field defect(s): {', '.join(field_defects[:8])}", file=sys.stderr)
+            return 1
+        print(f"{len(missing)} new item(s) since last regenerate — regenerating to cover them", file=sys.stderr)
+        regenerate()
+        missing = []
+        doc = DOC.read_text(errors="replace")
+        sections = _sections(doc)
+        for it in scan():
+            block = "\n".join(sections.get(it["name"], []))
+            if it["name"] not in sections:
+                missing.append(f"missing section: {it['name']}")
+            elif require_fields and it["kind"] in ("worktree", "cc-session"):
+                for field in ("last-action", "next-step"):
+                    if f"- {field}:" not in block:
+                        missing.append(f"{it['name']} (missing field {field})")
+        if missing:
+            print(f"FAIL: still uncovered after regenerate: {', '.join(missing[:8])}", file=sys.stderr)
+            return 1
+    print(f"verified: {len(items)} items covered" + (" (fields checked)" if require_fields else ""))
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print(__doc__)
+        return 2
+    if args[0] == "--scan":
+        print(json.dumps(scan(), indent=1))
+        return 0
+    if args[0] == "--regenerate":
+        print(f"regenerated: {regenerate()} items -> {DOC}")
+        return 0
+    if args[0] == "--verify":
+        return verify(require_fields="--fields" in args)
+    print(f"unknown: {args[0]}")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

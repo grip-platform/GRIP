@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""grip-settings-reconcile -- repair the live settings.json against HEAD.
+
+A GRIP tree's root settings.json is also a live config file: Claude Code's
+own /model picker rewrites it in its own key order, a GRIP hook edits one
+field, scripts/install.sh --update regenerates the hooks. None of those
+writers is a git commit, so the live file can drift from what HEAD tracks
+without the tree ever showing as "behind". This tool repairs that drift --
+restoring a managed item the live file lost, keeping every machine-local
+preference untouched -- without needing a new commit from origin/main at all
+(plan-v4 C5; see lib/settings_merge.py's reconcile_settings for why this needs
+a DIFFERENT composition than a true three-way sync).
+
+It does not fetch: it trusts the tree's ALREADY-FETCHED origin/main, the same
+ref bin/grip-tree-sync just updated. Run that first if origin/main might be
+stale.
+
+Usage:
+    bin/grip-settings-reconcile [--dry-run] [--check] [--claude-dir DIR]
+
+--dry-run   print the per-class diff this run would make; write nothing.
+--check     plan-v4 C7's falsifier: list every settings.json change HEAD
+            carries that the live file does not yet reflect and no override
+            explains; exit 1 if any remain. Never writes.
+(neither)   back the live file up (bin/grip-backup, outside the repo -- never
+            a settings.json.* file left in the tree) and write the reconciled
+            result, atomically, retrying if another writer touches the file
+            meanwhile (lib/settings_merge.py's write_settings_reconciled).
+
+--after-pull --old-head SHA --snapshot FILE
+            plan-v4 C6: scripts/install.sh's run_update calls this right
+            after its own `git pull --rebase`. Unlike every other mode, base
+            and theirs are genuinely different (main moved), so this is a
+            TRUE three-way compose (write_settings_three_way), not a repair:
+            base is SHA's tracked settings.json, theirs is the now-current
+            HEAD's, and `ours` is read from --snapshot -- the live file's
+            content from BEFORE the pull, captured by the caller because the
+            pull's own checkout has already overwritten the live file with
+            theirs by the time this mode runs. Still backs up and verifies
+            exactly as a real run does; skips the behind-origin/main refusal,
+            which the caller's own pull has already made moot.
+
+Refuses, in every mode but --after-pull, when this tree is behind
+origin/main (run bin/grip-tree-sync first) or when the verify step (C4)
+finds a managed hook group broken or a hook script missing -- writing
+nothing either way.
+Exit 0: clean / dry-run printed / reconciled. Exit 1: refused, or --check
+found unarrived changes.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+import settings_merge as sm  # noqa: E402
+
+_NON_ENV_STRUCTURAL = frozenset({"hooks", "permissions", "env"})
+
+
+def _git(claude_dir: Path, *args: str) -> str:
+    done = subprocess.run(
+        ["git", "-C", str(claude_dir), *args], capture_output=True, text=True, timeout=60)
+    if done.returncode != 0:
+        raise RuntimeError(done.stderr.strip() or f"git {args[0]} failed")
+    return done.stdout
+
+
+def _tracked_settings(claude_dir: Path) -> dict:
+    return json.loads(_git(claude_dir, "show", "HEAD:settings.json"))
+
+
+def _head_tracks_settings_json(claude_dir: Path) -> bool:
+    """False for a tree whose HEAD never committed a settings.json at all --
+    nothing to reconcile against, and NOT an error: some CLAUDE_DIR-shaped
+    trees (most of this file's own test fixtures, for one) legitimately have
+    no settings.json, and treating that as a refusal would make --check fail
+    a tree that is otherwise perfectly level."""
+    return subprocess.run(
+        ["git", "-C", str(claude_dir), "cat-file", "-e", "HEAD:settings.json"],
+        capture_output=True, timeout=30).returncode == 0
+
+
+def _behind_count(claude_dir: Path) -> int:
+    return int(_git(claude_dir, "rev-list", "--count", "HEAD..origin/main").strip() or 0)
+
+
+def _diff_by_class(before: dict, after: dict) -> dict[str, list[str]]:
+    """Group every change between two settings dicts by class, for
+    --dry-run's and the real run's per-class summary (plan-v4 C5)."""
+    groups: dict[str, list[str]] = {}
+    for key in {*before, *after} - _NON_ENV_STRUCTURAL:
+        if before.get(key) != after.get(key):
+            groups.setdefault(sm.classify_settings_key(key), []).append(f"$.{key}")
+    before_env, after_env = before.get("env", {}), after.get("env", {})
+    for name in {*before_env, *after_env}:
+        if before_env.get(name) != after_env.get(name):
+            groups.setdefault(sm.classify_env_name(name), []).append(f"$.env.{name}")
+    if before.get("hooks") != after.get("hooks"):
+        groups.setdefault("managed", []).append("$.hooks")
+    if before.get("permissions") != after.get("permissions"):
+        groups.setdefault("machine-local", []).append("$.permissions")
+    return groups
+
+
+def _print_diff(diff: dict[str, list[str]]) -> None:
+    for cls, paths in sorted(diff.items()):
+        print(f"  {cls}: {', '.join(paths)}")
+
+
+def _load_inputs(claude_dir: Path, settings_file: Path) -> tuple[dict, dict]:
+    theirs = _tracked_settings(claude_dir)
+    ours = json.loads(settings_file.read_text())
+    return theirs, ours
+
+
+def _run_check(theirs: dict, ours: dict, overrides: dict) -> int:
+    unarrived = sm.unarrived_settings_changes(theirs, ours, overrides)
+    if unarrived:
+        print("grip-settings-reconcile --check: these changes have not arrived:")
+        for path in unarrived:
+            print(f"  {path}")
+        return 1
+    print("grip-settings-reconcile --check: clean")
+    return 0
+
+
+def _run_dry_run(merged: dict, ours: dict, notes: list[dict]) -> int:
+    diff = _diff_by_class(ours, merged)
+    if not diff:
+        print("grip-settings-reconcile --dry-run: no change (already reconciled)")
+    else:
+        print("grip-settings-reconcile --dry-run: would change")
+        _print_diff(diff)
+    _print_notes(notes)
+    return 0
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    """Write via a temp file + rename, same directory, so a crash mid-write
+    never leaves `path` holding neither its prior content nor the new one
+    (review finding F13 on PR #8719: `_run_after_pull`'s own restore step
+    used a plain write_bytes, the one place in this file's write path that
+    was not crash-safe this way -- everything downstream of it already is,
+    through write_settings_three_way's own atomic replace)."""
+    handle, scratch = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".restore")
+    try:
+        with os.fdopen(handle, "wb") as out:
+            out.write(data)
+        os.replace(scratch, path)
+    except BaseException:
+        Path(scratch).unlink(missing_ok=True)
+        raise
+
+
+def _backup_or_refuse(claude_dir: Path, settings_file: Path) -> bool:
+    """bin/grip-backup, outside the repo -- never a settings.json.* file left
+    in the tree (plan-v4 C5). True on success; prints and returns False."""
+    backup = subprocess.run(
+        [str(claude_dir / "bin" / "grip-backup"), str(settings_file), "--label", "settings-reconcile"],
+        capture_output=True, text=True, timeout=30)
+    if backup.returncode != 0:
+        print(f"grip-settings-reconcile: refusing to write without a backup "
+              f"({backup.stderr.strip()})", file=sys.stderr)
+        return False
+    return True
+
+
+def _print_notes(notes: list[dict]) -> None:
+    """An unclassified key or env name that changed on both sides and was
+    kept local (plan-v4 C2: "unknown -> local AND reported in the plan
+    line"). Shared by every real-write path so a conflict note is visible
+    there too, not only under --dry-run -- review finding F8 on PR #8719:
+    `main()` already computed these notes for the real run and simply never
+    printed them, the one difference between this function and
+    _run_dry_run, which does."""
+    for note in notes:
+        print(f"  note: {note['path']} ({note['class']}): {note['why']}")
+
+
+def _run_apply(claude_dir: Path, settings_file: Path, theirs: dict, ours: dict,
+                merged: dict, overrides: dict, notes: list[dict]) -> int:
+    diff = _diff_by_class(ours, merged)
+    if not diff:
+        print("grip-settings-reconcile: already reconciled, nothing to do")
+        _print_notes(notes)
+        return 0
+    if not _backup_or_refuse(claude_dir, settings_file):
+        return 1
+    sm.write_settings_reconciled(settings_file, theirs, overrides, claude_dir=claude_dir)
+    print("grip-settings-reconcile: reconciled")
+    _print_diff(diff)
+    _print_notes(notes)
+    return 0
+
+
+def _run_after_pull(claude_dir: Path, settings_file: Path, old_head: str, snapshot: Path) -> int:
+    """plan-v4 C6: a TRUE three-way compose right after scripts/install.sh's
+    own `git pull --rebase`. `snapshot` holds the live file's content from
+    BEFORE that pull; HEAD's checkout has already overwritten the live file
+    with the NEW tracked copy by the time this runs, which is `theirs`."""
+    try:
+        base = json.loads(_git(claude_dir, "show", f"{old_head}:settings.json"))
+        theirs = _tracked_settings(claude_dir)
+        ours = json.loads(snapshot.read_text())
+    except (RuntimeError, OSError, ValueError) as exc:
+        print(f"grip-settings-reconcile --after-pull: {exc}", file=sys.stderr)
+        return 1
+    merged, notes = sm.compose_settings_three_way(base, ours, theirs)
+    overrides = sm.load_settings_overrides(claude_dir)
+    merged = sm.apply_settings_overrides(merged, overrides)
+    problems = sm.verify_composed_settings(merged, theirs, claude_dir)
+    if problems:
+        print("grip-settings-reconcile --after-pull: refusing to write:", file=sys.stderr)
+        for problem in problems:
+            print(f"  {problem}", file=sys.stderr)
+        return 1
+    if not _backup_or_refuse(claude_dir, settings_file):
+        return 1
+    _atomic_write(settings_file, snapshot.read_bytes())  # restore "ours" before the race-safe compose+write
+    sm.write_settings_three_way(settings_file, base, theirs, overrides, claude_dir=claude_dir)
+    print("grip-settings-reconcile --after-pull: reconciled")
+    _print_diff(_diff_by_class(ours, merged))
+    _print_notes(notes)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Reconcile the live settings.json against HEAD (plan-v4 C5).")
+    parser.add_argument("--claude-dir", default=None)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--check", action="store_true")
+    parser.add_argument("--after-pull", action="store_true")
+    parser.add_argument("--old-head", default=None)
+    parser.add_argument("--snapshot", default=None)
+    args = parser.parse_args(argv)
+
+    claude_dir = Path(args.claude_dir) if args.claude_dir else Path(
+        os.environ.get("CLAUDE_DIR") or Path.home() / ".claude")
+    settings_file = claude_dir / "settings.json"
+
+    if args.after_pull:
+        if not args.old_head or not args.snapshot:
+            print("grip-settings-reconcile --after-pull needs --old-head and --snapshot", file=sys.stderr)
+            return 1
+        return _run_after_pull(claude_dir, settings_file, args.old_head, Path(args.snapshot))
+
+    try:
+        behind = _behind_count(claude_dir)
+    except (RuntimeError, ValueError) as exc:
+        print(f"grip-settings-reconcile: could not read this tree's git state ({exc})", file=sys.stderr)
+        return 1
+    if behind:
+        print(f"grip-settings-reconcile: {behind} commit(s) behind origin/main -- "
+              f"run bin/grip-tree-sync first", file=sys.stderr)
+        return 1
+
+    if not _head_tracks_settings_json(claude_dir):
+        print("grip-settings-reconcile: HEAD tracks no settings.json here -- nothing to reconcile")
+        return 0
+
+    try:
+        theirs, ours = _load_inputs(claude_dir, settings_file)
+    except (RuntimeError, OSError, ValueError) as exc:
+        print(f"grip-settings-reconcile: {exc}", file=sys.stderr)
+        return 1
+
+    overrides = sm.load_settings_overrides(claude_dir)
+
+    if args.check:
+        return _run_check(theirs, ours, overrides)
+
+    merged, notes = sm.reconcile_settings(theirs, ours)
+    merged = sm.apply_settings_overrides(merged, overrides)
+    problems = sm.verify_composed_settings(merged, theirs, claude_dir)
+    if problems:
+        print("grip-settings-reconcile: refusing to write:", file=sys.stderr)
+        for problem in problems:
+            print(f"  {problem}", file=sys.stderr)
+        return 1
+
+    if args.dry_run:
+        return _run_dry_run(merged, ours, notes)
+    return _run_apply(claude_dir, settings_file, theirs, ours, merged, overrides, notes)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

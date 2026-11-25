@@ -1,0 +1,869 @@
+#!/usr/bin/env python3
+"""grip-auth-failover — main-session auth-bucket failover (L2 rate-limit resilience).
+
+A transient Anthropic server 429 ("Server is temporarily limiting requests" —
+NOT your usage limit) is retryable, not a cap. HAL already cascades providers
+for GRIP's own LLM calls. The GAP this closes is the interactive `claude` REPL
+and the relay `claude -p` spawn: on a SUSTAINED subscription/CCH 429, switch the
+active Anthropic auth from subscription-OAuth to the API key
+(keychain `grip-anthropic-external` -> ANTHROPIC_API_KEY). The API key is a
+SEPARATE rate-limit bucket, so it dodges the subscription throttle.
+
+    grip-auth-failover --engage [reason...]   # select the API-key bucket for future spawns
+                                              #   (needs GRIP_CLAUDE_ALLOW_PAID=1)
+    grip-auth-failover --note-429 [msg...]    # record one transient 429; auto-engages at N=3,
+                                              #   only with GRIP_CLAUDE_ALLOW_PAID=1
+    grip-auth-failover --note-cap [reset...]  # record a USAGE CAP: notify with the reset time
+                                              #   and wait (cap policy "notify", the default),
+                                              #   or fail over to the API-key bucket (policy
+                                              #   "engage" AND GRIP_CLAUDE_ALLOW_PAID=1) —
+                                              #   NEVER a silent stop (rate-limit-never-blocks)
+
+THE PAID KEY NEEDS AN OPT-IN (V>> 2026-10-12): every path that would write the
+API-key marker (--engage, the --note-429 threshold, cap policy "engage") does
+nothing unless GRIP_CLAUDE_ALLOW_PAID is exactly "1". A capped session moves to
+the next pooled subscription through the HAL wire instead, or waits for the
+reset (rules/claude-cap-moves-to-the-next-subscription.md).
+    grip-auth-failover --note-model-cap [msg] # ONE model's allowance is used up: notify, naming
+                                              #   the model; never touches the marker or the 429
+                                              #   counter, since the other models still serve
+    grip-auth-failover --note-ok [msg...]     # the subscription served a call: end an AUTOMATIC
+                                              #   engagement once the last throttle is 15+ min old
+    grip-auth-failover --classify [msg...]    # transient vs usage-cap? (exit 0=retry, 4=cap,
+                                              #   5=one model's allowance: switch model)
+    grip-auth-failover --status               # show active bucket + marker
+    grip-auth-failover --reset                # revert to the subscription bucket
+
+HONEST SCOPE — what this CANNOT do: it cannot re-authenticate an ALREADY-RUNNING
+`claude` REPL mid-turn. The harness owns the live session's auth; only the
+operator can `/logout` + `/login` (or restart) that process. What --engage DOES:
+it checks that the API-key keychain entry is present (it does not probe the
+bucket) and writes a marker (state/session/auth-failover.json), so that
+  - the NEXT `claude` spawn,            (via ~/.zshrc reading the marker)
+  - the relay `claude -p` dispatcher,   (lib/relay_dispatcher.py reads the marker
+                                         FRESH per spawn and keeps/resolves the
+                                         API key instead of stripping it)
+  - and any new shell sourcing ~/.zshrc
+use ANTHROPIC_API_KEY (the unthrottled bucket) instead of the throttled
+subscription. The relay path is the load-bearing surface: it is a long-lived
+daemon, so it re-reads the marker on every spawn — `--engage`/`--reset` take
+effect immediately, no daemon restart. Reversible + idempotent: --reset removes
+the marker and the next shell/spawn reverts to the subscription-preferring
+logic, byte-for-byte.
+
+AUTO-ENGAGE (--note-429): call this on every transient server 429 detected.
+The marker tracks consecutive_429s + window_start; after NOTE_429_THRESHOLD
+hits within NOTE_429_WINDOW_SECS of the first hit, the failover auto-engages.
+A single 429 or a usage-cap 429 NEVER auto-engages (rate-limit-never-blocks.md).
+Distinguish transient vs usage-cap at the CALL SITE by the harness wording
+before calling --note-429.
+
+AUTO-RECOVERY (--note-ok, GRIP#7274): an engagement made by --note-429 or
+--note-cap used to last until someone ran --reset. On 2026-10-03 one sat for
+eight hours after a 31-minute outage, keeping every new spawn on the paid key
+while the subscription served normally. The 429 window expiring still never
+un-engages (AGORA #3662): ending an engagement needs positive evidence. That
+evidence is --note-ok, sent when a subscription-billed call succeeds; it ends
+an AUTOMATIC engagement once the last throttle (engagement, 429 or cap) is
+NOTE_OK_COOLDOWN_SECS old. An engagement made by hand with --engage is the
+operator's choice and only --reset ends it.
+
+ONE MODEL'S ALLOWANCE (--note-model-cap, GRIP#7274): "You're out of usage
+credits. Run /usage-credits to keep using <model>" (often followed by "or
+/model to switch models") means that one model is spent while every other
+model still runs on the subscription. Counted as a 429 it would move every model onto the paid key, so
+this path touches neither the marker nor the 429 counter: it notifies, naming
+the model, and /model switches.
+
+CAP POLICY (GRIP#7274): what an account-wide usage cap does. "notify", the
+default, records the cap beside the marker, tells the operator when it resets
+and waits: the subscription comes first, and a cap is no reason for new paid
+spend. One notice goes out per cap, not per message: a repeat with the same
+reset time inside NOTE_OK_COOLDOWN_SECS only prints its line. "engage" fails
+over to the API-key bucket at once, as every cap did until GRIP#7274. Set
+$GRIP_AUTH_FAILOVER_ON_CAP, or "on_cap" in the gitignored
+config/auth-failover.local.json under the GRIP directory; --status shows the
+policy in force. --note-cap takes the reset time, or the harness's whole error
+text ("You've hit your session limit · resets 7:20am (UTC)"), from which it
+reads the time.
+
+SUBSCRIPTION CREDENTIAL: accepts EITHER "grip-claude-oauth" (the GRIP/HAL
+CCH OAuth store) OR "Claude Code-credentials" (the upstream CCH default) as a
+valid subscription credential. On this host "grip-claude-oauth" is canonical.
+
+The SECRET VALUE IS NEVER PRINTED — only PRESENT/ABSENT and operational
+labels (never the keychain entry name, never the secret).
+
+Pairs with rules/rate-limit-never-blocks.md, rules/full-power-stop-override.md,
+and feedback_cc_subscription_outage_api_key_fallback.md. The ~/.zshrc
+failover-aware export reads this marker; see docs/auth-bucket-failover.md.
+"""
+from __future__ import annotations
+
+import datetime as _dt
+import functools
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+from _compat import fcntl  # noqa: E402  -- POSIX fcntl, or the LockFileEx lock on Windows
+from claude_dir import get_claude_dir  # noqa: E402
+
+
+def _default_marker() -> Path:
+    """$GRIP_AUTH_FAILOVER_MARKER, else <claude dir>/state/session/auth-failover.json.
+
+    The resolution every reader already uses: ~/.zshrc, lib/relay_dispatcher.py,
+    lib/grip_infinite.py, lib/ultraplan_remote.py and the REPL hook. This writer
+    used to root the marker at ~/.claude alone, so wherever CLAUDE_DIR pointed
+    elsewhere it wrote a file those readers never looked at.
+    """
+    override = os.environ.get("GRIP_AUTH_FAILOVER_MARKER", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return get_claude_dir() / "state" / "session" / "auth-failover.json"
+
+
+MARKER = _default_marker()
+# The 429 counter lives in its OWN file. It used to share MARKER, and three of
+# the four readers test MARKER by bare EXISTENCE -- ~/.zshrc, this repo's
+# lib/relay_dispatcher.py:_auth_failover_engaged, and HAL's repl-429 hook. Only
+# _active_bucket() below read it correctly, by checking bucket == "api-key".
+# So a SINGLE transient 429, which by design engages nothing, wrote a
+# counter-shaped MARKER and silently moved every new shell AND the VPS relay
+# onto the API-key bucket while --status still reported "subscription".
+#
+# Observed 2026-08-24: a marker written 2026-08-18 by consecutive_429s=1 sat
+# unreleased for five days; every headless `claude -p` on the machine
+# authenticated by long-lived key against an account with no credits and failed
+# with "Credit balance is too low" -- an error that names credit, never the
+# credential.
+#
+# Splitting the files makes MARKER mean exactly what those three readers already
+# assume, without editing any of them.
+# Derived from MARKER rather than built independently from Path.home(): the
+# test fixture (and any harness) redirects MARKER to a tmp path, and a second
+# home-rooted constant would silently escape that redirection and write to the
+# real home. Sibling-by-construction — patch one, both move.
+_COUNTER_NAME = "auth-429-window.json"
+
+
+def _counter_path() -> Path:
+    return MARKER.with_name(_COUNTER_NAME)
+
+
+# A cap waited out under the "notify" policy is recorded here, never in MARKER:
+# ~/.zshrc exports the paid key whenever MARKER exists, whatever it says, so a
+# cap record that created MARKER would engage the key after all. Derived from
+# MARKER for the same reason as the counter.
+_CAP_NAME = "auth-cap.json"
+
+
+def _cap_path() -> Path:
+    return MARKER.with_name(_CAP_NAME)
+
+
+API_KEY_ENTRY = "grip-anthropic-external"   # the separate-bucket API key
+# Subscription credential: GRIP/HAL CCH store (canonical on this host) OR
+# upstream CCH default.  Either counts as "subscription present".
+OAUTH_ENTRIES = ("grip-claude-oauth", "Claude Code-credentials")
+
+# --note-429 auto-engage thresholds (transient 429s only)
+NOTE_429_THRESHOLD = 3      # consecutive hits needed to auto-engage
+NOTE_429_WINDOW_SECS = 300  # 5-minute rolling window
+# --note-ok: how long after the last throttle a served call ends an automatic
+# engagement. Three 429 windows with no throttle, so a burst cannot flap it.
+# Also how often the notice for one usage cap may repeat (_cap_notice_due).
+NOTE_OK_COOLDOWN_SECS = 900
+AUTO_ENGAGED_SUFFIX = "(auto)"   # the `by` field of --note-429 and --note-cap markers
+# What an account-wide usage cap does (GRIP#7274): "notify" waits for the reset,
+# "engage" fails over to the API-key bucket at once.
+CAP_POLICY_ENV = "GRIP_AUTH_FAILOVER_ON_CAP"
+CAP_POLICIES = ("notify", "engage")
+CAP_POLICY_FILE = Path("config") / "auth-failover.local.json"   # under the GRIP directory
+# The paid key is spent only on the operator's explicit say (V>> 2026-10-12, after
+# the HAL wire moved five capped sessions to another subscription: "Not via paid
+# API KEY"). Every path that would write the API-key marker asks _paid_allowed().
+PAID_OPT_IN_ENV = "GRIP_CLAUDE_ALLOW_PAID"
+_PAID_REFUSED = (f"the paid API key is used only with {PAID_OPT_IN_ENV}=1; a capped "
+                 "session moves to the next pooled subscription through the HAL wire, "
+                 "or waits for the reset.")
+_OPT_IN = (f"To fail over to the paid key on a cap instead, set {PAID_OPT_IN_ENV}=1 and "
+           f'{CAP_POLICY_ENV}=engage (or "on_cap": "engage" in {CAP_POLICY_FILE}).')
+
+
+def _paid_allowed() -> bool:
+    """True only when the operator set the opt-in to exactly "1"."""
+    return os.environ.get(PAID_OPT_IN_ENV) == "1"
+
+
+def _read_json(path: Path) -> dict:
+    """Guarded read: returns {} on absence, corruption, or a partial concurrent
+    write. NEVER raises into a caller (AGORA #3662 Speaker C — every read path
+    is fail-soft)."""
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _read_marker() -> dict:
+    return _read_json(MARKER)
+
+
+def _read_counter() -> dict:
+    """The 429 rolling window, healing a legacy shared-file marker on the way.
+
+    A legacy MARKER carrying counter fields but no ``bucket`` IS the defect: a
+    count that was never an engagement, which every existence-only reader sees
+    as one. Its fields move to the sibling and the marker is removed.
+
+    Two things this deliberately does NOT claim. Healing happens when the CLI
+    runs — the three broken readers (~/.zshrc, relay_dispatcher, HAL's repl-429
+    hook) never invoke a subcommand, so on a host carrying a legacy marker the
+    stale file keeps lying until something runs this script. Run
+    ``grip-auth-failover --status`` once after deploying. And the removal is
+    RETRIED on every call rather than skipped once a counter file exists: if
+    the write succeeded but the unlink failed, an early return would strand the
+    ghost marker permanently, and the ghost marker is the whole defect
+    (AGORA #5034).
+    """
+    legacy = _read_json(MARKER)
+    # Two shapes of stale marker, and the second was a REGRESSION this change
+    # introduced. A counter-shaped marker is the migration case. An UNPARSEABLE
+    # one is garbage: engaged markers are always valid JSON (atomic replace
+    # guarantees a reader sees whole files), so a marker that will not parse
+    # cannot be a real engagement -- yet the three existence-only readers see
+    # the file and treat it as one. The old build overwrote such a file on the
+    # next 429 and self-healed; routing the below-threshold write to the
+    # sibling removed that, making a corrupt marker permanent. Removing it
+    # restores the repair (AGORA #5034 round 2).
+    corrupt = MARKER.exists() and not legacy
+    stale = corrupt or (
+        bool(legacy) and legacy.get("bucket") != "api-key"
+        and "consecutive_429s" in legacy)
+    counter = _read_json(_counter_path())
+
+    if stale:
+        # A corrupt marker carries nothing to migrate; only the removal applies.
+        migrated = {k: legacy[k] for k in
+                    ("window_start", "consecutive_429s", "last_429") if k in legacy}
+        if not counter:
+            try:
+                _write_json(_counter_path(), migrated)
+                counter = migrated
+            except OSError:
+                return migrated   # never break a caller over housekeeping
+        try:
+            MARKER.unlink(missing_ok=True)   # idempotent, so retrying is safe
+        except OSError:
+            pass                             # try again next call
+    return counter
+
+
+def _write_json(path: Path, info: dict) -> None:
+    """Atomic write: serialise to a pid-unique temp file in the target's own
+    directory, then rename it over the target (POSIX-atomic via Path.replace).
+    A concurrent reader therefore sees either the whole old file or the whole
+    new file — never a truncated JSON (AGORA #3662 Speaker C: the frequent
+    --note-429 writes must not race the resolution-path reads)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(info, indent=2) + "\n")
+    try:
+        tmp.replace(path)
+    except OSError:
+        # A failed rename (permission, cross-device) must never orphan the temp
+        # nor disturb the existing file (AGORA #3662 round 2).
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _write_marker(info: dict) -> None:
+    _write_json(MARKER, info)
+
+
+def _keychain_present(entry: str) -> bool:
+    """True iff the macOS keychain entry exists. Presence-only: OMITS ``-w`` so
+    the password is NEVER read into this process (least-privilege — a presence
+    check has no need for the secret). ``security find-generic-password -s
+    <entry>`` exits 0 when the item exists, non-zero otherwise; its stdout is
+    item attributes (not the password) and is discarded via DEVNULL."""
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", entry],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def _oauth_present() -> bool:
+    """True iff ANY recognised subscription credential is in the keychain."""
+    return any(_keychain_present(e) for e in OAUTH_ENTRIES)
+
+
+def _notify_script() -> Path:
+    """Resolve the grip-notify CLI. GRIP_NOTIFY_SCRIPT overrides (CI, containers,
+    non-standard layouts — AGORA #4000: the path must not be hard-coded); else
+    ${CLAUDE_DIR:-~/.claude}/lib/grip_notify.py (path-portability.md semantics,
+    resolved inline to avoid a lib import in a bin script)."""
+    override = os.environ.get("GRIP_NOTIFY_SCRIPT")
+    if override:
+        return Path(override)
+    base = os.environ.get("CLAUDE_DIR") or str(Path.home() / ".claude")
+    return Path(base) / "lib" / "grip_notify.py"
+
+
+def _notify(title: str, message: str) -> bool:
+    """Operator push that is NEVER fully silent. A usage-cap MUST surface
+    (rate-limit-never-blocks.md: a cap is a bounded wait/escalate, never a silent
+    stop) — so if the grip-notify push is unavailable or fails, FALL BACK to
+    stderr rather than swallowing. This closes the AGORA #4000 falsifier: a
+    missing grip_notify.py must not turn fail-open into a silent-swallow. Set
+    GRIP_AUTH_FAILOVER_NO_NOTIFY=1 to suppress entirely (tests only).
+
+    Returns True only when the push landed. It never raises, so "returned" alone
+    cannot tell a delivered notice from one that fell back to stderr; the cap
+    notice's repeat suppression needs that difference (_send_cap_notice)."""
+    if os.environ.get("GRIP_AUTH_FAILOVER_NO_NOTIFY"):
+        return False
+    try:
+        result = subprocess.run(
+            [sys.executable, str(_notify_script()),
+             "send", "--title", title, "--body", message],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20,
+        )
+        if result.returncode == 0:
+            return True
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        pass  # fall through to the stderr surface — never a silent swallow
+    # The push did not land: surface to stderr so the operator/logs still see it.
+    print(f"[grip-auth-failover] {title}: {message}", file=sys.stderr)
+    return False
+
+
+def _marker_locked(fn):
+    """Serialise a marker read-modify-write across processes with an advisory
+    file lock (AGORA #4000 Speaker C: concurrent --note-cap / --engage /
+    --reset can otherwise lose a field between _read_marker and _write_marker;
+    _write_marker is already torn-write-safe, this closes the lost-update gap).
+    The lock comes from _compat: POSIX fcntl, or the LockFileEx lock on
+    Windows, where concurrent sessions race this marker too (GRIP#8757)."""
+    @functools.wraps(fn)
+    def _wrapped(*args, **kwargs):
+        lock_path = MARKER.with_name(f"{MARKER.name}.lock")
+        MARKER.parent.mkdir(parents=True, exist_ok=True)
+        # "a" (no-truncate): mode "w" truncated BEFORE flock was acquired — a
+        # theoretical lost-signal race on filesystems with weak flock (NFS/FUSE).
+        # Only the handle matters for flock; the file's content is irrelevant.
+        with open(lock_path, "a") as _lk:
+            fcntl.flock(_lk, fcntl.LOCK_EX)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                fcntl.flock(_lk, fcntl.LOCK_UN)
+    return _wrapped
+
+
+def _active_bucket() -> str:
+    """Which bucket future spawns will use, derived from marker + keychain state.
+
+    Mirrors the ~/.zshrc resolution order exactly:
+      marker engaged AND api-key present -> api-key (the unthrottled bucket)
+      else any subscription credential   -> subscription
+      else api-key present               -> api-key (legacy outage fallback)
+      else                               -> none
+    """
+    api_present = _keychain_present(API_KEY_ENTRY)
+    # An ENGAGED marker carries bucket="api-key" (written by engage() or by
+    # note_429 at threshold). The 429 counter now lives in a SIBLING file, so
+    # the marker exists only when engagement is real — which is what the three
+    # existence-only readers (~/.zshrc, relay_dispatcher, HAL's repl-429 hook)
+    # already assume. The bucket check is kept as a second line of defence and
+    # to reject a hand-written or legacy marker (rate-limit-never-blocks.md:
+    # one transient 429 never engages).
+    if api_present and _read_marker().get("bucket") == "api-key":
+        return "api-key"
+    if _oauth_present():
+        return "subscription"
+    if api_present:
+        return "api-key"
+    return "none"
+
+
+@_marker_locked
+def engage(reason: str) -> int:
+    if not _paid_allowed():
+        print(f"grip-auth-failover: NOT engaged -- {_PAID_REFUSED} (No marker written.)")
+        return 1
+    if not _keychain_present(API_KEY_ENTRY):
+        print("grip-auth-failover: CANNOT engage — the Anthropic API-key "
+              "keychain entry is ABSENT. Add it to the keychain first, then "
+              "retry. (No marker written.)")
+        return 1
+    _write_marker({
+        "engaged_at": _dt.datetime.now().isoformat(timespec="seconds"),
+        "by": "grip-auth-failover",
+        "bucket": "api-key",
+        "entry": API_KEY_ENTRY,
+        "reason": reason or "sustained-subscription-429",
+    })
+    print("grip-auth-failover: ENGAGED — future `claude` spawns + the relay "
+          "path will use the API-key bucket (a separate rate-limit pool). The "
+          "currently-running REPL keeps its auth until restart. Revert with "
+          "`grip-auth-failover --reset`.")
+    _notify("GRIP auth failover ENGAGED",
+            "Future claude spawns + the relay now use the API-key bucket "
+            f"(separate rate-limit pool). Reason: {reason or 'sustained-subscription-429'}. "
+            "If inference then fails on credit, top up grip-anthropic-external.")
+    return 0
+
+
+@_marker_locked
+def reset() -> int:
+    engaged = MARKER.exists()
+    MARKER.unlink(missing_ok=True)
+    # Clear the window too: a reset means "start clean", and leaving a stale
+    # count behind would let the next single 429 auto-engage immediately.
+    _counter_path().unlink(missing_ok=True)
+    if engaged:
+        print("grip-auth-failover: RESET — marker removed; next shell/spawn "
+              "reverts to the subscription bucket (presence-gated).")
+    else:
+        print("grip-auth-failover: was not engaged (already on the "
+              "subscription bucket).")
+    return 0
+
+
+@_marker_locked
+def note_429(msg: str) -> int:
+    """Record one transient server 429.  Auto-engages after NOTE_429_THRESHOLD
+    consecutive hits within NOTE_429_WINDOW_SECS.  A single hit never engages
+    (rate-limit-never-blocks.md: transient 429 = retry/failover, not a block).
+    Usage-cap 429s must NOT call this — the caller discriminates by wording."""
+    if not _keychain_present(API_KEY_ENTRY):
+        print("grip-auth-failover: --note-429 ignored — API-key bucket absent "
+              "(nothing to fail over to).")
+        return 0
+
+    now = _dt.datetime.now()
+    # Counter state lives in its own file now; a corrupt/partial read is {}.
+    info = _read_counter()
+    already_engaged = _read_marker().get("bucket") == "api-key"
+
+    # Rolling window: when the counter window has EXPIRED, clear ONLY the counter
+    # fields and start a fresh window — NEVER drop an existing engagement, which
+    # persists until an explicit --reset (AGORA #3662 Speaker C: window-expiry
+    # must not silently un-engage, nor let a stale count survive).
+    window_start_str = info.get("window_start")
+    if window_start_str:
+        try:
+            expired = (now - _dt.datetime.fromisoformat(window_start_str)
+                       ).total_seconds() > NOTE_429_WINDOW_SECS
+        except ValueError:
+            expired = True  # unparseable timestamp → treat as a fresh window
+        if expired:
+            for _k in ("window_start", "consecutive_429s", "last_429"):
+                info.pop(_k, None)
+    if "window_start" not in info:
+        info["window_start"] = now.isoformat(timespec="seconds")
+
+    count = info.get("consecutive_429s", 0) + 1
+    info["consecutive_429s"] = count
+    info["last_429"] = now.isoformat(timespec="seconds")
+
+    if not already_engaged and count >= NOTE_429_THRESHOLD and _paid_allowed():
+        # ONLY here does a marker appear, and only on the operator's opt-in. Below the threshold nothing but the
+        # counter file is touched, so a transient 429 can no longer flip a
+        # shell or the relay by writing a file whose mere existence they read
+        # as engagement.
+        #
+        # Counter first, marker second, and the order is load-bearing. Two
+        # renames cannot be one atomic act, so a crash between them must land
+        # on the safe side: this way a reader sees a full count and no marker
+        # and stays on the subscription, and the next 429 completes the
+        # engagement. The reverse order would publish an engagement backed by
+        # an unwritten count -- a false engagement, which is the very bug class
+        # this change exists to close (AGORA #5034).
+        _write_json(_counter_path(), info)
+        _write_marker({
+            "engaged_at": now.isoformat(timespec="seconds"),
+            "by": "grip-auth-failover --note-429 (auto)",
+            "bucket": "api-key",
+            "entry": API_KEY_ENTRY,
+            "reason": msg or f"auto: {count} consecutive transient 429s",
+        })
+        print(f"grip-auth-failover: AUTO-ENGAGED after {count} consecutive "
+              "transient 429s — future spawns use the API-key bucket. "
+              "Revert with `grip-auth-failover --reset`.")
+    else:
+        _write_json(_counter_path(), info)
+        print(_note_429_line(count, already_engaged))
+    return 0
+
+
+def _note_429_line(count: int, already_engaged: bool) -> str:
+    """What --note-429 prints when it records a 429 without engaging."""
+    if already_engaged:
+        return f"grip-auth-failover: already engaged; 429 recorded (total this window: {count})."
+    recorded = f"grip-auth-failover: transient 429 recorded ({count}/{NOTE_429_THRESHOLD}); "
+    if not _paid_allowed():
+        return f"{recorded}not engaged -- {_PAID_REFUSED}"
+    return f"{recorded}{NOTE_429_THRESHOLD - count} more within the window will auto-engage."
+
+
+def _paid_gate(policy: str, source: str) -> tuple[str, str]:
+    """Policy "engage" spends on the paid key, so it holds only with the opt-in."""
+    if policy == "engage" and not _paid_allowed():
+        return "notify", f"{source} asks for engage; refused without {PAID_OPT_IN_ENV}=1"
+    return policy, source
+
+
+def _cap_policy() -> tuple[str, str]:
+    """What an account-wide usage cap does, and where that was set (GRIP#7274).
+
+    $GRIP_AUTH_FAILOVER_ON_CAP wins, then "on_cap" in config/auth-failover.local.json
+    under the GRIP directory (gitignored: it is a choice about this machine's spending),
+    then the default, "notify". A value that is neither "notify" nor "engage" is ignored,
+    so a typo is never read as consent to spend. "engage" also needs
+    $GRIP_CLAUDE_ALLOW_PAID=1, or it is read as "notify" (_paid_gate)."""
+    chosen = os.environ.get(CAP_POLICY_ENV, "").strip().lower()
+    if chosen in CAP_POLICIES:
+        return _paid_gate(chosen, CAP_POLICY_ENV)
+    config = _read_json(get_claude_dir() / CAP_POLICY_FILE)
+    chosen = str(config.get("on_cap", "")).strip().lower()
+    if chosen in CAP_POLICIES:
+        return _paid_gate(chosen, str(CAP_POLICY_FILE))
+    return "notify", "default"
+
+
+def _reset_from(arg: str) -> str:
+    """The reset time a --note-cap argument carries.
+
+    The REPL hook passes the harness's whole error text ("You've hit your session limit
+    · resets 7:20am (UTC)"); a person or the relay passes the time alone, or nothing. A
+    cap message gives the time it names, or "" when it names none, so a notice never
+    reads "capped until Your credit balance is too low". Anything else is taken to be
+    the time itself. Imported lazily, as in classify(); if the classifier cannot load,
+    the argument is used as given, which is what --note-cap always did."""
+    try:
+        from rate_limit_classifier import cap_reset, classify as classify_message
+    except Exception:
+        return arg
+    return cap_reset(arg) or ("" if classify_message(arg).is_cap else arg)
+
+
+def _cap_notice_due(record: dict, reset: str, now: _dt.datetime) -> bool:
+    """Whether a usage cap needs a notice: one per cap, not one per message (GRIP#7274).
+
+    Due when the record holds no notice for this cap, when this cap names a different
+    reset time, or when the last notice is older than NOTE_OK_COOLDOWN_SECS. A cap
+    that names no reset time therefore repeats its notice at that interval. A notice
+    stamped in the future (the clock moved back) counts as stale, never as fresh."""
+    sent = _parse_stamp(record.get("notified_at"))
+    if sent is None or record.get("cap_reset", "") != reset:
+        return True
+    age = (now - sent).total_seconds()
+    return age < 0 or age > NOTE_OK_COOLDOWN_SECS
+
+
+def _send_cap_notice(record: dict, until: str, now: _dt.datetime) -> None:
+    """Push the cap notice. The record is marked sent only if the push landed; a
+    failed push clears the mark, so the next message for this cap tries again."""
+    if _notify("GRIP: subscription capped, waiting for the reset",
+               f"The subscription hit its usage cap and is capped {until}. GRIP did not "
+               f"switch to the paid API key and is waiting for the reset. {_OPT_IN}"):
+        record["notified_at"] = now.isoformat(timespec="seconds")
+    else:
+        record.pop("notified_at", None)
+
+
+def _wait_for_reset(reset: str) -> int:
+    """Cap policy "notify": record the cap, say when it resets, engage nothing (GRIP#7274).
+
+    The record goes beside MARKER (_cap_path), never into it: creating MARKER is what
+    makes ~/.zshrc export the paid key. Every session that hits a cap writes its own
+    error record, so one cap can arrive as dozens of messages, and a burst of identical
+    notices teaches the operator to ignore them. So the notice goes out once per cap
+    (_cap_notice_due), while this tool's one line is printed for every message."""
+    now = _dt.datetime.now()
+    record = _read_json(_cap_path())
+    due = _cap_notice_due(record, reset, now)
+    record.update(last_cap=now.isoformat(timespec="seconds"), cap_reset=reset)
+    until = f"until {reset}" if reset else "until its reset"
+    line = (f"grip-auth-failover: usage cap -- the subscription is capped {until}; the "
+            "paid API key was not engaged (cap policy: notify).")
+    if due:
+        _send_cap_notice(record, until, now)
+        print(f"{line} {_OPT_IN}")
+    else:
+        print(f"{line} The notice already went out at {record['notified_at']}; "
+              "not sent again.")
+    try:
+        _write_json(_cap_path(), record)
+    except OSError:
+        pass  # a lost record can only repeat a notice, never hide one
+    return 0
+
+
+@_marker_locked
+def note_cap(reset: str = "") -> int:
+    """Record a USAGE CAP (session/weekly/monthly limit, quota, or 'credit balance
+    too low') — the complement of --note-429 and the fix for silent-stop-on-cap. A
+    cap is NOT a transient 429: it cannot be spun on (rate-limit-never-blocks.md).
+    Every branch surfaces the cap to the operator. ``reset`` is the reset time or
+    the harness's whole error text (_reset_from).
+
+      NOT yet failed over, cap policy "notify" (the default, GRIP#7274)
+          -> record the cap, notify with the reset time and wait. Nothing engages.
+      NOT yet failed over, cap policy "engage", API key present
+          -> ENGAGE the API-key bucket (a separate pool) + notify.
+      already on the API-key bucket (the API key ITSELF is now capped /
+      credit-empty) under either policy, OR policy "engage" with no API key
+          -> notify "no usable fallback -> pausing to reset" and do NOT engage
+             (nothing left to fail over to). The caller backs off to the reset;
+             never a silent block.
+    """
+    reset = _reset_from(reset)
+    info = _read_marker()
+    already = info.get("bucket") == "api-key"
+    if not already and _cap_policy()[0] == "notify":
+        return _wait_for_reset(reset)
+    api_present = _keychain_present(API_KEY_ENTRY)
+    now = _dt.datetime.now().isoformat(timespec="seconds")
+    reset_note = f" Resets at {reset}." if reset else ""
+
+    if not already and api_present:
+        info.update({
+            "engaged_at": now,
+            "by": "grip-auth-failover --note-cap (auto)",
+            "bucket": "api-key",
+            "entry": API_KEY_ENTRY,
+            "reason": "usage-cap on subscription -> failed over to API-key bucket",
+            "last_cap": now,
+            "cap_reset": reset,
+        })
+        _write_marker(info)
+        _notify("GRIP: subscription usage-cap -> failed over",
+                "The subscription hit its usage cap. GRIP failed over to the "
+                "API-key bucket (a separate rate-limit pool). If that also caps "
+                "or is credit-empty, GRIP will surface it too -- never a silent stop.")
+        print("grip-auth-failover: usage-cap on subscription -> ENGAGED the "
+              "API-key bucket (separate pool) + notified. Revert with --reset.")
+        return 0
+
+    # Nothing left to fail over to: both buckets exhausted, or no API key.
+    info["last_cap"] = now
+    if reset:
+        info["cap_reset"] = reset
+    _write_marker(info)
+    if already:
+        detail = "Both the subscription AND the API-key bucket are usage-capped."
+    else:
+        detail = "The subscription is usage-capped and no API-key fallback is present."
+    _notify("GRIP: usage-cap, no fallback left",
+            f"{detail}{reset_note} GRIP is pausing to the reset -- NOT silently "
+            "stopping. Top up grip-anthropic-external or wait for the reset.")
+    print(f"grip-auth-failover: usage-cap, NO usable fallback. {detail}"
+          f"{reset_note} Surfaced to operator; pause-to-reset.")
+    return 0
+
+
+def _model_named(msg: str) -> str:
+    """The model a model-cap message names, or "". Imported lazily, as in classify();
+    if the classifier cannot load, the notice still goes out, just unnamed."""
+    try:
+        from rate_limit_classifier import model_cap_model
+    except Exception:
+        return ""
+    return model_cap_model(msg)
+
+
+def note_model_cap(msg: str) -> int:
+    """Record that ONE model's allowance is used up: notify, never engage (GRIP#7274).
+
+    Every other model still runs on the subscription, so moving every new session
+    onto the paid API key would be wrong. This deliberately reads and writes neither
+    the marker nor the 429 counter, which is also why it takes no marker lock.
+    """
+    who = _model_named(msg) or "One model"
+    _notify("GRIP: one model's allowance is used up",
+            f"{who} has used up its allowance. Other models still run on the "
+            "subscription, so GRIP did not switch to the paid API key. Run /model "
+            "to switch model.")
+    print(f"grip-auth-failover: {who}'s allowance is used up; the API-key bucket was "
+          "not engaged (other models still run on the subscription). Run /model to "
+          "switch model.")
+    return 0
+
+
+def _parse_stamp(stamp) -> _dt.datetime | None:
+    """A marker or counter timestamp (local, naive ISO-8601), or None."""
+    try:
+        return _dt.datetime.fromisoformat(stamp) if stamp else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _last_throttle(marker: dict, counter: dict) -> _dt.datetime | None:
+    """The most recent sign of throttling: the engagement, the last 429 or the last cap."""
+    stamps = (_parse_stamp(marker.get("engaged_at")), _parse_stamp(marker.get("last_cap")),
+              _parse_stamp(counter.get("last_429")))
+    known = [s for s in stamps if s is not None]
+    return max(known) if known else None
+
+
+@_marker_locked
+def note_ok(msg: str) -> int:
+    """Record that the SUBSCRIPTION served a call, and end an automatic engagement
+    once the throttle is safely over (GRIP#7274).
+
+    Three cases leave the marker alone: nothing is engaged; the engagement was made
+    by hand, which is the operator's choice and ends only with --reset; or the last
+    throttle is newer than NOTE_OK_COOLDOWN_SECS. Otherwise the marker and the 429
+    window go, as with --reset, and the recovery is announced as the engagement was.
+    """
+    marker = _read_marker()
+    if marker.get("bucket") != "api-key":
+        print("grip-auth-failover: --note-ok: not engaged; nothing to clear.")
+        return 0
+    if not str(marker.get("by", "")).endswith(AUTO_ENGAGED_SUFFIX):
+        print("grip-auth-failover: --note-ok: engaged by hand; only --reset ends it.")
+        return 0
+    last = _last_throttle(marker, _read_counter())
+    age = (_dt.datetime.now() - last).total_seconds() if last else 0.0
+    if age < NOTE_OK_COOLDOWN_SECS:
+        print(f"grip-auth-failover: --note-ok: last throttle {int(age // 60)} min ago; "
+              f"keeping the API-key bucket until {NOTE_OK_COOLDOWN_SECS // 60} min have passed.")
+        return 0
+    # Marker first: a crash after it leaves only a stale 429 window, which engages nothing.
+    MARKER.unlink(missing_ok=True)
+    _counter_path().unlink(missing_ok=True)
+    mins = int(age // 60)
+    print(f"grip-auth-failover: AUTO-RECOVERED — the subscription served a call {mins} min "
+          "after the last throttle; marker removed, future spawns use the subscription again.")
+    _notify("GRIP auth failover recovered",
+            f"The subscription is serving again ({msg or 'a subscription call succeeded'}), "
+            f"{mins} min after the last throttle. New claude spawns and the relay are back "
+            "on the subscription.")
+    return 0
+
+
+def status() -> int:
+    # Read the counter FIRST: that call performs the legacy migration, and
+    # reporting before healing meant the first --status on an affected host
+    # printed exactly the false "subscription" line that hid the incident for
+    # five days, then repaired the state after the output had gone out
+    # (AGORA #5034).
+    window = _read_counter()
+    bucket = _active_bucket()
+    info = _read_marker()
+    if info.get("bucket") == "api-key":
+        print(f"grip-auth-failover: ENGAGED since {info.get('engaged_at')} "
+              f"by {info.get('by')} — reason: {info.get('reason')}")
+    else:
+        print("grip-auth-failover: marker OFF (subscription-preferring)")
+    count = window.get("consecutive_429s", 0)
+    if count:
+        print(f"  consecutive transient 429s this window: {count}/"
+              f"{NOTE_429_THRESHOLD} (window started {window.get('window_start')})")
+    if count >= NOTE_429_THRESHOLD and info.get("bucket") != "api-key":
+        # Armed but not engaged: the marker write failed or the process died
+        # between the two renames. The next SINGLE 429 completes the
+        # engagement, which is exactly the event this tool promises cannot
+        # happen -- so say so rather than leaving the host one hit away from a
+        # silent bucket switch. Never auto-complete the marker here: that would
+        # engage without a 429 (AGORA #5034 round 2).
+        print("  WARNING: the counter is at or past the threshold with no "
+              "engagement recorded — the NEXT transient 429 will auto-engage. "
+              "Clear it with `grip-auth-failover --reset`.")
+    print(f"  active bucket for future spawns: {bucket}")
+    policy, source = _cap_policy()
+    print(f"  usage-cap policy: {policy} ({source})")
+    print(f"  API-key bucket: "
+          f"{'PRESENT' if _keychain_present(API_KEY_ENTRY) else 'ABSENT'}")
+    print(f"  subscription credential: "
+          f"{'PRESENT' if _oauth_present() else 'ABSENT'}")
+    return 0
+
+
+def classify(argv: list[str]) -> int:
+    """Print whether a 429-ish message is transient (retry) or a usage-cap (wait).
+
+    Delegates to lib/rate_limit_classifier — the single mechanical discriminator
+    for rules/rate-limit-never-blocks.md, so the "distinguish at the call site"
+    prose above is now one tested call, not per-site eyeballing. The import is
+    lazy: only this command, --note-model-cap and --note-cap pay for it;
+    --engage/--note-429/--reset/--status are untouched. Exit code encodes the verdict for
+    shell callers:
+      0 = transient / retryable (retry then failover)
+      4 = usage-cap (bounded wait to reset, or engage the API-key bucket)
+      5 = one model's allowance used up (switch model; never engage the API-key bucket)
+      2 = no message given
+      3 = classifier module not importable (honest failure, never a silent guess).
+    """
+    msg = " ".join(argv).strip()
+    if not msg:
+        print("grip-auth-failover: --classify needs a message to classify.")
+        return 2
+    _lib = str(Path(__file__).resolve().parent.parent / "lib")
+    if _lib not in sys.path:
+        sys.path.insert(0, _lib)
+    try:
+        from rate_limit_classifier import classify as _classify_msg
+    except Exception as exc:  # honest failure — do not pretend to have classified
+        print(f"grip-auth-failover: --classify unavailable — the classifier "
+              f"module is not importable ({exc}).")
+        return 3
+    verdict = _classify_msg(msg)
+    action, code = _classify_action(verdict)
+    print(f"class:     {verdict.kind}")
+    print(f"retryable: {'yes' if verdict.retryable else 'no'} -> {action}")
+    print(f"reason:    {verdict.reason}")
+    return code
+
+
+def _classify_action(verdict) -> tuple[str, int]:
+    """The advice and exit code --classify gives for a verdict (see classify())."""
+    if verdict.is_model_cap:
+        return "switch model with /model; do not engage the API-key bucket", 5
+    if verdict.retryable:
+        return "retry / failover (never report 'blocked')", 0
+    return "bounded wait to reset, or engage the API-key bucket", 4
+
+
+_DISPATCH = {
+    "--engage": lambda argv: engage(" ".join(argv)),
+    "--note-429": lambda argv: note_429(" ".join(argv)),
+    "--note-cap": lambda argv: note_cap(" ".join(argv)),
+    "--note-model-cap": lambda argv: note_model_cap(" ".join(argv)),
+    "--note-ok": lambda argv: note_ok(" ".join(argv)),
+    "--classify": classify,
+    "--reset": lambda argv: reset(),
+    "--status": lambda argv: status(),
+    "--help": lambda argv: (print(__doc__) or 0),
+    "-h": lambda argv: (print(__doc__) or 0),
+}
+
+
+def main(argv: list[str]) -> int:
+    cmd = argv[0] if argv else "--status"
+    handler = _DISPATCH.get(cmd)
+    if handler is None:
+        print(__doc__)
+        return 2
+    return handler(argv[1:])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

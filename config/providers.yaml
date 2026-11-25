@@ -1,0 +1,401 @@
+# HAL Provider Configuration
+# provider/model-name addressing convention (LiteLLM-inspired)
+# Edit this file to add, remove, or configure LLM providers.
+# Synced with config/model_catalog.yaml — every add/sunset touches BOTH files.
+#
+# Last refresh: 2026-09-24 (claude-opus-5-5 added 2026-09-23 by GRIP#6563, probe-verified
+#               serving on CC 2.1.281; moved after claude-sonnet-5 on 2026-09-24 so it
+#               no longer captures `--claude 5`. Base 2026-06-24 adversarial research)
+# CRITICAL: routing.default_model + fallback_chain updated from deprecated
+#           groq/llama-3.3-70b-versatile → groq/openai/gpt-oss-120b
+#           (Groq deprecated all Llama/Qwen/DeepSeek routes 2026-06-17)
+
+providers:
+  - name: groq
+    type: cloud
+    base_url: https://api.groq.com/openai/v1
+    api_key_source: keychain:grip-groq
+    # All Llama/Qwen/DeepSeek IDs deprecated on Groq 2026-06-17 — then Qwen
+    # routes RETURNED: qwen3.8-27b / qwen3.6-27b re-verified live 2026-08-30
+    # (GET /v1/models). Llama remains gone. qwen3.6-27b left /v1/models by
+    # 2026-11-24 (bin/grip-model-watch) and a chat call to it answers 404
+    # model_not_found, as a nonsense id does, so it is removed.
+    models: [openai/gpt-oss-120b, openai/gpt-oss-20b, qwen/qwen3.8-27b]
+    default: true
+
+  - name: gemini
+    type: cloud
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    api_key_source: keychain:grip-gemini
+    models: [gemini-3.5-flash, gemini-3.1-pro-preview, gemini-3.1-flash-lite, gemini-3.5-flash-lite, gemini-2.5-flash-lite, gemini-4-argon, gemini-3.6-flash, gemini-3.8-flash, gemini-4-carbon, gemini-4-hydrogen]
+    # gemini-3.5-flash was deprecated on 2026-10-08 (changelog: "API requests to
+    # gemini-3.5-flash are automatically routed to gemini-3.6-flash"); it stays listed
+    # while the id is accepted, so `--gemini flash` keeps its meaning. gemini-3.6-flash
+    # and gemini-3.8-flash (both Stable, served to this key 2026-10-18) are appended.
+    # gemini-4-argon (GA 2026-10-13) is listed LAST on purpose: a one-word qualifier
+    # answers with the first id carrying it, so position keeps every earlier
+    # qualifier where it was; `--gemini 4` and `--gemini argon` name it, a bare
+    # `--gemini` stays on the FAMILY_FLAGSHIP pin (tests/test_model_onboarding_parity.py).
+    # Removed: gemma-4-27b (deprecated), gemini-3-flash-preview (shutdown)
+    # Fixed: gemini-3.1-pro-preview context is 1M (not 2M — 2M belongs to unshipped 3.5-pro)
+    # gemini-3.5-flash-lite added 2026-11-24 (GRIP#9389), inserted before
+    # gemini-2.5-flash-lite so the onboarding-order tail (argon, 3.6-flash,
+    # 3.8-flash) is undisturbed.
+    # SUNSET 2026-11-24 (GRIP#9389): gemini-2.5-pro and gemini-2.5-flash removed
+    # from this list — every GRIP caller that named them now names their
+    # redirect target instead. ai.google.dev/gemini-api/docs/deprecations, read
+    # 2026-11-24: "effective December 1, 2026, API requests to `gemini-2.5-flash`
+    # will automatically route to [`gemini-3.5-flash-lite`]... and be billed at
+    # [Gemini 3.5 Flash-Lite rates]"; the same sentence for `gemini-2.5-pro` ->
+    # `gemini-3.8-flash`. lib/hal/cost_tracker.py keeps both old price rows —
+    # history already billed under them is still billed correctly.
+    # gemini-4-carbon and gemini-4-hydrogen added 2026-11-24 (dogfood-domain
+    # phase 2 family 6): gemini-4-carbon GA 2026-11-10, gemini-4-hydrogen GA
+    # 2026-11-12 (aistudio.google.com/docs/changelog). Appended LAST, after
+    # gemini-3.8-flash, so no earlier qualifier moves: `--gemini 4` still
+    # names gemini-4-argon (position is behaviour;
+    # tests/test_model_onboarding_parity.py). `--gemini carbon` and
+    # `--gemini hydrogen` name the new ids; FAMILY_FLAGSHIP and every
+    # chain/seat stay on gemini-3.1-pro-preview.
+
+  - name: qwen
+    type: cloud
+    base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+    api_key_source: keychain:grip-dashscope
+    models: [qwen3.7-max, qwen3.7-plus, qwen3.6-35b-a3b, qwen3.5-flash, qwen4-max, qwen3.8-flash]
+    # Removed: qwen3.5-plus, qwen3.6-plus-preview (superseded/pricing-unverified)
+    # qwen3.6-27b excluded — pricing unverifiable per adversarial research
+    # qwen4-max (flagship, GA 2026-11-16) and qwen3.8-flash (workhorse) added
+    # 2026-11-24, dogfood-domain phase 2 family 4. Both appended LAST: "max" is
+    # already a qualifier for qwen3.7-max (the flagship pin) and "flash" for
+    # qwen3.5-flash, and each new id carries one of those tokens too, so
+    # appending preserves both --qwen qualifiers unmoved (tests/
+    # test_model_onboarding_parity.py). No Token Plan provider: GRIP has none.
+
+  - name: deepseek
+    type: cloud
+    base_url: https://api.deepseek.com/v1
+    api_key_source: keychain:grip-deepseek
+    models: [deepseek-flash, deepseek-v4-pro]
+    # HARD SUNSET after 2026-07-24 15:59 UTC: deepseek-chat, deepseek-reasoner
+    # (legacy aliases die — already removed from routing chains)
+    # 2026-10-26: live GET https://api.deepseek.com/models returns EXACTLY
+    # two ids (deepseek-flash, deepseek-v4-pro). deepseek-v4-flash and
+    # deepseek-v4-flash-vision-exp were retired-but-aliased upstream — renamed
+    # to deepseek-flash (now text+vision). deepseek-v3.2 and deepseek-r1 were
+    # removed long ago — the direct API no longer serves them, so listing them
+    # could route a request to a dead model.
+    # NOTE: `deepseek-r1-distill-llama-70b` is a GROQ-hosted model and is
+    # unaffected by this sunset — do not remove it from the groq block.
+
+  - name: moonshot
+    type: cloud
+    base_url: https://api.moonshot.ai/v1
+    api_key_source: keychain:grip-moonshot
+    # Order matters: grip_harness_family.tier_match takes the FIRST id carrying
+    # the qualifier token, so kimi-k2.7-code must precede -highspeed for
+    # `--kimi code`. Mirrors the live GET /v1/models order (2026-09-07).
+    # kimi-k3.1-pro and its -highspeed variant (onboarded 2026-11-24) go LAST:
+    # they tokenise as kimi/k3/1/pro(/highspeed), so listed earlier they would
+    # capture `--kimi k3` and `--kimi highspeed`. `--kimi pro` and the full ids
+    # reach them (tests/test_kimi_k3_1_onboarding.py).
+    models: [kimi-k3, kimi-k2.7-code, kimi-k2.7-code-highspeed, kimi-k2.6, kimi-k3.1-pro, kimi-k3.1-pro-highspeed]
+    # Retired (platform.kimi.ai/docs/models.md): kimi-k2.5 and every
+    # moonshot-v1-* on 2026-08-31 (HTTP 404 since); the kimi-k2 series on
+    # 2026-05-25. None of them may be listed here.
+
+  - name: zhipu
+    type: cloud
+    base_url: https://api.z.ai/api/coding/paas/v4
+    api_key_source: keychain:grip-zhipu
+    # glm-5.3 joined 2026-11-24 (GRIP#9431): Zhipu's GLM Coding Plan answers every
+    # `glm-5.1` request with GLM-5.3 (two probes, each beside a glm-5.3 control, both
+    # read the reply's `model` field as glm-5.3), so FAMILY_FLAGSHIP["glm"]
+    # (lib/grip_harness_family.py) now names this id. Listed right after glm-5.1 so
+    # `--glm 5` -- a token both ids carry -- keeps answering glm-5.1 (the first-match
+    # trap skills/dogfood-domain/SKILL.md names).
+    # glm-5.4 and glm-5.3-flash joined 2026-11-24 too (docs.z.ai/guides/llm/glm-5.4.md
+    # and glm-5.3-flash.md, read 2026-11-24), LAST so no one-token qualifier that names
+    # an older id moves: glm-5.4 carries "4" (glm-4.7 keeps `--glm 4`) and "5" (glm-5.1
+    # keeps `--glm 5`, confirmed above). glm-5.3 and glm-5.3-flash both carry "3" --
+    # glm-5.3 is listed first among them, so a bare `--glm 3` answers glm-5.3, not the
+    # flash variant.
+    models: [glm-5.1, glm-5.3, glm-5-turbo, glm-5, glm-4.7, glm-4.6, glm-4.5, glm-4.5-air, glm-5.4, glm-5.3-flash]
+
+  - name: mistral
+    type: cloud
+    base_url: https://api.mistral.ai/v1
+    api_key_source: keychain:grip-mistral
+    models: [mistral-medium-3.5, mistral-large-latest, mistral-large-4, mistral-small-2603, ministral-3b-2512, ministral-8b-2512, codestral-latest, magistral-medium-latest]
+    # mistral-large-3 retired (2026-08-30 live /models: mistral-large-latest is current).
+    # Removed: mistral-small-latest (superseded by mistral-small-2603)
+    # mistral-large-4 added 2026-11-24 (/dogfood-domain, Phase 2 family 7). Vendor's
+    # live pricing page (docs.mistral.ai/inference/pricing, read 2026-11-24) groups
+    # modelIds [mistral-large-4, mistral-large-4-0, mistral-large-latest] on one card,
+    # so -latest may already serve Large 4 server-side -- this id is the stable,
+    # explicit name. Listed AFTER -latest so the one-token qualifier "large" keeps
+    # resolving to -latest (tests/test_mistral_large_4_onboarding.py); reach Large 4
+    # by its full id or the unambiguous "4" qualifier, which no other Mistral id
+    # carries. mistral-medium-3.5 and the large-3/-2512 generation are vendor-
+    # deprecated (deprecatedAt 2026-10-31, retiredAt 2027-04-30, replacedBy Large 4)
+    # but still served today -- left unrepointed per decision 1.
+
+  - name: openrouter
+    type: cloud
+    base_url: https://openrouter.ai/api/v1
+    api_key_source: keychain:grip-openrouter
+    models:
+      # OpenRouter keeps its OWN slug namespace, independent of the direct
+      # api.deepseek.com ids. deepseek/deepseek-v4-flash is still LIVE here
+      # (verified 2026-10-26 against openrouter.ai/api/v1/models) even though
+      # the direct API renamed v4-flash -> deepseek-flash. OpenRouter has NO
+      # deepseek/deepseek-flash slug — it lists deepseek/deepseek-v4.1-flash for
+      # the newer model — so DO NOT rename these to deepseek-flash: that id is
+      # direct-API-only and would 404 on OpenRouter.
+      - deepseek/deepseek-v4-flash
+      - deepseek/deepseek-v3.2
+      - qwen/qwen3-coder
+      - nvidia/nemotron-3-super-120b-a12b
+      - google/gemini-3.1-flash-lite
+      - anthropic/claude-opus-4.8
+      - anthropic/claude-sonnet-4.6
+      - meta-llama/llama-3.3-70b-instruct
+      - meta-llama/llama-4-scout
+      - meta-llama/llama-4-maverick
+      - openrouter/free
+    # 2026-08-30 live OpenRouter list: nvidia/nemotron-3-super-120b → -a12b;
+    # meta/llama-3.3-70b → meta-llama/llama-3.3-70b-instruct;
+    # llama-4-scout/maverick dropped their -17b-16e/-128e suffixes.
+    # Removed: google/gemma-4-31b-it, google/gemma-4-26b-a4b-it (superseded)
+    # meta-llama/llama-4-maverick: Groq route deprecated 2026-03-09; OpenRouter active
+
+  - name: openai
+    type: cloud
+    base_url: https://api.openai.com/v1
+    api_key_source: keychain:grip-openai
+    models: [gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.4-nano, gpt-4o, gpt-6-astra, gpt-6.2-astra, gpt-6.2-sol]
+    # gpt-6-astra sits before the two 2026-11-24 additions, against this list's
+    # newest-first habit, because the order is semantics rather than chronology:
+    # grip_harness_family.tier_match answers a qualifier with the FIRST model
+    # carrying it, and `6` is carried by the 5.6 tiers too. Last keeps `--gpt 6`
+    # on gpt-5.6-sol and leaves `--gpt astra` — the unambiguous name — as the
+    # only way in. Astra is $10/$50 per million against Sol's $4/$20, doubling on
+    # input and cache above 272K input tokens, so reaching it by accident is
+    # expensive. Added 2026-09-08; released 2026-09-03, per
+    # platform.openai.com/docs/changelog. Registered in HAL by HAL#558.
+    #
+    # gpt-6.2-astra and gpt-6.2-sol added 2026-11-24, launched 2026-11-17 (dogfood-
+    # domain family 8). Appended LAST for the SAME reason gpt-6-astra sits ahead of
+    # them: the generic qualifiers `astra`, `sol` and `6` are each carried by an
+    # older id too (gpt-6-astra, gpt-5.6-sol, gpt-5.6-sol/-terra/-luna
+    # respectively), and tier_match answers an ambiguous one-token qualifier with
+    # the FIRST model carrying it. Appending last means none of those qualifiers
+    # move: `--gpt astra` still lands on gpt-6-astra and `--gpt sol` still lands
+    # on gpt-5.6-sol (pinned by tests/test_gpt6_2_tier.py). Reach the 2026-11-24
+    # pair only by full id or a qualifier that names them uniquely, e.g.
+    # `--gpt 6.2-astra` / `--gpt 6.2-sol`. gpt-6.2-astra is $8/$40 per million,
+    # gpt-6.2-sol $2/$10, both doubling input/cache and 1.5x output above 272K
+    # input tokens (developers.openai.com/api/docs/pricing, read 2026-11-24). No
+    # default, flagship pin, routing chain or council seat names either id
+    # (V>>'s decision 6, 2026-11-24 HITL round 1).
+    # Removed 2026-08-30: gpt-5.5-pro (probe: "not a chat model" — Responses-only,
+    # fails on chat/completions; not eligible for the chat picker).
+    # Added 2026-08-17: the GPT-5.6 named tiers (sol/terra/luna), live-verified
+    # against api.openai.com/v1/models. GRIP had stopped at 5.5 while HAL already
+    # carried all three - the AGORA OpenAI rung was pinned to a model this file
+    # had itself removed.
+    # Removed: gpt-4o-mini, o3-mini (superseded by gpt-5.4-mini/nano)
+    # gpt-4o kept as legacy/compatibility
+
+  - name: anthropic
+    type: cloud
+    base_url: https://api.anthropic.com/v1
+    api_key_source: keychain:grip-anthropic-external
+    models: [claude-sonnet-5, claude-sonnet-5-5, claude-opus-5-5, claude-opus-5, claude-opus-4-8, claude-fable-5-1, claude-fable-5-2, claude-fable-5, claude-sonnet-4-6, claude-haiku-4-5-20251001, claude-haiku-5-5]
+    # Added 2026-11-11: claude-fable-5-2 AFTER claude-fable-5-1, so the one-token qualifier
+    #   `--claude fable` keeps naming Fable 5.1 until the operator moves it, as with Sonnet
+    #   5.5 and Haiku 5.5 below. Fable 5.2 is named with `--claude fable-5.2`, `--claude 5.2`
+    #   or the full id. It is priced BELOW Fable 5.1 ($8 / $40 against $10 / $50), so moving
+    #   `fable` would not raise cost; it is still the operator's decision, not this row's.
+    #   Served 2026-11-11 through Claude Code 2.1.319 (assistant.model=claude-fable-5-2) and
+    #   through HAL's CCH signer (a 200 answered as claude-fable-5-2, a nonsense control
+    #   refused). tests/test_model_onboarding_parity.py pins both landings.
+    # Added 2026-10-16 (GRIP#8413): claude-sonnet-5-5 AFTER claude-sonnet-5, so the one-token
+    #   qualifiers `--claude 5` and `--claude sonnet` keep answering Sonnet 5, the 2026-09-24
+    #   decision (tests/test_model_onboarding_parity.py::test_claude_5_qualifier_stays_on_sonnet_5
+    #   pins it). Whether `--claude sonnet` should move to the newest Sonnet is the operator's
+    #   call, not this row's. Sonnet 5.5 is named with `--claude sonnet-5.5` or the full id.
+    # This list is a capability enumeration AND, through its ORDER, a qualifier
+    # map: lib/grip_harness_family.tier_match answers a one-token qualifier
+    # (`--claude opus`, `--claude 5`) with the FIRST id carrying that token. So
+    # position is behaviour, not decoration — an earlier comment here said the
+    # opposite. A multi-token qualifier (`--claude 5.5`, `--claude opus-5`) or a
+    # full id is order-independent: it must name exactly one model.
+    # Added 2026-10-17 (GRIP#8213): claude-haiku-5-5 LAST, so `--claude haiku` keeps
+    #   meaning Haiku 4.5 until V>> moves it (Claude Code's own `haiku` alias already
+    #   means Haiku 5.5: /context budgets 950k for it on 2.1.296). With three ids ending
+    #   in 5-5, `--claude 5.5` is refused with the candidates; say `opus-5.5`,
+    #   `sonnet-5.5` or `haiku-5.5`. Both 5.5 models served on 2026-10-12 through
+    #   Claude Code 2.1.296 (modelUsage keyed by the id, a bogus control id refused)
+    #   and through HAL's CCH signer; both plain spellings budget 950k in /context.
+    # Added 2026-09-23 (GRIP#6563), reordered 2026-09-24: claude-opus-5-5 sits AFTER
+    #   claude-sonnet-5 so `--claude 5` still means Sonnet 5, and BEFORE claude-opus-5
+    #   so `--claude opus` means Opus 5.5 — V>>'s launch-default decision. GRIP#6563
+    #   had listed it first, which silently moved `--claude 5` from Sonnet 5 ($2/$10)
+    #   to Opus 5.5 ($4/$20): the first-match trap, reversed here and pinned by
+    #   tests/test_model_onboarding_parity.py. Probe-verified: /v1/models on this key
+    #   AND the subscription token returned 12 ids with has_more=false,
+    #   claude-opus-5-5 first; Claude Code 2.1.281 served it.
+    # Added 2026-09-01: claude-fable-5-1 (current Fable generation; Fable 5 now
+    #   listed legacy by the vendor but still served, so both stay). Probe-verified
+    #   the same day: /v1/models on this keychain key returned 11 ids with
+    #   has_more=false and claude-fable-5-1 was among them. What that probe does
+    #   NOT establish is subscription-path acceptance or plan entitlement.
+    #   Not wired into routing/council (Pool-A, weekly-limited).
+    # Added 2026-07-25: claude-opus-5 (GA current-gen Opus, supersedes 4-8 as frontier Opus;
+    #   verified live platform.claude.com). NOT wired into routing/council (Pool-A, weekly-limited).
+    # Removed: claude-opus-4-7 (superseded by 4-8 on subscription flat-fee)
+    # Fixed: claude-haiku-4-5 → claude-haiku-4-5-20251001 (canonical dated variant)
+    # RE-RELEASED (2026-06-12 export-control hold LIFTED, superseded):
+    #   claude-sonnet-5 — CC 2.1.197 default, native 1M; claude-fable-5 — CC 2.1.170, Mythos-class.
+    #   Served via CCH subscription OAuth (the grip-anthropic-external direct key currently = empty credit).
+    # Anthropic uses native /v1/messages with `x-api-key` header (not Bearer).
+    # HAL's OpenAI-compat router requires the custom adapter below.
+    # Direct callers (e.g. scripts/agora-agentmail-council.py) read this entry
+    # to discover the canonical keychain location and base URL.
+    # Keychain entry: grip-anthropic-external (verified 2026-05-04).
+    custom_adapter: anthropic_messages
+
+  - name: xai
+    type: cloud
+    base_url: https://api.x.ai/v1
+    api_key_source: keychain:grip-xai
+    models: [grok-4.3, grok-4.5, grok-4.20-0309-non-reasoning, grok-4.20-0309-reasoning, grok-4.7]
+    # Removed 2026-11-24, after bin/grip-model-watch listed them gone and a chat
+    # probe with a served and a nonsense control: grok-3, grok-3-mini,
+    # grok-4-0709 and grok-4-fast-non-reasoning still answer 200, but the
+    # reply's model field is grok-4.3, so xAI aliases them and a record naming
+    # them would name a model it did not call; grok-build-0.1 and
+    # grok-code-fast-1 answer 404.
+    # 2026-11-24 (dogfood-domain family 5): grok-4.5 and grok-4.20-0309-non-reasoning
+    # join as PARITY — GRIP's own code already called them (lib/sovereign_council.py,
+    # lib/broly_council.py, lib/council_seat.py) while this list named only grok-4.3,
+    # so a call on either address fell through to the unpriced default tier.
+    # grok-4.20-0309-reasoning (1M ctx, priced the same as grok-4.3) and grok-4.7
+    # (flagship, 500K ctx, released 2026-09-21, $2/$0.50/$6 per 1M tokens under
+    # 200K prompt tokens and $4/$1/$12 at or above — docs.x.ai/developers/
+    # release-notes, read 2026-11-24) are the genuinely NEW ids this family adds.
+    # Listed non-reasoning BEFORE reasoning on purpose: both carry the one-token
+    # qualifiers `20` and `0309` (grip_harness_family.tier_match answers a one-token
+    # qualifier with the first listed match), and reasoning's always-on thinking can
+    # emit materially more output tokens for the same request, so an ambiguous
+    # qualifier lands on the cheaper-in-practice sibling; either is still reachable
+    # in full by its own id or an unambiguous multi-token qualifier such as
+    # `0309-reasoning`. grok-4.7 sits last, as the newest id, so it cannot capture a
+    # qualifier that used to answer with an earlier model (dogfood-domain step 9).
+    # Nothing here moves FAMILY_FLAGSHIP (grok-4.3), the fallback/tier/council
+    # routing below, or AGORA's technical seat (xai/grok-4.3) — decision 6,
+    # V>> 2026-11-24.
+
+  - name: soruxgpt
+    type: cloud
+    base_url: https://service.soruxgpt.com/api/api
+    api_key_source: keychain:grip-soruxgpt
+    # UNVERIFIED 2026-08-30: the listed base path 404s for every model below
+    # (relay panel has moved endpoints). Re-probe against soruxgpt docs before
+    # relying on this provider.
+    models: [gpt-4o, gpt-4o-mini, claude-3-5-sonnet-20241022, deepseek-chat, gemini-2.0-flash-exp]
+
+  - name: vulavula
+    type: cloud
+    base_url: https://api.lelapa.ai/v1
+    api_key_source: keychain:grip-vulavula
+    models: [translate, transcribe, sentiment]
+    custom_adapter: vulavula
+
+
+  # The VPS sovereign council as ONE selectable OpenAI-compat model (ADR 0012, C').
+  # The picker forwards the selection to the local HAL gateway :4010, which routes
+  # the 'council' family DOWNSTREAM to the VPS council endpoint (Tailscale
+  # 100.64.0.10:8791) with fail-open. base_url is documentary (the picker does not
+  # dial it); api_key_source is the HAL gateway key. The council itself is
+  # zero-Anthropic (Pool-B speakers + exogenous judge, sha256+IDR sealed on the VPS).
+  - name: grip-vps
+    type: cloud
+    base_url: https://your-gateway.example.com/v1
+    api_key_source: keychain:grip-anthropic-external
+    models: [council]
+
+  - name: lemonade
+    type: local
+    base_url: http://localhost:7860/v1
+    detect: true
+    models: auto
+
+  - name: ollama
+    type: local
+    base_url: http://localhost:11434/v1
+    detect: true
+    # Primary: gemma4:26b (MoE 128/9 experts, ~4B effective, 256K ctx, multimodal)
+    # Install: ollama pull gemma4:26b
+    models: auto
+
+  - name: vllm
+    type: local
+    base_url: http://localhost:8000
+    detect: true
+    models: auto
+
+  - name: lmstudio
+    type: local
+    base_url: http://localhost:1234
+    detect: true
+    models: auto
+
+  - name: mlx_vlm
+    type: local
+    base_url: http://localhost:8080
+    auth: none
+    detect: true
+    models: auto
+    timeout_s: 180
+    # mlx-vlm v0.4.3: vision, audio, OCR, object detection, segmentation
+    # Start: uv pip install -U mlx-vlm && python -m mlx_vlm.server --port 8080
+
+routing:
+  default: fallback
+  # UPDATED 2026-06-24: was groq/llama-3.3-70b-versatile — deprecated Groq 2026-06-17
+  default_model: groq/openai/gpt-oss-120b
+  # Ordering: speed (Groq infra) → reliability (Gemini 1M-ctx) → frontier (xAI)
+  #   → cost (OpenRouter passthrough, Qwen) → quality-cost (DeepSeek) → local (Ollama)
+  fallback_chain:
+    - groq/openai/gpt-oss-120b
+    - gemini/gemini-3.5-flash-lite
+    - xai/grok-4.3
+    - openrouter/deepseek/deepseek-v4-flash
+    - qwen/qwen3.5-flash
+    - deepseek/deepseek-flash
+    - ollama/gemma4:26b
+
+  quality_cost:
+    simple:  groq/openai/gpt-oss-120b
+    standard: openrouter/deepseek/deepseek-v4-flash
+    complex: gemini/gemini-3.1-pro-preview
+    local:   ollama/gemma4:26b
+
+  # Tier-scoped fallback chains — failures stay within cost tier before escalating
+  tier_chains:
+    free:    [ollama/gemma4:26b, openrouter/openrouter/free]
+    cheap:   [groq/openai/gpt-oss-20b, qwen/qwen3.5-flash, openrouter/deepseek/deepseek-v4-flash]
+    mid:     [gemini/gemini-3.5-flash-lite, deepseek/deepseek-flash, moonshot/kimi-k2.6]
+    premium: [xai/grok-4.3, gemini/gemini-3.1-pro-preview, qwen/qwen3.7-max, moonshot/kimi-k2.7-code]
+
+  # Council models for cross-LLM deliberation (HALCouncil)
+  # Architecture diversity: Groq OSS, Google, xAI, Alibaba, DeepSeek, Mistral open-weight
+  council:
+    - groq/openai/gpt-oss-120b
+    - gemini/gemini-3.5-flash-lite
+    - xai/grok-4.3
+    - qwen/qwen3.7-max
+    - deepseek/deepseek-flash
+    - mistral/mistral-large-latest

@@ -1,0 +1,739 @@
+#!/usr/bin/env python3
+"""GRIP Sovereign Council CLI — a multi-LLM council that runs with ZERO Anthropic.
+
+The council core (REGISTRY, fan_out, judge, seal, IDR provenance) lives in
+``lib/sovereign_council.py`` — extracted at its 3rd consumer per YSH (this CLI,
+``bin/grip-sovereign-demo``, and ``bin/grip-council-endpoint`` all reuse it). This
+file is the thin CLI: argument parsing, human-readable rendering, and the
+``--show`` / ``--verify`` / ``--merkle`` record commands.
+
+"Thin" is about WHERE the cognition lives, not about line count: no council
+logic belongs here, but presentation does, and the render helpers below are
+shared by both surfaces that present a council — a live run and ``--show``
+reading a sealed record back off disk.
+
+  1. FAN-OUT  — the question is answered IN PARALLEL by N non-Anthropic speakers.
+  2. JUDGE    — a *different* non-Anthropic model ranks + synthesises (exogenous).
+  3. SEAL     — sha256 over {prompt, answers, verdict} + a signed IDR leaf; edit
+                any byte and ``--verify`` reports TAMPERED.
+
+Speaker answers print IN FULL. They used to be cut to 217 characters + "...",
+which hid most of every real answer; ``--brief`` restores that cap for a quick
+scan, and ``--show`` reads any past record back off disk.
+
+Usage:
+  grip-sovereign-council ["prompt"]
+  grip-sovereign-council --speakers deepseek,openai,gemini,groq --judge gemini-pro ["prompt"]
+  grip-sovereign-council --advisor codex --speakers xai,groq ["prompt"]   (Knight's Roundtable)
+  grip-sovereign-council --brief ["prompt"]
+  grip-sovereign-council --show <sha|path-to-record.json>
+  grip-sovereign-council --verify <sha|path-to-record.json> [--pubkeys <file>]
+  grip-sovereign-council --merkle
+
+What a STRANGER holding a shipped record can establish, and what they cannot.
+INTEGRITY, always and with no keys: ``--verify`` re-derives the sha256 from the
+record's own bytes, so one altered character reports TAMPERED — and it does
+that against the file WHERE IT LIES, so a record that travels with a document
+needs no GRIP install to check. ATTRIBUTION — that this operator's keys sealed
+it, rather than anyone who can write a JSON file — needs their PUBLISHED public
+keys, passed with ``--pubkeys`` (or ``$GRIP_COUNCIL_VERIFY_KEYS``). Without
+them the IDR leaf's signatures are present but unchecked and the verdict line
+says exactly that. Publishing the keys is the operator's decision; consuming
+them is this tool's job.
+
+Provider keys read in-process from the env -> Keychain -> /proc ladder; never
+printed. Verification keys are PUBLIC and are the only keys this tool reads
+from a file the reader supplies.
+"""
+from __future__ import annotations
+
+# Windows consoles default to cp1252, which cannot encode the glyphs below.
+# Located from __file__, not sys.path[0]: the tests load these commands with
+# SourceFileLoader, which does not put bin/ on the path.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from _grip_console import ensure_utf8_stdio  # noqa: E402
+
+ensure_utf8_stdio()
+
+import json
+import pathlib
+import sys
+import textwrap
+
+# Ensure both repo root and lib/ are on sys.path so the council core + IDR imports
+# resolve when invoked directly as a bin (pytest adds lib/ automatically; bin runs
+# do not).
+_ROOT = pathlib.Path(__file__).resolve().parent.parent
+for _p in (str(_ROOT), str(_ROOT / "lib")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from sovereign_council import (  # noqa: E402
+    ANTHROPIC_SPEAKERS,
+    DEFAULT_JUDGE,
+    DEFAULT_SPEAKERS,
+    REGISTRY,
+    SUBPROCESS_SPEAKERS,
+    STATE_DIR,
+    _council_merkle_root,
+    _seal_idr,
+    _verify_idr,
+    fan_out,
+    judge,
+    load_verify_keys,
+    no_quorum_verdict,
+    recompute,
+    resolve_record_path,
+    roundtable,
+    seal,
+)
+from jcs import JcsError  # noqa: E402
+
+
+def cmd_verify(record_ref: str, *, pubkeys: "str | None" = None,
+               idr: "str | None" = None,
+               _idr_path: "pathlib.Path | None" = None) -> int:
+    """Verify one sealed record, named either by content-address or by PATH.
+
+    ``record_ref`` is resolved by ``resolve_record_path``: a path is read where
+    it lies, so a record that ships with a document is verifiable without
+    first copying it into a directory that only exists on a GRIP install.
+
+    ``pubkeys`` names the reader's own published-key file. With it, the IDR
+    leaf's signatures are checked against THOSE keys and GRIP's own key
+    directory is never consulted — which is the only form of the check that
+    means anything to someone who does not trust GRIP.
+
+    ``idr`` names a JSONL carrying the signed leaf. A council record does NOT
+    contain its own signature — the shipped seal has no ``audit`` block at all,
+    because the signature lives on the leaf in the operator's chain. So without
+    a way for that leaf to travel beside the record, ``--pubkeys`` would have
+    nothing to check and would be a capability in name only.
+    """
+    path = resolve_record_path(record_ref, STATE_DIR)
+    if not path.is_file():
+        print(f"no sealed record at {path}"); return 1
+    # Each file gets its OWN door. Raised by AGORA speaker A on PR #6431 and
+    # confirmed real: one handler around both reads meant a damaged RECORD
+    # printed "cannot read verification keys" — json.JSONDecodeError subclasses
+    # ValueError — sending the reader to edit a key file that was never broken,
+    # and which in that run had not even been supplied.
+    try:
+        keys = load_verify_keys(pubkeys)
+    except (OSError, ValueError) as exc:
+        print(f"cannot read verification keys: {exc}"); return 1
+    chain = _idr_path
+    if idr is not None:
+        # Only an EXPLICIT --idr is existence-checked: a file the reader named
+        # and that is not there is their typo to fix, and saying so beats
+        # degrading to "the leaf did not travel", which would be a true
+        # sentence about the wrong file. An absent default chain is the normal
+        # stranger case and is reported by the leaf line, not refused here.
+        chain = pathlib.Path(idr).expanduser()
+        if not chain.is_file():
+            print(f"no IDR chain at {chain}"); return 1
+    try:
+        # See the writer in lib/sovereign_council.py: records are UTF-8. Reading
+        # them with the Windows locale default mis-decodes those bytes, so
+        # recompute() hashes different text and a GENUINE record reports
+        # TAMPERED -- the worst failure a verifier can have, because it
+        # destroys trust in valid evidence rather than merely missing an attack.
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"cannot read sealed record at {path}: {exc}"); return 1
+    if not isinstance(record, dict) or "sha256" not in record:
+        # Reachable only because a reader can now name any file on disk; every
+        # record under STATE_DIR was written by seal() and carries the field.
+        # Refused rather than called TAMPERED — a file with no seal is more
+        # likely not a council record at all than a stripped one — but never,
+        # under any reading, verified.
+        print(f"not a sealed council record (no sha256 field): {path}"); return 1
+    try:
+        fresh = recompute(record)
+    except KeyError as exc:
+        # The seal survived but a field it covers did not. seal() writes every one,
+        # so the field was deleted after sealing. This used to raise out of the
+        # command as a traceback instead of a verdict (GRIP#6432).
+        print(f"record   : {path}")
+        print(f"VERDICT  : TAMPERED ✗ (sealed field {exc} is missing — content was altered)")
+        return 2
+    except JcsError as exc:
+        # A seal_format this build cannot hash. A newer GRIP may have written it, so
+        # it is refused rather than called TAMPERED -- and never verified.
+        print(f"cannot verify {path}: {exc}"); return 1
+    sha_ok = fresh == record["sha256"]
+    idr_line, idr_ok = _verify_idr(record, _idr_path=chain, pubkeys=keys)
+    print(f"record   : {path}")
+    print(f"sealed   : {record['sha256']}")
+    print(f"recompute: {fresh}")
+    print(idr_line)
+    if not sha_ok:
+        print("VERDICT  : TAMPERED ✗ (sha256 mismatch — content was altered)"); return 2
+    if idr_ok is False:
+        print("VERDICT  : TAMPERED ✗ (sha256 ok but IDR signature BROKEN)"); return 2
+    _print_what_was_checked(idr_ok)
+    return 0
+
+
+#: What a clean verification does NOT tell you. Printed with every pass, because a
+#: single "PROVEN ✓" is exactly the overclaim that produced a real defect on
+#: 2026-09-17: a forged verdict verified clean because three checks each agreed with
+#: the record rather than with anything the forger could not control. A surveyed
+#: competitor (Asqav, MIT-licensed) already exposes a fixed non-assertions list and
+#: deliberately publishes NO single "valid" flag; this adopts that discipline.
+#:
+#: These are not hedges. Each names a property a reader WILL otherwise assume, and
+#: each is a real gap measured this session — recorded in
+#: docs/measurements/2026-09-17-adversarial-boundary-injections.md.
+NON_ASSERTIONS = (
+    "the council's answers are CORRECT — only that they are the answers that were given",
+    "the recorded time is TRUE — `ts` is written by the author; no external "
+    "timestamp authority attests it unless GRIP_TSA_URL was set",
+    "nothing BYPASSED the sealing path — a decision made and never sealed leaves "
+    "no trace here",
+    "the signing key is UNCOMPROMISED — a holder of the key can produce a record "
+    "that verifies",
+    "the chain is COMPLETE — truncating it leaves every surviving link valid",
+)
+
+
+def _print_what_was_checked(idr_ok: "bool | None") -> None:
+    """Report what verification established, and what it explicitly did not.
+
+    Deliberately NOT a single verdict token. The one-word summary is what let a
+    forged record read as clean, and a reader who takes "PROVEN" to mean "this
+    decision was right, at that time, and nothing was missed" has been misled by
+    an accurate word.
+    """
+    print("CHECKED  : content digest matches the sealed value")
+    if idr_ok is True:
+        print("           signed IDR leaf verifies, and it commits to THIS digest")
+    else:
+        # Deliberately neutral, because this branch now covers several
+        # different situations — no leaf, no lib, no keys supplied, or a dual
+        # seal whose post-quantum limb could not be checked here. The leaf line
+        # above states which one, so asserting a specific cause here would
+        # contradict it in exactly the cases it matters.
+        print("           IDR leaf NOT fully verified — the leaf line above says "
+              "what was checked")
+    print("NOT ASSERTED by a clean result — each of these is a real, measured gap:")
+    for item in NON_ASSERTIONS:
+        print(f"           · {item}")
+    if idr_ok is not True:
+        print("           · anything the signature would have shown, since it was "
+              "not checked")
+
+
+def cmd_merkle() -> int:
+    """Print the single externally-anchorable Merkle root committing all council verdicts."""
+    res = _council_merkle_root()
+    if res is None:
+        print("IDR forest lib unavailable — cannot compute Merkle root")
+        return 1
+    root, n = res
+    if n == 0:
+        print("no sealed council verdicts in the IDR chain yet — run a council first")
+        return 1
+    print(f"council verdicts committed : {n}")
+    print(f"Merkle root (RFC6962)      : {root}")
+    print("externally anchorable      : submit this root on-chain (lib/idr_forest anchoring) "
+          "to bind every verdict to an exogenous timestamp")
+    return 0
+
+
+# ── rendering ────────────────────────────────────────────────────────────────
+# Speaker answers print IN FULL. Every speaker used to go through
+# ``text[:217] + "..."``: measured across the 184 sealed records on the machine
+# where this was found, 411 of 615 answered speakers (67%) ran past that cap and
+# the median answer was 979 characters — so the console showed roughly the first
+# fifth of a typical answer, usually stopping mid-word, and any second or third
+# finding was invisible. The reasoning IS the council's product, so it is no
+# longer the part that gets thrown away. The data was never lost: seal() has
+# always written the whole answer to the sealed record, which is why this is a
+# presentation fix that leaves the sealed payload untouched.
+
+_BORDER_W = 74
+_BODY_INDENT = " " * 8
+_BRIEF_CAP = 220  # chars kept by --brief before the "..." — the pre-fix default
+
+
+def _wrap_body(text: str) -> str:
+    """Wrap *text* to the console border and indent it under its speaker header.
+
+    Each source line keeps its own leading whitespace, so numbered findings and
+    nested bullets stay readable. Long unbroken tokens — a sha256, a URL, a file
+    path — are deliberately never split: a broken identifier no longer
+    copy-pastes, which is a worse failure than one over-long line.
+    """
+    out: list[str] = []
+    for line in text.splitlines() or [""]:
+        stripped = line.lstrip()
+        if not stripped:
+            out.append("")
+            continue
+        lead = line[: len(line) - len(stripped)]
+        out.extend(textwrap.wrap(
+            stripped, width=max(24, _BORDER_W - len(lead)),
+            initial_indent=lead, subsequent_indent=lead,
+            break_long_words=False, break_on_hyphens=False,
+        ) or [lead])
+    return "\n".join(_BODY_INDENT + ln if ln else "" for ln in out)
+
+
+def _print_speaker(speaker: dict, *, brief: bool, latency: "float | None" = None) -> None:
+    """Print one speaker: a header line, then the answer body.
+
+    ``truncated`` is already sealed by the council core; surfacing it here is
+    what makes a model-side cut-off visible at a glance instead of only to
+    someone who opens the JSON.
+    """
+    flag = "✓" if speaker.get("ok") else "✗"
+    lat = f"{latency:5.2f}s" if latency is not None else ""
+    warn = ("  ⚠ CUT OFF (hit its token budget — this answer stops mid-thought)"
+            if speaker.get("truncated") else "")
+    print(f"  [{flag}] {speaker['name']:9} {speaker['model']:24} {lat}{warn}")
+    text = speaker.get("text") or ""
+    if brief and len(text) > _BRIEF_CAP:
+        text = text[: _BRIEF_CAP - 3] + "..."
+    print(f"{_wrap_body(text)}\n")
+
+
+def _print_judge(model: str, best: str, synthesis: str, *, truncated: bool = False) -> None:
+    """Print the judge block.
+
+    Deliberately left on ONE unwrapped line: ``lib/ultralearn.py`` parses the
+    consensus back out with ``consensus:\\s*(.+)``, and ``.`` does not cross a
+    newline, so wrapping here would silently shorten that capture to the first
+    wrapped line — re-introducing the very defect this file is fixing. The judge
+    synthesis is one sentence by design and was never capped, so there is
+    nothing to fix on this line.
+
+    ``truncated`` gets the same ⚠ a cut-off speaker gets. The judge was the one
+    voice on the panel whose being cut off went unannounced, which is backwards:
+    it is the one that states the verdict.
+    """
+    warn = ("  ⚠ CUT OFF (hit its token budget — this verdict stops mid-thought)"
+            if truncated else "")
+    print(f"  JUDGE  ⚖  {model} (non-Anthropic, exogenous to the panel){warn}")
+    print(f"  best   → {best}")
+    print(f"  consensus: {synthesis}")
+
+
+def _print_no_quorum(answered: int, total: int) -> None:
+    """What to print when nobody answered. NOT a verdict.
+
+    Observed 2026-09-20: every speaker timed out, `speakers answered : 0/1`,
+    and the block above still printed `best → Model A` and a fluent paragraph
+    beginning "The council consensus defines...". The judge had been handed an
+    empty panel and synthesised from the question alone.
+
+    The SEAL was honest throughout — ok=False, judge_ok=None, consensus=None —
+    which is the more dangerous shape, not the safer one: a human reads the
+    terminal, never the JSON, so the only lying surface was the one anybody
+    actually looks at. This nearly went into a report as Astra's design opinion.
+
+    GRIP's own law already says what to do here. CLAUDE.md: "Below that floor
+    the outcome is NO_QUORUM, which does withhold it: a tribunal under its own
+    quorum has ratified nothing." `lib/continuity_council.py` raises on a
+    dangling verdict for the same reason. This tool was the one place that
+    printed a consensus anyway.
+    """
+    print(f"  NO QUORUM — {answered} of {total} speakers answered.")
+    print("  No verdict was rendered. A council with nobody sitting has")
+    print("  ratified nothing, and a synthesis built from an empty panel")
+    print("  would be the judge answering the question by itself.")
+
+
+def _print_provenance(sha: str, idr_id: "str | None", *, sealed_at: str = "",
+                      record_path: "pathlib.Path | None" = None) -> None:
+    """Print the seal, and how to get back to it.
+
+    The record path is printed because a console scrollback is not a durable
+    home for a council's reasoning: without it, recovering a past answer meant
+    knowing the state directory by heart.
+
+    ``record_path`` names the file this record was actually READ from, so the
+    two commands below are ones the reader can paste. A record that travelled
+    with a document does not live under ``STATE_DIR`` on the reader's machine,
+    and printing a re-verify command that resolves there would hand them an
+    instruction that fails — the defect GRIP#6430 reports, repeated in the
+    hint that is supposed to fix it.
+    """
+    print(f"  PROVENANCE sha256 : {sha}")
+    if idr_id:
+        print(f"  IDR leaf id       : {idr_id}")
+    if sealed_at:
+        print(f"  sealed at         : {sealed_at}")
+    if sha:
+        ref = str(record_path) if record_path is not None else sha[:16]
+        print(f"  sealed record     : "
+              f"{record_path if record_path is not None else STATE_DIR / (sha[:16] + '.json')}")
+        print(f"  re-verify         : grip-sovereign-council --verify {ref}")
+        print(f"  re-read in full   : grip-sovereign-council --show {ref}")
+
+
+def _speaker_from_record(s: dict) -> dict:
+    """Sealed-record speaker -> the shape :func:`_print_speaker` expects.
+
+    The seal stores the answer under ``answer``; a live run carries it as
+    ``text``. Normalising here lets one renderer serve both surfaces.
+    """
+    return {
+        "name": s.get("name", "?"),
+        "model": s.get("model", "?"),
+        "ok": bool(s.get("ok", True)),
+        "text": s.get("answer", ""),
+        "truncated": bool(s.get("truncated", False)),
+    }
+
+
+def render(prompt: str, results: list, total: float, verdict: dict, sha: str,
+           idr_id: "str | None" = None, *, brief: bool = False) -> None:
+    bar = "═" * _BORDER_W
+    # Honest accounting, never an asserted zero: an operator-directed fable
+    # seat (V>> 2026-09-24) is Anthropic and must be visible up front.
+    ac = sum(1 for r in results if r.get("name") in ANTHROPIC_SPEAKERS)
+    tag = "ZERO Anthropic" if ac == 0 else f"{ac} Anthropic seat(s), operator-directed"
+    print(bar)
+    print(f"  GRIP SOVEREIGN COUNCIL — multi-LLM, judged, sealed · {tag}")
+    print(bar)
+    print(f"  Q: {prompt}\n")
+    for r in results:
+        _print_speaker(r, brief=brief, latency=r["end"] - r["start"])
+    print("─" * _BORDER_W)
+    ok = [r for r in results if r["ok"]]
+    if ok and verdict.get("judge_model"):
+        _print_judge(verdict["judge_model"], verdict["best"], verdict["synthesis"],
+                     truncated=bool(verdict.get("judge_truncated")))
+    else:
+        _print_no_quorum(len(ok), len(results))
+    print("─" * _BORDER_W)
+    lats = [r["end"] - r["start"] for r in results]
+    denom = sum(lats) - (max(lats) if lats else 0.0)
+    overlap = (sum(lats) - total) / denom if denom > 0.05 else 1.0
+    # A speaker cut off mid-thought still counts as having answered, because it
+    # did answer -- just not to the end. Left unqualified, "4/4" reads as a full
+    # panel when half of it never reached a position. Observed twice on
+    # 2026-08-19: 2 of 4 truncated, both runs, and the summary said 4/4 both
+    # times. Same false green the AGORA fallback tally carried (#4946).
+    cut = [r for r in ok if r.get("truncated")]
+    cut_note = f" ({len(cut)} cut off)" if cut else ""
+    print(f"  speakers answered : {len(ok)}/{len(results)}{cut_note}"
+          f"   |   parallel overlap: {overlap*100:.0f}%")
+    if ac:
+        print(f"  Anthropic calls   : {ac}   (operator-directed temporary seat"
+              " — judge non-Anthropic)")
+    else:
+        print("  Anthropic calls   : 0   (every speaker + the judge is non-Anthropic)")
+    _print_provenance(sha, idr_id)
+    print(bar)
+
+
+def cmd_show(record_ref: str, *, brief: bool = False) -> int:
+    """Print a sealed record's FULL speaker answers and judge verdict, from disk.
+
+    ``--verify`` proves a record is untampered but prints only provenance. This
+    is the retrieval path: without it, reading back what the council actually
+    said meant hand-writing a JSON reader.
+
+    Takes a content-address OR a path, the same as ``--verify``: a reader who
+    can verify a shipped record must also be able to read it, and splitting
+    those two abilities would leave them able to prove a document sound
+    without ever seeing what it says.
+    """
+    path = resolve_record_path(record_ref, STATE_DIR)
+    if not path.is_file():
+        print(f"no sealed record at {path}")
+        return 1
+    # Records are UTF-8; the locale default mis-decodes them on Windows and a
+    # genuine record then reports TAMPERED. See lib/sovereign_council.py.
+    record = json.loads(path.read_text(encoding="utf-8"))
+    bar = "═" * _BORDER_W
+    print(bar)
+    print(f"  SEALED COUNCIL RECORD — {path.name}")
+    print(bar)
+    print(f"  Q: {record.get('prompt', '')}\n")
+    for s in record.get("speakers", []):
+        _print_speaker(_speaker_from_record(s), brief=brief)
+    print("─" * _BORDER_W)
+    judge_rec = record.get("judge", {})
+    # Older seals carry no judge truncation flag; absent reads as complete,
+    # which is what those records already implied.
+    _print_judge(judge_rec.get("model", "?"), judge_rec.get("best", "?"),
+                 judge_rec.get("synthesis", ""),
+                 truncated=bool(judge_rec.get("truncated")))
+    print("─" * _BORDER_W)
+    _print_provenance(record.get("sha256", ""), record.get("idr_id"),
+                      sealed_at=record.get("sealed_at", ""), record_path=path)
+    print(bar)
+    return 0
+
+
+def _usage() -> str:
+    return (
+        "grip-sovereign-council — a multi-LLM council that runs with ZERO Anthropic.\n"
+        "\n"
+        "  grip-sovereign-council [\"prompt\"]            convene the council\n"
+        "  grip-sovereign-council --show <sha|path>     re-read a sealed record in full\n"
+        "  grip-sovereign-council --verify <sha|path>   check a sealed record for tampering\n"
+        "  grip-sovereign-council --merkle              Merkle root over every sealed verdict\n"
+        "\n"
+        f"  --speakers a,b,c   choose the panel   (default: {','.join(DEFAULT_SPEAKERS)})\n"
+        f"  --judge <name>     choose the judge   (default: {DEFAULT_JUDGE})\n"
+        f"  --brief            cap each answer at {_BRIEF_CAP} characters;\n"
+        "                     the default prints every answer IN FULL\n"
+        "  --pubkeys <file>   the operator's PUBLISHED verifying keys. Must be a JSON\n"
+        "                     OBJECT {\"<key fingerprint>\": \"<public key hex>\"} — the\n"
+        "                     same shape GRASP reads from GRASP_VERIFY_KEYS. May also\n"
+        "                     be given inline as $GRIP_COUNCIL_VERIFY_KEYS. A map that\n"
+        "                     is not an object, or whose values are not hex, is\n"
+        "                     refused by name rather than read as no keys at all.\n"
+        "  --idr <file>       the JSONL carrying this record's signed IDR leaf. A\n"
+        "                     council record holds no signature of its own, so the\n"
+        "                     leaf must travel beside it for --pubkeys to check\n"
+        "                     anything.\n"
+        "\n"
+        "WHAT A STRANGER CAN VERIFY, AND WHAT THEY CANNOT\n"
+        "  Integrity, always, with no keys and no GRIP install: --verify re-derives\n"
+        "  the record's sha256 from its own bytes, so one altered character reports\n"
+        "  TAMPERED, and a path argument checks the file wherever it lies rather than\n"
+        "  only under this machine's state directory. Attribution — that the record\n"
+        "  was sealed by THIS operator's keys and not by anyone able to write a JSON\n"
+        "  file — needs their published public keys via --pubkeys, and the signed\n"
+        "  leaf via --idr; without those the signatures are unchecked (or absent),\n"
+        "  and the verdict line says so rather than implying more. Publishing the\n"
+        "  keys is the operator's call; consuming them is this tool's job.\n"
+    )
+
+
+def _dispatch_subcommand(argv: list, *, brief: bool,
+                         pubkeys: "str | None" = None,
+                         idr: "str | None" = None) -> "int | None":
+    """Route a record/usage subcommand.
+
+    Returns that subcommand's exit code, or ``None`` when the arguments are not
+    a subcommand at all and the caller should convene the council. Split out of
+    main() to keep both halves under the cyclomatic-complexity threshold
+    (rules/cc-enforcement.md): argument routing and running a council are two
+    responsibilities, and main() had grown to hold both.
+    """
+    head = argv[0] if argv else ""
+    if head in ("--help", "-h"):
+        # Before this, --help fell through and was treated as the PROMPT: it
+        # fanned out to every provider and asked them the literal string
+        # "--help" — a live, billable, network-dependent run for a usage query.
+        print(_usage())
+        return 0
+    if head == "--verify":
+        if len(argv) < 2:
+            return print("usage: --verify <sha|path-to-record.json> "
+                         "[--idr <leaf.jsonl>] [--pubkeys <keys.json>]") or 1
+        return cmd_verify(argv[1], pubkeys=pubkeys, idr=idr)
+    if head == "--show":
+        if len(argv) < 2:
+            return print("usage: --show <sha|path-to-record.json>") or 1
+        return cmd_show(argv[1], brief=brief)
+    if head == "--merkle":
+        return cmd_merkle()
+    return None
+
+
+def _take_option(argv: list, flag: str) -> "tuple[str | None, list]":
+    """Consume a position-independent ``<flag> <value>`` pair from *argv*.
+
+    Returns ``(value_or_None, remaining_argv)``. A trailing *flag* with no
+    value is dropped and reported as absent, which surfaces as the ordinary
+    "no verification keys supplied" line rather than an argument-parsing crash.
+
+    Position-independent so a reader can append the flag AFTER the record they
+    already typed — which is the order it is reached in practice, because you
+    go looking for your keys only once the line says DEGRADED.
+
+    A REPEATED flag resolves the ordinary shell way: every occurrence is
+    consumed and the LAST value wins. Raised twice by AGORA on PR #6431,
+    where taking the first occurrence left the second in argv to be read as
+    part of the prompt. Last-wins rather than raising, so a reader correcting
+    a typo by re-typing the flag gets what they meant.
+    """
+    value, rest = None, list(argv)
+    while flag in rest:
+        i = rest.index(flag)
+        if i + 1 < len(rest):
+            value = rest[i + 1]
+        rest = rest[:i] + rest[i + 2:]
+    return value, rest
+
+
+def _seat_names(flag: str, value: str) -> list[str]:
+    """The names a seat flag asks for: a comma list for --speakers, one name otherwise."""
+    parts = value.split(",") if flag == "--speakers" else [value]
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _seatable() -> frozenset:
+    """Every name that may speak or advise. The judge is REGISTRY-only.
+
+    A function rather than a module constant, so it reads the registry as it
+    is when called and cannot go stale.
+    """
+    return frozenset(REGISTRY) | frozenset(SUBPROCESS_SPEAKERS)
+
+
+def _unseatable(flag: str, names: list[str]) -> list[str]:
+    """Each requested name this flag cannot seat, as "<flag> <name>".
+
+    The judge must be a REGISTRY seat; a speaker or the advisor may also be a
+    subscription CLI seat. A flag that names nobody is itself unseatable,
+    because it would otherwise convene an empty panel or no judge.
+    """
+    if not names:
+        return [f"{flag} (no name given)"]
+    allowed = frozenset(REGISTRY) if flag == "--judge" else _seatable()
+    return [f"{flag} {n}" for n in names if n not in allowed]
+
+
+def _unseatable_message(refused: list[str]) -> str:
+    return (f"unknown council seat: {', '.join(refused)}\n"
+            f"  speakers and the advisor may be: {', '.join(sorted(_seatable()))}\n"
+            f"  the judge may be: {', '.join(sorted(REGISTRY))}")
+
+
+_SEAT_FLAGS = ("--speakers", "--judge", "--advisor")
+_DEFAULT_PROMPT = "In one sentence: what makes a software company's moat durable rather than temporary?"
+
+
+def _take_seats(argv: list) -> "tuple[dict, list]":
+    """The seat flags wherever they sit, as {flag: value}, and the rest of argv.
+
+    GRIP#8786: they were read only while they led the list, so a flag after the
+    prompt was dropped without a word and the default panel sat. The last value
+    wins, as for --pubkeys; a flag with no value maps to "" and is refused below
+    as naming nobody.
+    """
+    seats = {}
+    for flag in _SEAT_FLAGS:
+        if flag in argv:
+            value, argv = _take_option(argv, flag)
+            seats[flag] = value or ""
+    return seats, argv
+
+
+def _seated(seats: dict) -> "dict | None":
+    """{"speakers", "judge_name", "advisor"} for the seat flags, or None after
+    saying which name cannot sit. GRIP#6652: an unknown name used to be dropped or
+    replaced silently, so the sealed verdict recorded a council nobody asked for;
+    refuse before any paid call. Subscription CLI seats may speak or advise, never
+    judge, and lib roundtable() keeps the advisor (Knight's Roundtable) off the
+    bench. Named, not positional, so the judge and the advisor cannot be swapped
+    by a reordering (AGORA on GRIP#9725)."""
+    seated = {"speakers": list(DEFAULT_SPEAKERS), "judge_name": DEFAULT_JUDGE, "advisor": None}
+    role = {"--speakers": "speakers", "--judge": "judge_name", "--advisor": "advisor"}
+    for flag, value in seats.items():
+        names = _seat_names(flag, value)
+        refused = _unseatable(flag, names)
+        if refused:
+            print(_unseatable_message(refused), file=sys.stderr)
+            return None
+        seated[role[flag]] = names if flag == "--speakers" else names[0]
+    return seated
+
+
+def _is_stray_option(arg: str) -> bool:
+    """A lone "-word" or "--word", one token with no whitespace in it, is a
+    mistyped option, never a prompt: "grip-sovereign-council --jduge" used to
+    convene a council with "--jduge" as its question (AGORA on GRIP#9730). A
+    real prompt that starts with a dash has more words, whether a space, a tab
+    or a line break separates them (AGORA on GRIP#9772), so it still passes."""
+    return arg.startswith("-") and len(arg.split()) == 1
+
+
+def _leftover_message(argv: list) -> str:
+    """Why words after the prompt are refused, naming an option the tool does not
+    know, which is likelier a typo than an unquoted prompt (AGORA on GRIP#9725)."""
+    unknown = [a for a in argv if a.startswith("-")]
+    if unknown:
+        return f"unknown option: {', '.join(unknown)} (the seat flags are {', '.join(_SEAT_FLAGS)})"
+    return f"one prompt expected, got {len(argv)} arguments: quote the prompt"
+
+
+def main() -> int:
+    raw = sys.argv[1:]
+    # --brief is position-independent so it composes with --show and with a
+    # prompt. Only an exact "--brief" token is consumed.
+    brief = "--brief" in raw
+    argv = [a for a in raw if a != "--brief"]
+    # --pubkeys and --idr likewise, so each can follow --verify's argument
+    # rather than having to precede it.
+    pubkeys, argv = _take_option(argv, "--pubkeys")
+    idr, argv = _take_option(argv, "--idr")
+
+    # No catch-all here, deliberately. A single handler around the whole
+    # dispatch could only report ONE cause for failures arising in two
+    # different files, and it picked the wrong one — see cmd_verify, where the
+    # key read and the record read now each report themselves.
+    subcommand_rc = _dispatch_subcommand(argv, brief=brief, pubkeys=pubkeys, idr=idr)
+    if subcommand_rc is not None:
+        return subcommand_rc
+
+    seats, argv = _take_seats(argv)
+    seated = _seated(seats)
+    if seated is None:
+        return 2
+    if len(argv) > 1 or (argv and _is_stray_option(argv[0])):
+        # GRIP#8786: anything after the prompt used to be dropped in silence.
+        print(_leftover_message(argv), file=sys.stderr)
+        return 2
+    return _convene(argv[0] if argv else _DEFAULT_PROMPT, brief=brief, **seated)
+
+
+def _convene(prompt: str, *, speakers: list, judge_name: str, advisor: "str | None",
+             brief: bool) -> int:
+    """Sit the council (or the Roundtable, with an advisor), seal it and render it."""
+    n_anth = sum(1 for n in speakers if n in ANTHROPIC_SPEAKERS)
+    label = ("non-Anthropic speakers" if n_anth == 0 else
+             f"speakers ({n_anth} Anthropic, operator-directed)")
+    seat_note = f" (advisor: {advisor})" if advisor else ""
+    print(f"convening {len(speakers)} {label} + 1 non-Anthropic judge{seat_note}...\n")
+    if advisor:
+        out = roundtable(prompt, advisor, speakers, judge_name)
+        adv = out["advisor"]
+        flag = "✓" if adv["ok"] else "✗"
+        print(f"  [{flag}] ADVISOR {adv['name']} / {adv['model']}  "
+              f"{adv['end'] - adv['start']:.2f}s"
+              + ("" if adv["ok"] else f"  — {adv['text'][:80]}"))
+        render(out["record"]["prompt"], out["results"], out["panel_total"],
+               out["verdict"], out["sha"], out.get("idr_id"), brief=brief)
+        return 0 if (out["verdict"].get("judge_ok") and out["speakers_ok"] >= 2) else 1
+    results, total = fan_out(prompt, speakers)
+    answered = sum(1 for r in results if r.get("ok"))
+    # Skip the judge entirely when the panel is empty. Not only because the
+    # verdict would be fabricated, but because it is a paid call that cannot
+    # be informed by anything.
+    # GRIP#6557: an all-dead panel used to hand seal() this empty stub and
+    # crash on verdict["judge_model"], leaving the failed sitting unrecorded.
+    verdict = judge(prompt, results, judge_name) if answered else no_quorum_verdict()
+    record, sha = seal(prompt, results, verdict)
+    render(prompt, results, total, verdict, sha, record.get("idr_id"), brief=brief)
+    return 0 if (verdict.get("judge_ok") and sum(r["ok"] for r in results) >= 2) else 1
+
+
+if __name__ == "__main__":
+    # This shebang is `/usr/bin/env python3`, which need not be an interpreter
+    # that can dual-sign. Without this the tool still runs and still records --
+    # it just writes a forgeable demo-sealed record when a real seal was one
+    # interpreter away (lib/pq_reexec.py).
+    #
+    # Imported as top-level `pq_reexec` off THIS checkout, never as
+    # `lib.pq_reexec`: by now `lib` may already be bound to another tree's
+    # package, and the import would miss the file or read another branch's copy.
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "lib"))
+    from pq_reexec import reexec_if_incapable as _reexec
+
+    _reexec(_Path(__file__))
+    sys.exit(main())

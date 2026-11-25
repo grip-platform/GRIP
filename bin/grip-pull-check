@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+# grip-pull-check -- after `git pull`, say in plain words whether this machine can
+# still run GRIP, and give one copy-paste line for each thing that is wrong.
+#
+# Why it exists: a teammate on Windows pulls, GRIP stops working, and the cause is
+# one of a handful of machine-level breakages that never show on the operator's
+# Mac, because there ~/.claude is a symlink to ~/.grip and every path agrees. On
+# any other layout the same pull can leave a settings.json Claude Code cannot
+# parse, or hooks that run from an old copy of GRIP. Each check below names one
+# of those breakages.
+#
+# Read-only by construction: it never edits, stages, fetches, stashes or deletes
+# anything. Every check is plain bash except the JSON validity test, which uses
+# a Python proven to run by what it prints (never by its exit code) and is
+# skipped, with a warning, when there is none. Output is ASCII only, because a
+# Windows console on code page cp1252 cannot print the glyphs GRIP uses elsewhere.
+#
+# Usage:
+#   bash ~/.grip/bin/grip-pull-check            (run it from any folder, any shell)
+#   bash ./grip-pull-check ~/.grip              (a copy outside the clone, given its path)
+#
+# The second form exists for a clone that cannot pull: read the script straight
+# out of git, which works even mid-conflict, and point it at the clone:
+#   git -C ~/.grip fetch origin && git -C ~/.grip show origin/main:bin/grip-pull-check > ~/grip-pull-check && bash ~/grip-pull-check ~/.grip
+#
+# Exit status: 0 = nothing stops GRIP, 1 = at least one FAIL, 2 = cannot run.
+
+set -u
+
+# Keeps Python's error text printable on a cp1252 console; an operator's own
+# choice of encoding is kept.
+export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
+
+GRIP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+FAILS=0
+WARNS=0
+
+# Files GRIP or Claude Code rewrite while they run. A local change to any of them
+# makes the next `git pull` stop with a conflict.
+RUNTIME_FILES=(settings.json data/genome-shared.json)
+
+say_ok()   { printf '[ OK ] %s\n' "$1"; }
+say_warn() { WARNS=$((WARNS + 1)); printf '[WARN] %s\n' "$1"; [ -n "${2:-}" ] && printf '       Fix: %s\n' "$2"; return 0; }
+say_fail() { FAILS=$((FAILS + 1)); printf '[FAIL] %s\n' "$1"; [ -n "${2:-}" ] && printf '       Fix: %s\n' "$2"; return 0; }
+
+# --no-optional-locks: without it `git status` may rewrite git's own index cache,
+# and this check promises to change nothing.
+g() { git --no-optional-locks -C "$GRIP_DIR" "$@"; }
+
+# The folder GRIP's hook commands resolve to: settings.json writes every hook as
+# "${CLAUDE_DIR:-$HOME/.claude}/...", so this is that same expansion.
+hook_tree() { printf '%s' "${CLAUDE_DIR:-$HOME/.claude}"; }
+
+# The one command that makes ~/.claude the same folder as this clone (a junction
+# on Windows, a symlink elsewhere). grip-claude-dir-link is the tool ratified for
+# exactly the stale-copy layout: it archives and verifies the old folder, renames
+# it aside rather than deleting it, and rolls back by itself if the link fails.
+# Set in main(), once GRIP_DIR is final.
+LINK_FIX=""
+
+check_operation_in_progress() {
+    # Absolute: --git-path answers relative to the clone, not to the caller's folder.
+    local gd
+    gd="$(g rev-parse --absolute-git-dir 2>/dev/null)"
+    if [ -d "$gd/rebase-merge" ] || [ -d "$gd/rebase-apply" ]; then
+        say_fail "A pull stopped halfway (a rebase is still in progress), so the GRIP folder is in a mixed state." \
+            "git -C \"$GRIP_DIR\" rebase --abort   (puts the folder back exactly as it was before the pull)"
+    elif [ -f "$gd/MERGE_HEAD" ]; then
+        say_fail "A pull stopped halfway (a merge is still in progress)." \
+            "git -C \"$GRIP_DIR\" merge --abort"
+    else
+        say_ok "No pull is stuck halfway."
+    fi
+}
+
+# Space-separated, each path double-quoted, ready to paste after `--`.
+UNMERGED=""
+
+check_unmerged() {
+    local f
+    while IFS= read -r f; do
+        [ -n "$f" ] && UNMERGED="$UNMERGED \"$f\""
+    done <<EOF
+$(g diff --name-only --diff-filter=U 2>/dev/null)
+EOF
+    if [ -z "$UNMERGED" ]; then
+        say_ok "No files are left in a conflicted state."
+        return
+    fi
+    say_fail "These files are still conflicted after the pull:$UNMERGED. Claude Code cannot read a settings file in this state." \
+        "git -C \"$GRIP_DIR\" checkout HEAD --$UNMERGED   (your own version stays saved in: git -C \"$GRIP_DIR\" stash list)"
+}
+
+check_conflict_markers() {
+    local f bad=""
+    for f in settings.json .mcp.json "${RUNTIME_FILES[@]}"; do
+        [ -f "$GRIP_DIR/$f" ] || continue
+        case " $bad " in *" \"$f\" "*) continue ;; esac
+        if grep -qE '^(<<<<<<<|>>>>>>>)( |$)|^=======$' "$GRIP_DIR/$f"; then
+            bad="$bad \"$f\""
+        fi
+    done
+    if [ -z "$bad" ]; then
+        say_ok "No conflict markers (<<<<<<<) inside GRIP's settings files."
+        return
+    fi
+    say_fail "Git conflict markers (<<<<<<<) are written inside:$bad. JSON with those lines in it cannot be read." \
+        "git -C \"$GRIP_DIR\" checkout origin/main --$bad"
+}
+
+# True when the candidate really runs Python. Judged by OUTPUT, not exit code:
+# the Windows Store placeholder has been measured exiting 49 on one machine and 0
+# on another (a teammate's merged commit aebd49b52), so a zero exit proves
+# nothing. sys.stdout.write, not print: on Windows print adds "\r\n" and the
+# comparison would fail on the "\r".
+answers() {
+    [ -n "${1:-}" ] || return 1
+    [ "$("$1" -c 'import sys; sys.stdout.write("12345")' 2>/dev/null)" = "12345" ]
+}
+
+# A system interpreter that really runs. `py` is the launcher python.org installs
+# on Windows, which ships no python3.exe. Not
+# scripts/lib/venv-utils.sh::resolve_venv_python: that now makes the same output
+# test as answers() above (it used exit codes and returned the placeholder), but
+# it never tries `py`.
+system_python() {
+    local c p
+    for c in python3 python py; do
+        p="$(command -v "$c" 2>/dev/null)" || continue
+        if answers "$p"; then
+            printf '%s' "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# The interpreter for the JSON test: the clone's venv first, then the system.
+json_python() {
+    venv_python_in "$GRIP_DIR/venv" || system_python
+}
+
+check_settings_readable() {
+    local f="$GRIP_DIR/settings.json" bom py err
+    local backup="cp \"$f\" \"$f.bak.pullcheck\" && git -C \"$GRIP_DIR\" checkout origin/main -- settings.json"
+    if [ ! -f "$f" ]; then
+        say_fail "settings.json is missing from $GRIP_DIR." "git -C \"$GRIP_DIR\" checkout origin/main -- settings.json"
+        return
+    fi
+    bom="$(head -c 3 "$f" | od -An -tx1 | tr -d ' \n')"
+    if [ "$bom" = "efbbbf" ]; then
+        say_fail "settings.json starts with an invisible byte-order mark (PowerShell 5 adds one when it saves UTF-8). JSON readers reject the file." "$backup"
+        return
+    fi
+    py="$(json_python 2>/dev/null)"
+    if [ -z "$py" ]; then
+        say_warn "Could not check that settings.json is valid JSON: no working Python was found." ""
+        return
+    fi
+    # The token, not the exit code, is the pass signal (see answers above).
+    err="$("$py" -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8")); sys.stdout.write("JSON-OK")' "$f" 2>&1)"
+    if [ "$err" = "JSON-OK" ]; then
+        say_ok "settings.json is valid JSON."
+    else
+        say_fail "settings.json is not valid JSON, so Claude Code ignores it: $(printf '%s' "$err" | tail -n 1)" "$backup"
+    fi
+}
+
+check_config_dir() {
+    local cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+    if [ "$cfg" -ef "$GRIP_DIR" ]; then
+        say_ok "Claude Code loads its settings from this GRIP folder."
+    else
+        say_fail "Claude Code loads its settings from $cfg, which is not this GRIP folder, so GRIP's hooks never load." "$LINK_FIX"
+    fi
+}
+
+check_hook_tree() {
+    local tree
+    tree="$(hook_tree)"
+    if [ "$HOME/.claude" -ef "$GRIP_DIR" ]; then
+        say_ok "GRIP's hooks run from this folder however Claude Code is started."
+    elif [ "$tree" -ef "$GRIP_DIR" ]; then
+        # A FAIL, not a warning: eight PreToolUse hooks, the context gate and the
+        # guardrail-evasion gate among them, import their code from Path.home()/.claude
+        # whatever CLAUDE_DIR says (and on Windows Python takes the home folder from
+        # USERPROFILE, not from Git Bash's HOME).
+        say_fail "Most hooks find this folder through CLAUDE_DIR, but eight of GRIP's safety hooks (the context gate among them) always load their code from $HOME/.claude. With a separate folder there they crash or run old code, so they never protect anything. Started from PowerShell, Windows Terminal, VS Code or the desktop app, Claude Code may not see CLAUDE_DIR at all." "$LINK_FIX"
+    elif [ -e "$HOME/.claude" ]; then
+        say_fail "GRIP's hooks run from $HOME/.claude, a different folder from the one you just pulled, so the pull never reaches them (on Windows this is usually an old copy made instead of a link)." "$LINK_FIX"
+    else
+        say_fail "GRIP's hooks run from $HOME/.claude, which does not exist, so every hook fails." "$LINK_FIX"
+    fi
+}
+
+venv_python_in() {
+    local p
+    for p in "$1/Scripts/python.exe" "$1/bin/python3" "$1/bin/python"; do
+        if [ -x "$p" ] && answers "$p"; then
+            printf '%s' "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Checks this clone's own venv, not the hook tree's: when the two differ, the tree
+# check above already says so, and a fix line must repair the clone, never a stale copy.
+check_hook_interpreter() {
+    local sys
+    if venv_python_in "$GRIP_DIR/venv" >/dev/null; then
+        say_ok "GRIP's hook runner finds a working Python in $GRIP_DIR/venv."
+        return
+    fi
+    sys="$(system_python)"
+    if [ -n "$sys" ]; then
+        say_fail "No working Python in $GRIP_DIR/venv, so every hook tries to rebuild it and may fall back to a broken python3." \
+            "\"$sys\" -m venv \"$GRIP_DIR/venv\" && bash \"$GRIP_DIR/scripts/grip-deps-install.sh\""
+    else
+        say_fail "No working Python in $GRIP_DIR/venv, and none on this machine either." \
+            "install Python 3 from python.org, then run: bash \"$GRIP_DIR/bin/grip-pull-check\""
+    fi
+}
+
+check_python3_stub() {
+    local p
+    p="$(command -v python3 2>/dev/null)"
+    if [ -n "$p" ] && ! answers "$p"; then
+        say_warn "'python3' on this machine is a placeholder that does not run Python (on Windows, the Microsoft Store alias). GRIP's hook runner falls back to it when its venv is missing, and every hook then fails with 'Python was not found'." \
+            "Windows Settings > Apps > Advanced app settings > App execution aliases: turn off python.exe and python3.exe"
+    else
+        say_ok "'python3' is either a working Python or absent (no placeholder to trip over)."
+    fi
+}
+
+check_hook_targets() {
+    local tree rel missing=0 sample=""
+    tree="$(hook_tree)"
+    # shellcheck disable=SC2016  # the literal "${CLAUDE_DIR:-$HOME/.claude}" text is what is matched
+    while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        if [ ! -e "$tree/$rel" ]; then
+            missing=$((missing + 1))
+            [ "$missing" -le 3 ] && sample="$sample $rel"
+        fi
+    done <<EOF
+$(grep -oE '\$\{CLAUDE_DIR:-\$HOME/\.claude\}/[A-Za-z0-9_./-]+' "$GRIP_DIR/settings.json" 2>/dev/null | sed 's|^[^}]*}/||' | sort -u)
+EOF
+    if [ "$missing" -eq 0 ]; then
+        say_ok "Every GRIP hook file named in settings.json exists where the hooks look for it."
+    elif [ "$tree" -ef "$GRIP_DIR" ]; then
+        say_fail "$missing hook file(s) named in settings.json are missing from this clone, e.g.$sample." \
+            "git -C \"$GRIP_DIR\" status   (then restore any deleted file with: git -C \"$GRIP_DIR\" checkout HEAD -- <file>)"
+    else
+        say_fail "$missing hook file(s) named in settings.json are missing from $tree, e.g.$sample. Python stops with exit code 2 on a missing file, and Claude Code treats exit code 2 as 'block', so it can refuse your commands, edits and prompts." "$LINK_FIX"
+    fi
+}
+
+# Shell scripts with Windows line endings. Git for Windows offers "checkout
+# Windows-style" (core.autocrlf=true) as its install default and .gitattributes
+# sets no eol rule, so a pull can rewrite a script with CRLF. bash then stops on a
+# syntax error with exit code 2, the code Claude Code treats as 'block'.
+check_line_endings() {
+    local f crlf=0 clean="" look="-lI"
+    # The grep of Git for Windows strips carriage returns from a text file before
+    # it matches, so there this search found nothing. -U makes it read the bytes
+    # as they are. Elsewhere the options stay as they were: the grep that macOS
+    # ships gives -U another meaning.
+    case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) look="-lIU" ;; esac
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        crlf=$((crlf + 1))
+        # Only files with no edits of their own are safe to delete and restore.
+        [ -z "$(g status --porcelain -- "$f" 2>/dev/null)" ] && clean="$clean \"$f\""
+    done <<EOF
+$(cd "$GRIP_DIR" && git ls-files -z -- '*.sh' 'bin/*' 2>/dev/null | xargs -0 grep "$look" $'\r$' 2>/dev/null)
+EOF
+    if [ "$crlf" -eq 0 ]; then
+        say_ok "GRIP's shell scripts have Unix line endings."
+    elif [ -n "$clean" ]; then
+        say_fail "$crlf shell script(s) have Windows line endings (CRLF), so bash stops on them with exit code 2, which Claude Code treats as 'block'." \
+            "git -C \"$GRIP_DIR\" config core.autocrlf false && (cd \"$GRIP_DIR\" && rm -f$clean && git checkout --$clean)"
+    else
+        say_fail "$crlf shell script(s) have Windows line endings (CRLF) and also carry your own edits, so they were left alone." \
+            "git -C \"$GRIP_DIR\" config core.autocrlf false, then convert each with: sed -i 's/\\r\$//' <file>"
+    fi
+}
+
+check_foreign_paths() {
+    local p count=0 example=""
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        if [ ! -e "$p" ]; then
+            count=$((count + 1))
+            [ -z "$example" ] && example="$p"
+        fi
+    done <<EOF
+$(grep -E '"command":' "$GRIP_DIR/settings.json" 2>/dev/null | grep -oE "/(Users|home)/[^\"' ]+" | sort -u)
+EOF
+    if [ "$count" -eq 0 ]; then
+        say_ok "No hook in settings.json points at a file on someone else's computer."
+    else
+        say_warn "$count hook(s) in settings.json point at files on another person's computer (e.g. $example). Here they print 'No such file or directory' and do nothing else. This is a known GRIP defect; do NOT edit settings.json yourself, or your next pull will conflict." ""
+    fi
+}
+
+check_runtime_files_clean() {
+    local f dirty=""
+    for f in "${RUNTIME_FILES[@]}"; do
+        # A conflicted file belongs to check_unmerged: `git checkout --` refuses it.
+        case "$UNMERGED " in *" \"$f\" "*) continue ;; esac
+        [ -n "$(g status --porcelain -- "$f" 2>/dev/null)" ] && dirty="$dirty \"$f\""
+    done
+    if [ -z "$dirty" ]; then
+        say_ok "Files GRIP rewrites while running are unchanged, so the next pull will not stop on them."
+        return
+    fi
+    say_warn "These files were changed on this machine by GRIP or Claude Code while running:$dirty. Your next pull will stop with a conflict on them." \
+        "mkdir -p \"$HOME/.grip-pull-backups\" && (cd \"$GRIP_DIR\" && cp$dirty \"$HOME/.grip-pull-backups/\") && git -C \"$GRIP_DIR\" checkout --$dirty"
+}
+
+check_behind() {
+    local n
+    n="$(g rev-list --count HEAD..origin/main 2>/dev/null)"
+    if [ -z "$n" ]; then
+        say_warn "Could not compare this clone with origin/main." ""
+    elif [ "$n" -eq 0 ]; then
+        say_ok "This clone has every commit from origin/main that it last fetched."
+    else
+        say_warn "This clone is $n commit(s) behind origin/main as of the last fetch." "git -C \"$GRIP_DIR\" pull --rebase"
+    fi
+}
+
+main() {
+    case "${1:-}" in
+        -h|--help) sed -n '2,27p' "${BASH_SOURCE[0]}"; return 0 ;;
+        "") ;;
+        *)
+            if [ ! -d "$1" ]; then
+                printf 'grip-pull-check: %s is not a folder.\n' "$1" >&2
+                return 2
+            fi
+            GRIP_DIR="$(cd "$1" && pwd)"
+            ;;
+    esac
+    LINK_FIX="bash \"$GRIP_DIR/bin/grip-claude-dir-link\" --grip-dir \"$GRIP_DIR\" --apply   (run it once without --apply to preview the plan)"
+    if [ -z "$GRIP_DIR" ] || ! g rev-parse --git-dir >/dev/null 2>&1; then
+        printf 'grip-pull-check: %s is not a GRIP clone (no git repository).\n' "${GRIP_DIR:-?}" >&2
+        return 2
+    fi
+    printf 'GRIP pull check for %s\n(read-only: nothing is changed; checked in this shell'"'"'s environment)\n\n' "$GRIP_DIR"
+    check_operation_in_progress
+    check_unmerged
+    check_conflict_markers
+    check_settings_readable
+    check_config_dir
+    check_hook_tree
+    check_hook_interpreter
+    check_python3_stub
+    check_hook_targets
+    check_line_endings
+    check_foreign_paths
+    check_runtime_files_clean
+    check_behind
+    printf '\nResult: %d problem(s) that stop GRIP working, %d warning(s).\n' "$FAILS" "$WARNS"
+    [ "$FAILS" -eq 0 ]
+}
+
+main "$@"

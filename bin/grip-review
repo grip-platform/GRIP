@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""grip-review -- one place to find what GRIP worked on, so a human can review it.
+
+The operator (2026-09-19): *"you have to make it easy for me to find the most recent
+files you've worked on ... It's all over the show: /plans /drafts/ whatever."*
+
+This writes a single categorised, newest-first index to ONE stable location -- the
+shared tree's ``REVIEW/`` folder -- no matter which worktree generated it. Sessions
+run in ``~/.grip-worktrees/grip-session-*``, so an index written beside the caller
+would land somewhere different every session, which is the scatter, not the fix.
+
+Dates come from ``git log``, never from file mtime: a worktree is checked out in one
+operation, so every file in it shares the checkout's timestamp and an mtime sort is
+uniformly wrong (measured 2026-09-19 -- all 22 plan/draft files read as "today",
+including one last edited in May).
+
+Usage:
+    bin/grip-review                      # last 14 days -> $CLAUDE_DIR/REVIEW/
+    bin/grip-review --days 30            # widen the window
+    bin/grip-review --out ./REVIEW       # write somewhere else
+    bin/grip-review --print              # stdout only, write nothing
+    bin/grip-review --open               # write, then open it
+"""
+
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+from claude_dir import get_claude_dir  # noqa: E402
+from review_index import build, render, write_index  # noqa: E402
+
+
+def _repo_root(start: Path) -> Path | None:
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(start), capture_output=True, text=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    root = proc.stdout.strip()
+    return Path(root) if root else None
+
+
+def _repo_name(repo: Path) -> str:
+    """Name the repository, not the worktree.
+
+    Sessions run in ``~/.grip-worktrees/grip-session-<n>``, so ``repo.name`` puts a
+    throwaway directory name in the index heading. The origin remote is stable.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            cwd=str(repo), capture_output=True, text=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "GRIP"
+    url = proc.stdout.strip() if proc.returncode == 0 else ""
+    if not url:
+        return "GRIP"
+    return Path(url.rstrip("/")).name.removesuffix(".git") or "GRIP"
+
+
+def _display(path: Path) -> str:
+    """Resolve symlinks and abbreviate $HOME, so the printed path is the real one."""
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    home = Path.home()
+    try:
+        return f"~/{resolved.relative_to(home)}"
+    except ValueError:
+        return str(resolved)
+
+
+def _open(path: Path) -> None:
+    opener = "open" if sys.platform == "darwin" else "xdg-open"
+    try:
+        subprocess.run([opener, str(path)], timeout=15, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="grip-review", description="Index recent GRIP work for human review."
+    )
+    parser.add_argument("--days", type=int, default=14,
+                        help="How far back to look (default: 14).")
+    parser.add_argument("--repo", type=Path, default=None,
+                        help="Repo to scan (default: the git root of the cwd).")
+    parser.add_argument("--out", type=Path, default=None,
+                        help="Output dir (default: $CLAUDE_DIR/REVIEW).")
+    parser.add_argument("--limit", type=int, default=25,
+                        help="Max entries listed per category (default: 25).")
+    parser.add_argument("--print", dest="to_stdout", action="store_true",
+                        help="Print to stdout and write nothing.")
+    parser.add_argument("--open", dest="open_after", action="store_true",
+                        help="Open the index after writing it.")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+
+    repo = args.repo or _repo_root(Path.cwd())
+    if repo is None:
+        print("grip-review: not inside a git repository (pass --repo)", file=sys.stderr)
+        return 2
+    if not (repo / ".git").exists():
+        print(f"grip-review: {repo} is not a git repository", file=sys.stderr)
+        return 2
+
+    index = build(repo, days=args.days, limit_per_category=args.limit)
+    name = _repo_name(repo)
+
+    if args.to_stdout:
+        print(render(index, repo_name=name))
+        return 0
+
+    out_dir = args.out or (get_claude_dir() / "REVIEW")
+    target = write_index(repo, index, out_dir, repo_name=name)
+
+    # Print the RESOLVED path. get_claude_dir() returns $HOME/.claude, which on this
+    # machine is a symlink to $HOME/.grip -- the same inode, but printing the symlink
+    # invites the reasonable question "why is my file in .claude and not .grip?".
+    # Resolving is portable: where no symlink exists it returns the same path.
+    shown = _display(target)
+    print(f"{len(index.entries)} files from the last {args.days} days")
+    print(f"index:  {shown}")
+    print(f"latest: {_display(out_dir / 'latest')}")
+
+    if args.open_after:
+        _open(target)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

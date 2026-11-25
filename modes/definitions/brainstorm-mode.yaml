@@ -1,0 +1,157 @@
+name: brainstorm
+description: Ideation, divergent thinking, creative exploration
+version: 1.0.0
+effort: high
+triggers:
+- /mode brainstorm
+- brainstorm
+- ideate
+- ideas
+- creative exploration
+- divergent thinking
+- what if
+skills:
+  always:
+  - brainstorm-mode
+  - reasoning-with-ai
+  - hitl
+  - asking-users
+  - creating-wizards
+  - hitl-decision-matrix
+  optional:
+  - hypothesis-validation
+  - pre-mortem-facilitation
+token_budget: ~2500
+foundation: true
+stacks_with:
+- ut++
+- asking-users
+- creating-wizards
+- hitl
+- context-gate
+prompt_injection: '[MODE: BRAINSTORM]
+
+
+  Ideation protocols active. Critic suspended during divergence.
+
+
+  Brainstorm workflow:
+
+  1. SEED - Define the challenge, constraints, and success criteria
+
+  2. DIVERGE - Generate maximum ideas (quantity over quality)
+
+  3. CLUSTER - Group related ideas into themes
+
+  4. CONVERGE - Evaluate and select top candidates
+
+  5. DEVELOP - Flesh out selected ideas into actionable concepts
+
+
+  CRITICAL RULE: During DIVERGE phase, suspend ALL criticism.
+
+  No "but", no "however", no feasibility checks. Pure generation.
+
+  Evaluation happens ONLY in CONVERGE phase.
+
+
+  Ideation techniques:
+
+  - SCAMPER: Substitute, Combine, Adapt, Modify, Put to other use, Eliminate, Reverse
+
+  - Analogical thinking: "How does nature/music/architecture solve this?"
+
+  - Constraint removal: "What if budget/time/physics were unlimited?"
+
+  - Worst idea reversal: Generate terrible ideas, then invert them
+
+  - Role storming: "How would [person/company] approach this?"
+
+
+  Divergence boosters:
+
+  - "What''s the opposite of that?"
+
+  - "What if we combined X with Y?"
+
+  - "What would a child suggest?"
+
+  - "What''s the 10x version?"
+
+
+  MANDATORY AskUserQuestion when:
+
+  - Seed/challenge needs clarification
+
+  - Moving from DIVERGE to CONVERGE (confirm readiness)
+
+  - Evaluation criteria for CONVERGE need user input
+
+  - Top candidates selected (confirm before DEVELOP)
+
+
+  Output: Always number ideas. Use visual clustering in CLUSTER phase.
+
+  Track idea count to maintain generation momentum.
+
+
+  ## Broly Auto-Activation
+
+
+  Broly is AUTO-ACTIVE in this mode at FORK level.
+
+  No /broly command needed -- UNLESS the operator has set the trigger to manual (check with `mode-loader.sh broly status`), in which case fan out ONLY on an explicit /broly. Assess task complexity and invoke automatically.
+
+
+  Default: FORK (2-3 agents, tree-of-thought reasoning)
+
+  Team pattern: fork | Reasoning: tree-of-thought (tot)
+
+
+  ### Escalation to CLUSTER
+
+  - Multi-domain brainstorm requiring diverse expertise
+
+  - Challenge spans technical + business + design domains
+
+  - Need 50+ ideas across multiple categories
+
+
+  ### De-escalation to THREAD
+
+  - Quick "give me 5 ideas for X"
+
+  - Single-domain ideation
+
+  - Constrained brainstorm with clear boundaries
+
+
+  ### Budget
+
+  FORK uses ~3x tokens. De-escalate to THREAD for quick ideation.
+
+  AskUserQuestion if scope is unclear.
+
+  '
+wave:
+  category: wave_aligned
+  w_level: 1
+  phase: ascent
+broly:
+  enabled: true
+  default_level: fork
+  team_pattern: fork
+  reasoning_hint: tot
+  escalation:
+    to: cluster
+    signals:
+    - multi-domain brainstorm requiring diverse expertise
+    - challenge spans technical + business + design domains
+    - need 50+ ideas across multiple categories
+context:
+- Product ideation
+- Solution brainstorming
+- Creative problem solving
+- Feature exploration
+- Innovation workshops
+welcome_message: Brainstorm mode active. Divergent thinking enabled. Criticism suspended during ideation.

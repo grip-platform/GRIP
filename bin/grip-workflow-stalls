@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""grip-workflow-stalls -- how much work did a Workflow run throw away?
+
+The Claude Code workflow runner kills an agent after 180s with no progress event and
+re-runs the identical prompt up to six times. The timer is cleared during tool calls and
+re-armed after the last tool result, so the only window it can fire in is the model's own
+long generation AFTER its reads -- which means it selects against the most careful agents
+and leaves the transcript looking like a retry rather than a defect. One run lost
+5,394,182 tokens across twelve killed attempts before anyone noticed (GRIP#5136).
+
+This is the probe for that. It reads what the runner DID, not what it said: journal.jsonl
+carries one `started` per attempt, one `result` per lane that answered and one `failed` per
+lane that exhausted its retries, with attempts of a lane sharing a content-addressed `key`.
+Discarded attempts are `started` minus those that produced a result. The runner's own stall
+strings are console output and are never written to disk, so an earlier text-scanning
+version of this tool reported ZERO stalls for the very run that lost twelve attempts.
+
+Usage:
+    bin/grip-workflow-stalls <run-dir> [--summary]
+    bin/grip-workflow-stalls --latest [--summary]
+
+Run directories live under
+``$CLAUDE_DIR/projects/<project>/<session>/subagents/workflows/wf_*``. Those project
+directories alias one another heavily -- a naive glob returns ~24,000 paths that resolve to
+under a hundred real ones -- so --latest resolves and de-duplicates before choosing.
+
+Reading the output -- why a 185s death is `stall_shaped` and a 4s death is not. A
+discarded attempt proves work was thrown away, never why. The watchdog signature is the
+DURATION: a killed attempt dies AT its budget, so it clusters there. Two budgets are
+recognised -- 180s (the runner default, `er` in the 2.1.251 binary) and 600s (what GRIP
+sets explicitly) -- with a 30s tolerance either side. That window covers the measured
+cluster of real kills (184.9-205.9s against a 180s timer, being the timer plus the
+start-up before it armed) while still excluding an attempt that died in seconds for some
+other reason. Anything discarded outside those windows is reported as `other_dead`, and a
+stall is never claimed from a retry alone.
+
+Exit codes -- 3 is NOT success, because "could not measure" must never be indistinguishable
+from "nothing was lost":
+    0  measured, no discarded attempts
+    1  measured, discarded attempts present
+    3  INDETERMINATE -- the run directory could not be read
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+from claude_dir import get_claude_dir  # noqa: E402
+from workflow_stall_metrics import measure, summary_line  # noqa: E402
+
+EXIT_CLEAN, EXIT_LOST_WORK, EXIT_INDETERMINATE = 0, 1, 3
+
+
+def _latest_run() -> Path | None:
+    """The most recently written run directory, de-duplicated by resolved path."""
+    root = get_claude_dir() / "projects"
+    runs = {p.resolve() for p in root.glob("*/*/subagents/workflows/wf_*") if p.is_dir()}
+    runs = [p for p in runs if (p / "journal.jsonl").exists()]
+    if not runs:
+        return None
+    return max(runs, key=lambda p: (p / "journal.jsonl").stat().st_mtime)
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        prog="grip-workflow-stalls",
+        description="Measure discarded agent attempts in a Claude Code Workflow run.",
+    )
+    ap.add_argument("run_dir", nargs="?", help="workflow run directory (wf_...)")
+    ap.add_argument("--latest", action="store_true", help="measure the most recent run")
+    ap.add_argument("--summary", action="store_true", help="one line instead of full JSON")
+    return ap.parse_args(argv)
+
+
+def _resolve_target(args: argparse.Namespace) -> Path | None:
+    """The run directory to measure, or None when the caller gave us nothing usable."""
+    if args.latest:
+        target = _latest_run()
+        if target is not None:
+            print(f"run: {target}", file=sys.stderr)
+        return target
+    if args.run_dir:
+        return Path(args.run_dir).expanduser()
+    return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(sys.argv[1:] if argv is None else argv)
+    target = _resolve_target(args)
+    if target is None:
+        print("grip-workflow-stalls: give a run directory, or --latest", file=sys.stderr)
+        return EXIT_INDETERMINATE
+
+    try:
+        result = measure(target)
+    except (FileNotFoundError, PermissionError) as exc:
+        print(json.dumps({"error": str(exc), "measured": False}, indent=2))
+        return EXIT_INDETERMINATE
+
+    print(summary_line(result) if args.summary else json.dumps(result, indent=2))
+    return EXIT_LOST_WORK if result["dead_attempts"] else EXIT_CLEAN
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

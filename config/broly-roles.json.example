@@ -1,0 +1,11 @@
+{
+  "_comment": "Copy to config/broly-roles.json to override broly per-role LLM assignments. Each role MUST be present. Weight defaults to 1.0. Provider families should span >= 3 distinct providers for genuine cross-model diversity.",
+  "assignments": [
+    {"role": "analyst",     "model": "gemini/gemini-3.5-flash-lite",     "weight": 1.0},
+    {"role": "explorer",    "model": "xai/grok-4.20-0309-non-reasoning", "weight": 1.0},
+    {"role": "reviewer",    "model": "deepseek/deepseek-v4-pro",          "weight": 1.5},
+    {"role": "pragmatist",  "model": "groq/openai/gpt-oss-120b",     "weight": 1.0},
+    {"role": "devil",       "model": "xai/grok-4.20-0309-non-reasoning", "weight": 2.0},
+    {"role": "integrator",  "model": "gemini/gemini-3.5-flash-lite",     "weight": 1.0}
+  ]
+}

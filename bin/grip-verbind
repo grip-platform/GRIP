@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+"""grip-verbind -- coined slash verbs, bound through a Koppel round (docs/VERBIND.md).
+
+JSON in, JSON out. Subcommands: gate, refine, list, forget, ultralearned.
+Run with --help for each. The library is lib/verbind/; this file only starts it.
+"""
+import sys
+from pathlib import Path
+
+if __name__ == "__main__":
+    # This shebang is `/usr/bin/env python3`, which need not be an interpreter
+    # that can dual-sign. Without this the tool still runs and still records --
+    # it just writes a forgeable demo-sealed IDR leaf when a real seal was one
+    # interpreter away (lib/pq_reexec.py, rules/never-system-python-for-grip.md).
+    #
+    # Imported as top-level `pq_reexec` off THIS checkout, never as
+    # `lib.pq_reexec`: by now `lib` may already be bound to another tree's
+    # package, and the import would miss the file or read another branch's copy.
+    _lib = Path(__file__).resolve().parent.parent / "lib"
+    sys.path.insert(0, str(_lib))
+    from pq_reexec import reexec_if_incapable as _reexec
+
+    _reexec(Path(__file__))
+
+    from verbind.cli import main
+
+    raise SystemExit(main(sys.argv[1:]))

@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""grip-kanban — canonical team Kanban CLI.
+
+Usage:
+    grip-kanban show                       Render the board as markdown
+    grip-kanban add "Title" [--owner V>>] [--lane todo]
+                  [--detail TEXT] [--link #123 ...]
+    grip-kanban move <id> <lane>           Move a card between lanes
+    grip-kanban assign <id> <owner>        Reassign a card
+    grip-kanban summary                    One-line per-lane counts
+    grip-kanban seed                       Seed from the open-items snapshot
+                                           (idempotent — safe to re-run)
+
+Lanes: backlog | todo | doing | review | done
+Owners: V>> K>> A>> GRIP
+Store: state/kanban/board.json (CLAUDE_DIR env override honoured)
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+import kanban  # noqa: E402
+
+
+def _cmd_show(board, args):
+    return kanban.render_markdown(board), False
+
+
+def _cmd_summary(board, args):
+    return kanban.board_summary(board), False
+
+
+def _cmd_seed(board, args):
+    added = kanban.seed_board(board)
+    total = len(board["cards"])
+    return f"Seeded {added} card(s); board now has {total} card(s).", True
+
+
+def _cmd_add(board, args):
+    card = kanban.add_card(
+        board,
+        args.title,
+        owner=args.owner,
+        lane=args.lane,
+        detail=args.detail,
+        links=args.links,
+    )
+    return f"Added {card['id']} to {card['lane']} (owner {card['owner']}).", True
+
+
+def _cmd_move(board, args):
+    card = kanban.move_card(board, args.card_id, args.lane)
+    return f"Moved {card['id']} to {card['lane']}.", True
+
+
+def _cmd_assign(board, args):
+    card = kanban.assign_card(board, args.card_id, args.owner)
+    return f"Assigned {card['id']} to {card['owner']}.", True
+
+
+def _cmd_publish(board, args):
+    """Publish the board to docs/team-kanban-board.md (V>> 2026-06-10: the
+    board must not be WhatsApp-only). Committed + pushed, the file is the
+    team-viewable surface on GitHub; web render is the follow-up."""
+    import datetime
+    out = kanban.get_claude_dir() / "docs" / "team-kanban-board.md"
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M %Z").strip()
+    body = kanban.render_markdown(board)
+    out.write_text(
+        body.rstrip()
+        + f"\n\n---\n\nPublished {stamp} by `grip-kanban publish` — "
+          "edit via the CLI, never by hand; this file is generated.\n"
+    )
+    return f"Published board -> {out}", False
+
+
+_HANDLERS = {
+    "show": _cmd_show,
+    "summary": _cmd_summary,
+    "seed": _cmd_seed,
+    "add": _cmd_add,
+    "move": _cmd_move,
+    "assign": _cmd_assign,
+    "publish": _cmd_publish,
+}
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="grip-kanban", description="GRIP canonical team Kanban board"
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("show", help="render the board as markdown")
+    sub.add_parser("summary", help="one-line per-lane counts")
+    sub.add_parser("seed", help="seed from the open-items snapshot (idempotent)")
+    sub.add_parser("publish", help="write the GitHub-viewable board to docs/team-kanban-board.md")
+
+    p_add = sub.add_parser("add", help="add a card")
+    p_add.add_argument("title")
+    p_add.add_argument("--owner", default="GRIP")
+    p_add.add_argument("--lane", default="todo")
+    p_add.add_argument("--detail", default="")
+    p_add.add_argument("--link", action="append", default=[], dest="links")
+
+    p_move = sub.add_parser("move", help="move a card to a lane")
+    p_move.add_argument("card_id")
+    p_move.add_argument("lane")
+
+    p_assign = sub.add_parser("assign", help="assign a card to an owner")
+    p_assign.add_argument("card_id")
+    p_assign.add_argument("owner")
+    return parser
+
+
+def main(argv=None) -> int:
+    args = _build_parser().parse_args(argv)
+    board = kanban.load_board()
+    try:
+        message, needs_save = _HANDLERS[args.command](board, args)
+    except ValueError as exc:
+        print(f"grip-kanban: {exc}", file=sys.stderr)
+        return 1
+    if needs_save:
+        kanban.save_board(board)
+    print(message)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

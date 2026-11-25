@@ -1,0 +1,622 @@
+#!/usr/bin/env bash
+# codec-call — /140.85 easter-egg TUI delight
+# Opens a Mei Ling-style codec call showing current GRIP session state.
+# Matches the /stealth protocol's frequency 140.85.
+#
+# Usage: codec-call              — status only
+#        codec-call --save       — also trigger grip_save (canonical Mei Ling action)
+#        codec-call --short      — single-line codec (for hooks / statusline)
+
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+source "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib/venv-utils.sh"
+if ! VENV_PY="$(resolve_venv_python "$CLAUDE_DIR/venv")"; then
+  echo "[codec-call] no Python interpreter found (searched $CLAUDE_DIR/venv, then PATH)" >&2
+  exit 1
+fi
+
+SAVE=0
+SHORT=0
+for arg in "$@"; do
+  case "$arg" in
+    --save)  SAVE=1 ;;
+    --short) SHORT=1 ;;
+  esac
+done
+
+export CODEC_SAVE="$SAVE"
+export CODEC_SHORT="$SHORT"
+
+"$VENV_PY" - <<'PY'
+import json
+import os
+import random
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR", Path.home() / ".claude"))
+sys.path.insert(0, str(CLAUDE_DIR / "lib"))
+from path_encoding import encode_project_path  # noqa: E402
+from _compat import grip_python  # noqa: E402 -- needs lib/ on sys.path first
+_PROJECT_SLUG = encode_project_path(CLAUDE_DIR)
+SAVE = os.environ.get("CODEC_SAVE") == "1"
+SHORT = os.environ.get("CODEC_SHORT") == "1"
+
+# --- ANSI palette -----------------------------------------------------------
+C = {
+    "reset":  "\033[0m",
+    "dim":    "\033[2m",
+    "bold":   "\033[1m",
+    "green":  "\033[38;5;46m",   # codec green
+    "amber":  "\033[38;5;214m",
+    "cyan":   "\033[38;5;51m",
+    "grey":   "\033[38;5;240m",
+    "bg":     "\033[48;5;235m",
+    "ml":     "\033[38;5;213m",  # Mei Ling pink
+}
+
+# --- Live state readers -----------------------------------------------------
+def read_instance():
+    """Return latest instance record (with message_count, lineage.generation)
+    plus the top-level index metadata."""
+    try:
+        proj_dir = CLAUDE_DIR / "projects" / _PROJECT_SLUG / "grip"
+        idx_path = proj_dir / "index.json"
+        if not idx_path.exists():
+            return {}
+        idx = json.loads(idx_path.read_text())
+        instances = idx.get("instances") or []
+        latest = instances[-1] if isinstance(instances, list) and instances else {}
+        lineage = latest.get("lineage", {}) if isinstance(latest, dict) else {}
+        return {
+            "generation": lineage.get("generation", idx.get("generation", "?")),
+            "message_count": latest.get("message_count", "?"),
+            "branch": lineage.get("branch") or idx.get("branch", "?"),
+        }
+    except Exception:
+        return {}
+
+def read_genome():
+    try:
+        g = json.loads((CLAUDE_DIR / "cache" / "genome.json").read_text())
+        # Fitness fallback chain: fitness -> composite_fitness -> latest history -> 0.0
+        fitness = g.get("fitness")
+        if fitness is None:
+            fitness = g.get("composite_fitness")
+        if fitness is None:
+            hist = g.get("fitness_history") or []
+            fitness = hist[-1] if hist else 0.0
+        history = g.get("fitness_history") or []
+        # Last 10 numeric entries, defensively coerced.
+        trend = []
+        for v in history[-10:]:
+            try:
+                trend.append(float(v))
+            except (TypeError, ValueError):
+                continue
+        return {
+            "gen": g.get("generation", g.get("gen", "?")),
+            "genes": len(g.get("genes", [])),
+            "fitness": float(fitness) if fitness is not None else 0.0,
+            "trend": trend,
+        }
+    except Exception:
+        return {"gen": "?", "genes": 0, "fitness": 0.0, "trend": []}
+
+
+def peek_next_fib():
+    """Compute the fib_id of the NEXT `--save` call without mutating state.
+
+    Reads state/missions/counter.json and returns (next_mission_number, next_fib).
+    Safe if the counter has never been written — both values default to 1.
+    """
+    try:
+        cp = CLAUDE_DIR / "state" / "missions" / "counter.json"
+        if not cp.exists():
+            return 1, 1
+        s = json.loads(cp.read_text())
+        n = int(s.get("mission_number", 0)) + 1
+        curr = int(s.get("curr_fib", 1))
+        return n, (curr if n > 1 else 1)
+    except Exception:
+        return 1, 1
+
+def current_branch():
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(CLAUDE_DIR), "branch", "--show-current"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip() or "?"
+    except Exception:
+        return "?"
+
+def dirty_count():
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(CLAUDE_DIR), "status", "--short"],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+        return len([l for l in out.splitlines() if l.strip()])
+    except Exception:
+        return 0
+
+def predictions_breakdown():
+    """Return (confirmed, refuted, pending) from hypotheses.jsonl.
+    Treats 'falsified' as a synonym for 'refuted'."""
+    try:
+        hpath = CLAUDE_DIR / "learning" / "hypotheses.jsonl"
+        if not hpath.exists():
+            return (0, 0, 0)
+        c = r = p = 0
+        for line in hpath.read_text().splitlines():
+            try:
+                s = json.loads(line).get("status", "pending")
+            except Exception:
+                continue
+            if s == "confirmed":
+                c += 1
+            elif s in ("refuted", "falsified"):
+                r += 1
+            elif s == "pending":
+                p += 1
+        return (c, r, p)
+    except Exception:
+        return (0, 0, 0)
+
+def read_identity():
+    """Active operator signature (V>>, A>>, etc.) from session state."""
+    try:
+        ai = CLAUDE_DIR / "state" / "session" / "active-identity"
+        if ai.exists():
+            val = ai.read_text().strip()
+            return val or "?"
+    except Exception:
+        pass
+    return "?"
+
+def read_project():
+    """Return a human-friendly project name from the git remote, or fall
+    back to the git toplevel directory name."""
+    cwd = os.getcwd()
+    try:
+        url = subprocess.check_output(
+            ["git", "-C", cwd, "config", "--get", "remote.origin.url"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+        if url:
+            # git@github.com:owner/repo.git or https://github.com/owner/repo(.git)
+            slug = url.rstrip("/")
+            if slug.endswith(".git"):
+                slug = slug[:-4]
+            if slug.startswith("git@") and ":" in slug:
+                slug = slug.split(":", 1)[1]
+            elif "://" in slug:
+                slug = slug.split("://", 1)[1]
+                slug = slug.split("/", 1)[1] if "/" in slug else slug
+            return slug or "?"
+    except Exception:
+        pass
+    try:
+        top = subprocess.check_output(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+        if top:
+            return Path(top).name
+    except Exception:
+        pass
+    return "?"
+
+def read_dir():
+    """Home-relative cwd for display."""
+    try:
+        cwd = os.getcwd()
+        home = str(Path.home())
+        if cwd.startswith(home):
+            return "~" + cwd[len(home):]
+        return cwd
+    except Exception:
+        return "?"
+
+# --- Mei Ling proverbs (Chinese, Japanese, Sun Tzu) -------------------------
+PROVERBS = [
+    ("A general is but an empty vessel if not informed of the conditions on the battlefield.", "Sun Tzu"),
+    ("Know yourself and you will win all battles.", "Sun Tzu"),
+    ("The supreme art of war is to subdue the enemy without fighting.", "Sun Tzu"),
+    ("Those who are victorious plan effectively and change decisively.", "Sun Tzu"),
+    ("Strategy without tactics is the slowest route to victory.", "Sun Tzu"),
+    ("When strong, appear weak. When weak, appear strong.", "Sun Tzu"),
+    ("Opportunity in the midst of chaos.", "Sun Tzu"),
+    ("A man's true wealth is the good he does in this world.", "Mei Ling"),
+    ("The greatest victory is that which requires no battle.", "Sun Tzu"),
+    ("He who knows when to fight and when not to fight will be victorious.", "Sun Tzu"),
+    ("Even a sheet of paper has two sides.", "Japanese proverb"),
+    ("The bamboo that bends is stronger than the oak that resists.", "Japanese proverb"),
+    ("Vision without action is a daydream. Action without vision is a nightmare.", "Japanese proverb"),
+    ("If you understand everything, you must be misinformed.", "Japanese proverb"),
+    ("Fall seven times, stand up eight.", "Japanese proverb"),
+    ("A wise man adapts himself to circumstances as water shapes itself to the vessel.", "Chinese proverb"),
+    ("Dig the well before you are thirsty.", "Chinese proverb"),
+    ("He who asks is a fool for five minutes, but he who does not ask remains a fool forever.", "Chinese proverb"),
+    ("The best time to plant a tree was 20 years ago. The second best time is now.", "Chinese proverb"),
+    ("When the winds of change blow, some build walls while others build windmills.", "Chinese proverb"),
+]
+
+# --- Mei Ling ASCII portrait (3 context-aware variants) ---------------------
+# Which face renders is decided from the hypothesis confirmed/refuted ratio —
+# the panel literally reflects whether recent predictions are bearing out.
+# Selector is pure: no scary surprise expressions; Mei Ling stays recognisable
+# in all three variants, only mouth + brows shift.
+MEI_NEUTRAL = r"""
+      ,--""--,
+     /  o  o  \
+    |  \____/  |
+     \   --   /
+      `-.__.-'
+     /| MEI |\
+    ( |LING | )
+     \|_____|/
+"""
+
+MEI_HAPPY = r"""
+      ,--""--,
+     /  ^  ^  \
+    |  \____/  |
+     \  \__/  /
+      `-.__.-'
+     /| MEI |\
+    ( |LING | )
+     \|_____|/
+"""
+
+MEI_CONCERNED = r"""
+      ,--""--,
+     /  -  -  \
+    |  \____/  |
+     \   ~~   /
+      `-.__.-'
+     /| MEI |\
+    ( |LING | )
+     \|_____|/
+"""
+
+def pick_portrait(confirmed, refuted):
+    """Return (portrait, mood_label) keyed on the hypothesis ratio.
+
+    >=1.5  → happy      (predictions bearing out, operator on track)
+    <0.75  → concerned  (too many refutations, rethink called for)
+    else   → neutral    (mixed signal / early session / no data)
+    """
+    if refuted == 0 and confirmed == 0:
+        return MEI_NEUTRAL, "calibrating"
+    ratio = confirmed / max(refuted, 1)
+    if ratio >= 1.5:
+        return MEI_HAPPY, "on track"
+    if ratio < 0.75:
+        return MEI_CONCERNED, "review needed"
+    return MEI_NEUTRAL, "mixed"
+
+
+# --- Unicode sparkline + proportional bar (delight v2 visuals) --------------
+_SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+def sparkline(values, width=10):
+    """Render up to `width` numeric values as ▁..█ blocks. Returns `·`*width
+    if the history is empty; flat-line renders at midpoint.
+    """
+    if not values:
+        return "·" * width
+    vals = list(values)[-width:]
+    lo, hi = min(vals), max(vals)
+    if hi == lo:
+        return _SPARK_CHARS[4] * len(vals)
+    span = hi - lo
+    return "".join(
+        _SPARK_CHARS[min(7, int((v - lo) / span * 7))] for v in vals
+    )
+
+
+def proportional_bar(segments, width=30):
+    """Render segments as a coloured proportional bar of given width.
+
+    segments: list[(count:int, ansi_color:str)]. Colours are raw ANSI escape
+    sequences from the C palette. The last segment absorbs any rounding
+    remainder so the bar always renders exactly `width` block characters.
+    """
+    total = sum(c for c, _ in segments) or 1
+    pieces = []
+    remaining = width
+    n = len(segments)
+    for i, (count, colour) in enumerate(segments):
+        if i == n - 1:
+            k = max(0, remaining)
+        else:
+            k = int(round(count / total * width))
+            k = max(0, min(k, remaining))
+        remaining -= k
+        if k > 0:
+            pieces.append(f"{colour}{'█' * k}{C['reset']}")
+    return "".join(pieces)
+
+def typewriter(text, delay=0.003):
+    """Cheap typewriter effect — skippable."""
+    if SHORT:
+        print(text, end="")
+        return
+    for ch in text:
+        sys.stdout.write(ch)
+        sys.stdout.flush()
+        time.sleep(delay)
+
+# --- Compose the codec call ------------------------------------------------
+inst = read_instance()
+genome = read_genome()
+br = current_branch()
+dirty = dirty_count()
+confirmed, refuted, pending = predictions_breakdown()
+identity = read_identity()
+project = read_project()
+workdir = read_dir()
+gen = inst.get("generation") or genome.get("gen") or "?"
+msgs = inst.get("message_count", "?")
+if msgs in (None, ""):
+    msgs = "?"
+proverb, source = random.choice(PROVERBS)
+
+if SHORT:
+    print(f"{C['ml']}◆ 140.85 ◆{C['reset']} Gen {gen} · {br} · {dirty} dirty · {pending} pend · {C['grey']}\"{proverb[:50]}...\"{C['reset']}")
+    sys.exit(0)
+
+# --- Panel geometry (Swiss-nihilism-grade: one primitive, one formula) -----
+# The old render block had five ad-hoc pad formulas, three of them off by
+# one in different directions — the right border drifted inward and outward
+# at different rows. Consolidated into panel_line() below. Inside-bar
+# width is W; every row is padded to exactly W visible columns.
+W = 62
+BAR = "═" * W
+SEP = "─" * (W - 2)
+
+import re as _re
+import unicodedata as _ud
+_ANSI_STRIP = _re.compile(r"\033\[[0-9;]*m")
+
+def _vwidth(s: str) -> int:
+    """Display width in monospace columns, ANSI escapes stripped.
+
+    Uses East Asian Width property: 'W'/'F' code points occupy two columns;
+    everything else (including 'A' ambiguous, which kitty renders as 1 col
+    by default) occupies one. Guards against drift on glyphs like ●.
+    """
+    plain = _ANSI_STRIP.sub("", s)
+    w = 0
+    for ch in plain:
+        w += 2 if _ud.east_asian_width(ch) in ("W", "F") else 1
+    return w
+
+def panel_line(inner: str = "") -> str:
+    """Return a panel row: ║{inner}{pad}║ padded to exactly W columns.
+
+    The only place the pad formula lives. If you find yourself computing
+    `W - 1 - len(...)` somewhere, use this instead.
+    """
+    pad = max(0, W - _vwidth(inner))
+    return f"  {C['green']}║{C['reset']}{inner}{' ' * pad}{C['green']}║{C['reset']}"
+
+def panel_sep(kind: str = "mid") -> str:
+    """Horizontal border row. kind ∈ {'top','mid','bot'}."""
+    left = {"top": "╔", "mid": "╠", "bot": "╚"}[kind]
+    right = {"top": "╗", "mid": "╣", "bot": "╝"}[kind]
+    return f"  {C['green']}{left}{BAR}{right}{C['reset']}"
+
+def panel_section(label: str) -> str:
+    """Section heading row: two-space indent, coloured label, dim rule to the right bar."""
+    prefix = f"  {C['amber']}{label}{C['reset']} "
+    rule_width = W - _vwidth(prefix) - 2  # 2 for the trailing spaces
+    rule = f"{C['dim']}{'─' * rule_width}{C['reset']}  "
+    return panel_line(prefix + rule)
+
+
+print()
+print(panel_sep("top"))
+print(panel_line(
+    f"  {C['bold']}{C['ml']}◆ CODEC ◆{C['reset']}  {C['dim']}FREQ:{C['reset']} "
+    f"{C['amber']}140.85{C['reset']}   {C['ml']}✦ MEI LING ✦{C['reset']}"
+))
+print(panel_sep("mid"))
+
+# Portrait + greeting (two columns). Face is chosen from hypothesis ratio.
+portrait_raw, mood = pick_portrait(confirmed, refuted)
+portrait = portrait_raw.strip("\n").splitlines()
+mood_line_map = {
+    "on track":      " Predictions on track, Snake.",
+    "review needed": " Predictions drifting. Review.",
+    "mixed":         " You're in good hands, Snake.",
+    "calibrating":   " Calibrating, stand by.",
+}
+secondary = (
+    " I have saved your progress." if SAVE else mood_line_map.get(mood, mood_line_map["mixed"])
+)
+greeting = [
+    f"{C['ml']}\"This is Mei Ling.{C['reset']}",
+    "",
+    secondary,
+    "",
+    f" Frequency is {C['amber']}140.85{C['reset']}. Remember it.\"",
+]
+while len(greeting) < len(portrait):
+    greeting.append("")
+
+for pl, gl in zip(portrait, greeting):
+    # Two-column inner: " {portrait} {greeting}" — panel_line adds the pad.
+    inner = f" {C['cyan']}{pl}{C['reset']} {gl}"
+    print(panel_line(inner))
+
+print(panel_line())
+print(panel_section("STATUS"))
+
+def row(label, value):
+    print(panel_line(
+        f"  {C['grey']}{label:<12}{C['reset']} {C['bold']}{value}{C['reset']}"
+    ))
+
+row("Generation:",  gen)
+row("Project:",     project)
+row("DIR:",         workdir)
+row("WHO_ARE_YOU?", identity)
+row("Branch:",      br)
+row("Messages:",    msgs)
+row("Genome:",      f"genome {genome['gen']} · {genome['genes']} genes · fitness {genome['fitness']:.3f}")
+# Fitness trend sparkline — only render when ≥2 points are available so the
+# reader gets actual shape information, not a flat block or single char.
+if len(genome.get("trend", [])) >= 2:
+    spark = sparkline(genome["trend"], width=10)
+    trend_delta = genome["trend"][-1] - genome["trend"][0]
+    arrow = "↑" if trend_delta > 0 else ("↓" if trend_delta < 0 else "→")
+    delta_colour = C["green"] if trend_delta > 0 else (C["amber"] if trend_delta < 0 else C["grey"])
+    row("Trend:",    f"{C['cyan']}{spark}{C['reset']} {delta_colour}{arrow} {trend_delta:+.3f}{C['reset']}")
+# Working-files colour reflects dirty state — green when clean, amber when
+# under 20 files, red when the tree is visibly out of hand (≥20).
+if dirty == 0:
+    working_val = f"{C['green']}clean{C['reset']}"
+elif dirty < 20:
+    working_val = f"{C['amber']}{dirty} files uncommitted{C['reset']}"
+else:
+    working_val = f"\033[38;5;196m{dirty} files uncommitted{C['reset']}"
+row("Working:",     working_val)
+pred_val = (
+    f"{C['green']}{confirmed} confirmed{C['reset']} · "
+    f"{C['amber']}{refuted} refuted{C['reset']} · "
+    f"{pending} pending"
+    if (confirmed or refuted or pending) else "none on record"
+)
+row("PREDICTIONS:", pred_val)
+# Proportional bar underneath — visual proof of the mix. Skipped when there
+# is no hypothesis data so the panel doesn't render an empty gutter.
+if confirmed or refuted or pending:
+    _pred_bar = proportional_bar(
+        [(confirmed, C["green"]), (refuted, C["amber"]), (pending, C["grey"])],
+        width=42,
+    )
+    row("", _pred_bar)
+
+print(panel_line())
+print(panel_section("TODAY'S PROVERB"))
+
+import textwrap
+wrapped = textwrap.wrap(proverb, width=W - 6)
+for i, w in enumerate(wrapped):
+    is_first = (i == 0)
+    is_last = (i == len(wrapped) - 1)
+    if is_first and is_last:
+        body = f"  {C['ml']}\"{w}\"{C['reset']}"
+    elif is_first:
+        body = f"  {C['ml']}\"{w}{C['reset']}"
+    elif is_last:
+        body = f"   {C['ml']}{w}\"{C['reset']}"
+    else:
+        body = f"   {C['ml']}{w}{C['reset']}"
+    print(panel_line(body))
+# Attribution: right-aligned, dim — Swiss asymmetry, body-of-text vs caption.
+_attrib_core = f"— {source}"
+_attrib_right_gap = W - _vwidth(_attrib_core) - 2  # -2 reserves a trailing gutter
+print(panel_line(f"{' ' * _attrib_right_gap}{C['dim']}{_attrib_core}{C['reset']}  "))
+
+print(panel_line())
+
+# --- Mission logging (V>>--<<V watermark, Fibonacci mission chain) --------
+# Each --save advances the mission counter. Mission IDs follow the Fibonacci
+# recurrence F(n) = F(n-1) + F(n-2), making the cipher V+1=V+V-1 literal:
+# every save's ID is the sum of the previous two. Missions are logged with
+# the V>>--<<V watermark so downstream tools (plain-language translator,
+# provenance watermarker) can recognise authentic V>> invocations.
+VOICE_GATE = "V>>--<<V"
+
+def log_mission(claude_dir, label):
+    """Append a mission record and return (mission_number, fib_id).
+
+    Mission records live in state/missions/F-<fib_id>.jsonl (one file per
+    distinct Fibonacci value — repeated values append to the same file).
+    The counter at state/missions/counter.json tracks the last two
+    Fibonacci values so the next call can compute F(n) = F(n-1) + F(n-2).
+    """
+    mdir = claude_dir / "state" / "missions"
+    mdir.mkdir(parents=True, exist_ok=True)
+    counter_path = mdir / "counter.json"
+    try:
+        s = json.loads(counter_path.read_text()) if counter_path.exists() else {}
+    except Exception:
+        s = {}
+    mission_number = int(s.get("mission_number", 0)) + 1
+    prev = int(s.get("prev_fib", 0))
+    curr = int(s.get("curr_fib", 1))
+    fib_id = curr if mission_number > 1 else 1
+    # Advance (prev, curr) -> (curr, prev + curr) for the NEXT save.
+    new_prev, new_curr = curr, prev + curr
+    entry = {
+        "mission_number": mission_number,
+        "fib_id": fib_id,
+        "label": label,
+        "watermark": VOICE_GATE,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    log_path = mdir / f"F-{fib_id}.jsonl"
+    with log_path.open("a") as fh:
+        fh.write(json.dumps(entry) + "\n")
+    counter_path.write_text(json.dumps({
+        "mission_number": mission_number,
+        "prev_fib": new_prev,
+        "curr_fib": new_curr,
+        "last_label": label,
+    }, indent=2))
+    return mission_number, fib_id
+
+
+# --- Optional save ---------------------------------------------------------
+if SAVE:
+    mission_n, fib = log_mission(CLAUDE_DIR, "codec-call 140.85 --save")
+    print(panel_line(
+        f"  {C['bold']}{C['green']}[ ✓ Saving progress to KONO substrate... ]{C['reset']}"
+    ))
+    print(panel_line(
+        f"  {C['dim']}Mission #{mission_n} · F({mission_n})={fib} · "
+        f"{C['ml']}{VOICE_GATE}{C['reset']}"
+    ))
+    # Anticipation footer — show the Fibonacci value the NEXT --save will land
+    # on, so the operator has the F(n+1) already in view before walking away.
+    next_n, next_fib = peek_next_fib()
+    print(panel_line(
+        f"  {C['dim']}next → Mission #{next_n} · F({next_n})={next_fib}{C['reset']}"
+    ))
+    try:
+        subprocess.run(
+            # Not bare "python3": grip_save.py signs an IDR record and that
+            # shebang resolves to an interpreter without `cryptography`,
+            # which writes a forgeable demo seal instead of failing.
+            [grip_python(CLAUDE_DIR), str(CLAUDE_DIR / "lib" / "grip_save.py"),
+             "codec-call 140.85"],
+            timeout=30, check=False, capture_output=True,
+        )
+    except Exception:
+        pass
+
+# Bottom border carries the V>>--<<V palindrome watermark — the operator
+# authenticity cipher. Its bidirectional symmetry survives centred alignment.
+# Length maths: the decorative segment " ◇ V>>--<<V ◇ " is 15 chars; the
+# two outside fills split the remainder evenly so the watermark stays
+# geometrically centred at any W.
+_WM_CENTRE = " ◇ V>>--<<V ◇ "
+_wm_fill = max(0, W - len(_WM_CENTRE))
+_left = _wm_fill // 2
+_right = _wm_fill - _left
+_wm_line = (
+    "═" * _left
+    + f"{C['ml']}{_WM_CENTRE}{C['reset']}{C['green']}"
+    + "═" * _right
+)
+print(f"  {C['green']}╚{_wm_line}╝{C['reset']}")
+print()
+typewriter(f"  {C['dim']}Kept you waiting, huh?{C['reset']}\n\n", 0.02)
+PY

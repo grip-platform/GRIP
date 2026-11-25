@@ -1,0 +1,3762 @@
+#!/usr/bin/env bash
+#
+# GRIP CLI - Claude Instance Preservation System
+# Coordinates resume workflows, branch management, and session orchestration.
+#
+# GRASP Pattern: Controller
+# Handles resume use cases, coordinates resolver and compressor.
+# Supports branching model for parallel sessions.
+# Supports polymorphic merge of branches (Phase 6).
+#
+# Usage:
+#   grip resume <reference>           # Full resume via claude --resume
+#   grip fresh <reference> [tokens]   # Fresh session with compressed context
+#   grip list [limit]                 # List available sessions
+#   grip branches                     # List all branches
+#   grip status                       # Show active sessions
+#   grip merge <ref> <ref> [--into]   # Merge branches
+#   grip tree                         # View tree structure
+#   grip resume branch:alpha          # Resume from specific branch
+#
+# Examples:
+#   grip resume latest
+#   grip resume gen:5
+#   grip resume branch:alpha
+#   grip fresh gen:5 2000
+#   grip branches
+#   grip status
+#   grip merge alpha bravo --into main
+#   grip tree
+#
+# VERSION: 6.0.0
+# DATE: 2026-01-01
+#
+
+set -euo pipefail
+
+# ============================================================================
+# PYTHON INTERPRETER RESOLUTION
+# ============================================================================
+# A virtualenv puts its interpreter at bin/python3 on POSIX and at
+# Scripts/python.exe on Windows, so a hardcoded path silently skips a perfectly
+# good venv on the other platform. scripts/lib/venv-utils.sh knows both.
+#
+# Two-rung source ladder (mirrors the wizard-path ladder further down): this
+# script's own repo first, then CLAUDE_DIR — because a Homebrew install puts
+# bin/grip outside the GRIP checkout, where ../scripts/lib does not exist.
+for _grip_venv_utils in \
+    "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd)/scripts/lib/venv-utils.sh" \
+    "${CLAUDE_DIR:-$HOME/.claude}/scripts/lib/venv-utils.sh"; do
+    if [[ -f "$_grip_venv_utils" ]]; then
+        source "$_grip_venv_utils"
+        break
+    fi
+done
+unset _grip_venv_utils
+
+# Interpreter for a given venv dir: the venv's own Python when there is one,
+# otherwise python3 — the same ladder these call sites always used, minus the
+# hardcoded POSIX path. Degrades to python3 (never a hard failure) if
+# venv-utils.sh is absent, because this file is the harness launcher.
+_grip_resolve_python() {
+    local venv_dir="$1" resolved=""
+    if declare -F resolve_venv_python >/dev/null 2>&1; then
+        resolved="$(resolve_venv_python "$venv_dir" 2>/dev/null || true)"
+    fi
+    if [[ -n "$resolved" ]]; then
+        echo "$resolved"
+    else
+        echo "python3"
+    fi
+}
+
+# ============================================================================
+# BOOTSTRAP CONSTANTS
+# ============================================================================
+
+GRIP_VERSION="9.0.0"
+GRIP_WARM=1
+
+# Harness picker (#2212): which AI harness to open at `grip` launch. Captured
+# from `--harness <name>` (parsed + stripped in main) or the GRIP_HARNESS env
+# var. Empty = resolve interactively (TTY) or default to Claude Code. The
+# resolver (_resolve_harness_launch) NEVER prompts for the non-session
+# subcommands, only-Claude installs, or a non-TTY launch — so the existing
+# already-onboarded flow is preserved by construction.
+GRIP_HARNESS_FLAG="${GRIP_HARNESS:-}"
+
+# Derive share dir from script location (works for both Intel and Apple Silicon Homebrew)
+if [[ -z "${GRIP_SHARE_DIR:-}" ]]; then
+    SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    HOMEBREW_PREFIX="${SCRIPT_PATH%/bin}"
+    GRIP_SHARE_DIR="$HOMEBREW_PREFIX/share/grip"
+fi
+
+# Source first-run detector if available
+if [[ -f "$HOME/.claude/lib/first-run-detector.sh" ]]; then
+    source "$HOME/.claude/lib/first-run-detector.sh"
+fi
+
+# Source flow-mode functions if available
+if [[ -f "$HOME/.claude/lib/flow-mode.sh" ]]; then
+    source "$HOME/.claude/lib/flow-mode.sh"
+fi
+
+# Source TUI progress library if available
+if [[ -f "$HOME/.claude/lib/tui-progress.sh" ]]; then
+    source "$HOME/.claude/lib/tui-progress.sh"
+fi
+
+# The launch card replaces the old splash (lib/grip-splash.sh, removed). ONE
+# renderer serves both surfaces: the card shown on a harness launch IS the
+# splash shown on a bare launch. Every figure is read from real state at render
+# time -- the old splash hardcoded skill_count="~150" as both the value and its
+# own fallback, so a cache miss and a live read looked identical on screen.
+#
+# Fail-OPEN by construction: the card is decoration over real data, and no
+# decoration may ever block a launch. A missing file, a broken python or an
+# unreadable chain prints nothing and the session starts regardless.
+_grip_launch_card() {
+    local card_py="${CLAUDE_DIR:-$HOME/.claude}/lib/grip_launch_card.py"
+    [[ -f "$card_py" ]] || return 0
+    # stderr is KEPT, not discarded (#4243). Fail-open is about the launch never
+    # being blocked, which `|| true` already guarantees; it never required
+    # destroying the reason. With 2>/dev/null a syntax error, a missing import
+    # or a permission denial all looked identical to "no card today", so the
+    # operator had no way to find out why.
+    #
+    # Per-PID, not a fixed name: concurrent GRIP sessions are the normal case
+    # here, and a shared filename means two launches racing to truncate the same
+    # file — the surviving text may belong to either, which is worse than no log
+    # because it looks authoritative. One small file per launch instead.
+    GRIP_LAUNCH_CARD_ERRLOG="${TMPDIR:-/tmp}/grip-launch-card.$$.err"
+    local card_rc=0
+    python3 "$card_py" \
+        --harness "${GRIP_HARNESS_FLAG:-}" \
+        --model "${GRIP_HARNESS_MODEL:-}" 2>"$GRIP_LAUNCH_CARD_ERRLOG" || card_rc=$?
+    # Show it, then drop it (#4328). Writing the reason somewhere the operator
+    # has to already know about is not visibility — it is the same opacity with
+    # an extra step. Printing to stderr puts the reason where the failure is.
+    #
+    # Gated on the EXIT STATUS, not on the file being non-empty: a card that
+    # rendered perfectly well can still emit a warning to stderr, and a
+    # non-empty test would then announce "launch card failed" on every single
+    # start of a working install. That nagging is the thing this is meant to
+    # avoid, so a zero exit stays silent and its stderr is discarded with the
+    # file. The unconditional rm keeps one file per launch from piling up in
+    # the temp dir forever, whether the card rendered or not.
+    if [[ $card_rc -ne 0 && -s "$GRIP_LAUNCH_CARD_ERRLOG" ]]; then
+        printf 'grip: launch card failed (exit %d):\n' "$card_rc" >&2
+        cat "$GRIP_LAUNCH_CARD_ERRLOG" >&2
+    fi
+    rm -f "$GRIP_LAUNCH_CARD_ERRLOG"
+}
+
+# ── Claude handoff seam (DRY across the 7 exec sites) ───────────────────
+# Direct exec — historical behaviour. The W2 pty-repaint wrapper was
+# retired 2026-05-26 (V>>: "since it's just cosmetic let's get rid of it";
+# spec drafts/tui-future-multiharness-spec-2026-05-15.md §2 retired).
+#
+# 1M context window: every GRIP launch engages the Anthropic context-1m beta
+# so Opus 4.x runs the 1,000,000-token window instead of the 200K base. Opus
+# 4.8 / Sonnet 4.x use it; models that don't support it simply IGNORE the
+# header (verified HTTP 200 for opus-4-8 / sonnet-4-6 / haiku-4-5, 2026-05-28),
+# so unconditional injection is safe. The statusline reads CC's *real* reported
+# window, so this turning on is immediately visible (no fabricated label).
+#   - Opt out for one launch:  GRIP_NO_1M=1 grip ...
+#   - A caller-supplied --betas wins (skip injection → no duplicate flag).
+GRIP_CONTEXT_1M_BETA="context-1m-2025-08-07"
+# The 1M model VARIANT — not just the API beta header above. The beta unlocks
+# the 1M ceiling at the API, but Claude Code's *declared* context window (the
+# number autocompact and the statusline read) comes from the MODEL VARIANT.
+# Without the [1m] variant pinned, CC boots the account's ambient default —
+# sometimes the 200K base variant — so autocompact thrashes at 200K even though
+# the beta accepted 1M. The manual `/model → Opus 5.5 (1M context)` workaround
+# just selects this variant; pinning it here makes every GRIP launch 1M
+# deterministically. (GRIP 2026-07-06 — recurring "started without 1M" bug.)
+#   - Opt out for one launch:  GRIP_NO_1M=1 grip ...   (skips beta AND model)
+#   - A caller-supplied --model wins (skip injection → no duplicate flag).
+#   - Override the pinned variant:  GRIP_1M_MODEL='<id>' grip ...
+#
+# The pin below is VERIFIED TO SERVE, not assumed. Probed 2026-09-23 on Claude
+# Code 2.1.281: subtype=success, is_error=false, and modelUsage keyed to
+# ["claude-opus-5-5"] — the API's own usage record naming the model, which is a
+# stronger claim than "it did not error". That distinction is load-bearing: a
+# probe on 2026-08-25 showed a deliberately nonsensical id reach the network
+# exactly like a real one, so a non-error proves nothing on its own. The control
+# still discriminates today — `claude-opus-9-9-nonsense` returns the generic
+# "may not exist", where this id returned real usage.
+#
+# NOTE THE MISSING `[1m]`. Opus 5.5 is NATIVELY 1M, so the suffix is unnecessary
+# here — the v2.1.280 changelog reads "Added Claude Opus 5.5
+# (`claude-opus-5-5`), now the default Opus model — 1M context", and the vendor's
+# context-windows page adds "For every model with a 1M-token context window, 1M
+# is the default: you don't need a beta header." The suffix is an Opus-era
+# artefact from when 1M was a gated variant. Name the layer when recording this:
+# Claude Code still ACCEPTS the suffix and strips it (its own /model picker writes
+# claude-opus-5-5[1m], and a whole 2.1.281 session served under that spelling on
+# 2026-09-24), while the API itself answers HTTP 404 to claude-opus-5-5[1m]. So the
+# suffix is harmless at this layer and wrong only below Claude Code.
+#
+# 2026-09-28: the pin is now the `default` ALIAS, not a literal id. `default`
+# clears any model override and reverts to the account's runtime default — Opus
+# 5.5 at 1M on a Max plan (Claude Code model-config: "default ... reverts to the
+# runtime default for your account"). Naming a literal id selected a CUSTOM
+# picker row that could fall back to a 200K window; Default (Recommended) cannot
+# drift. GRIP_1M_MODEL override stays honoured for a confirmed id.
+#
+# 2026-10-11: the machine-local pin, config/model-pin.local.json (written by
+# bin/grip-model-default, read by lib/model_pin.py), is the default for every
+# launch. The vendor ranks the launch flag above every settings key (model-config,
+# "Setting your model": --model is 2 of 5, the `model` key 4), so this is the
+# ONLY way the operator's default reaches a session GRIP starts; the env entry
+# the same command writes covers the sessions GRIP does not start. A caller's
+# GRIP_1M_MODEL still wins; no pin file keeps the `default` alias; a pin file
+# that cannot be read or names no valid model REFUSES the launch with its cause,
+# because booting the account default in silence is the downgrade this pin and
+# the 1M pin above both exist to prevent. The read is stdlib-only and writes
+# nothing, so a plain python3 is fine here (rules/never-system-python-for-grip.md).
+_grip_model_pin() {
+    local lib="${CLAUDE_DIR:-$HOME/.claude}/lib/model_pin.py"
+    [[ -f "$lib" ]] || return 3
+    python3 "$lib" show --launch
+}
+
+# 2026-11-16 (GRIP#9208): on Claude Code 2.1.325 no ConfigChange event follows the
+# /model picker's own save (measured on Windows), and that save leaves the pick, a
+# dropped effortLevel and a reordered file in the tracked settings.json. So each
+# launch tidies the file before Claude Code reads it, when a pin file exists:
+# `lib/model_pin.py reconcile` removes a saved pick and writes back the committed
+# bytes when only key order and spacing differ, or also effortLevel beside a saved
+# pick (without one, a missing effortLevel is a local change). It writes, so it
+# runs under the venv interpreter, not the system python3
+# (rules/never-system-python-for-grip.md). It never blocks a launch: it prints what
+# it changed or why it could not tidy, and one note when the tidy did not run at all.
+_grip_model_pin_tidy() {
+    local dir="${CLAUDE_DIR:-$HOME/.claude}" py="" out="" rc=0
+    [[ -f "$dir/config/model-pin.local.json" && -f "$dir/lib/model_pin.py" ]] || return 0
+    py="$(_grip_resolve_python "$dir/venv" 2>/dev/null)" || py=""
+    [[ -n "$py" ]] || return 0
+    out="$("$py" "$dir/lib/model_pin.py" reconcile --brief --source launch 2>/dev/null)" || rc=$?
+    [[ -n "$out" ]] && >&2 printf '%s\n' "$out"
+    [[ "$rc" == 0 || -n "$out" ]] || >&2 echo "[grip] note: the settings.json tidy did not run (exit $rc); launching anyway."
+    return 0
+}
+
+# 2026-10-18: whether a launch skips Claude Code's own permission prompts is a
+# per-machine choice, no longer a hardcoded default. Every grip_handoff call below
+# used to pass --dangerously-skip-permissions, written for the operator's machines
+# and inherited by every fresh install (the one-folder product plan, finding F2,
+# item A8). V>> ruled: host prompts plus GRIP's gates for every non-operator
+# profile. So this helper prints the flag ONLY when the gitignored
+# config/launch.local.json says skip_permissions: true, which the operator sets
+# once per machine with bin/grip-launch-permissions skip. No file, or a file that
+# cannot be read, means prompts: the safe side, never the dangerous one by
+# accident. A caller's own --dangerously-skip-permissions on the grip command
+# line is passed through untouched; this decides only the launcher's default.
+# The read is stdlib-only and writes nothing, so plain python3 is fine here
+# (rules/never-system-python-for-grip.md). Pinned by tests/test_launch_permissions.py.
+_grip_permission_flag() {
+    local lib="${CLAUDE_DIR:-$HOME/.claude}/lib/launch_permissions.py"
+    local mode="prompt"
+    if [[ -f "$lib" ]]; then
+        mode="$(python3 "$lib" show 2>/dev/null)" || mode="prompt"
+    fi
+    if [[ "$mode" == "skip" ]]; then
+        printf -- '--dangerously-skip-permissions'
+    else
+        >&2 echo "[grip] Claude Code's permission prompts are ON for this machine (GRIP's gates stay on); the operator's switch is: bin/grip-launch-permissions skip"
+    fi
+}
+# The pin itself is read inside grip_handoff, at the Claude launch seam, and only
+# when it would be used. Read here at load time it made `grip --help`, `grip
+# status` and every non-Claude launch exit on a malformed pin (Codex on
+# GRIP#8011). What load time records is whether the CALLER chose a model: a
+# caller's GRIP_1M_MODEL wins and the pin file stays unread.
+_GRIP_1M_MODEL_CALLER="${GRIP_1M_MODEL:-}"
+GRIP_1M_MODEL="${GRIP_1M_MODEL:-default}"
+
+# Read the value a caller passed for --<name>, using the argv semantics the
+# shell and Claude Code actually apply: stop at a bare `--` (everything after
+# it is positional, not an option) and let the LAST occurrence win, because
+# that is the one that takes effect.
+#
+# ONE parser decides BOTH whether to inject and whether to warn. They used to
+# disagree — suppression was a substring test on "$*" while the warning parsed
+# tokens — and the gap was the very silent failure this code exists to stop:
+# `grip -- --model x` and `grip -p "explain --model handling"` both suppressed
+# the pin (the substring matched) AND printed nothing (the token parse found no
+# option), dropping the window to 200K with no diagnostic. Measured 2026-08-25,
+# both cases. Two grammars cannot be kept consistent by care; there is one now.
+#
+# It models `--` termination, duplicate flags, and the value-consuming flags
+# named in _GRIP_VALUE_FLAGS — so `grip -p --model x`, `grip -p "--model=x"` and
+# `grip -p "explain --model handling"` all keep the pin and stay silent.
+#
+# REMAINING LIMIT, narrowed rather than claimed away: _GRIP_VALUE_FLAGS is a
+# named list, not Claude Code's full grammar. A value-consuming flag NOT on that
+# list would still have its argument misread as an option. Adding one is a
+# one-line change; guessing at flags this launcher does not know would be worse
+# than covering the ones it does.
+# Exit 0 when the flag is PRESENT, even with an empty value; the value goes to
+# stdout. Presence and non-emptiness must be separable: keying off `-n "$out"`
+# made `--model=` and `--model ""` read as "no flag", so the pin was injected
+# while the caller's empty token stayed in "$@" — two --model flags on the exec
+# line, the empty one winning, an inert pin and no warning. Measured
+# 2026-08-25: both spellings produced `--model claude-opus-5[1m] --model=`.
+# Flags whose NEXT argv word is their value, so anything there is data, not an
+# option. A short, named list rather than an attempt at Claude Code's whole
+# grammar — but it must contain every flag this file ALREADY parses, which is
+# the gap AGORA #5046 round 8 found: --betas was missing while _grip_opt_arg
+# was reading it two lines below, so `grip --betas --model x` misread --model
+# as an option, suppressed the pin and printed a false diagnostic naming a
+# model the launch never had. "Unknown flag" was never an excuse for a flag
+# this code knows about. --model is here for the same reason, symmetrically.
+_GRIP_VALUE_FLAGS=" -p --print --betas --model "
+
+# Which models actually have a 1M window. Source: platform.claude.com
+# /docs/en/build-with-claude/context-windows, re-read live 2026-09-23 — "Claude
+# Fable 5.1, Claude Mythos 5.1, Claude Fable 5, Claude Mythos 5, Claude Opus 5.5,
+# Claude Opus 5, Claude Opus 4.8, Claude Opus 4.7, Claude Opus 4.6, Claude
+# Sonnet 5, Claude Sonnet 4.6 ... have a 1M-token context window", and "For every
+# model with a 1M-token context window, 1M is the default: you don't need a beta
+# header."
+#
+# This replaces a `[1m]`-suffix test that was wrong for every natively-1M model.
+# The suffix is an Opus-era artefact from when 1M was a gated variant; Fable 5
+# is 1M on the plain id and carries no suffix, so the old test told operators
+# their window had dropped to 200K on the model they use most. The lesson is
+# not "add Fable" — it is that a NAMING heuristic was standing in for a
+# CAPABILITY fact that the vendor publishes.
+#
+# Which is exactly why claude-fable-5-1 needs its OWN entry rather than
+# inheriting one. The test below is an exact match against this space-delimited
+# list, so a 5.1 id matches nothing and would be warned about as a 200K model —
+# the same false warning, on the same family, one generation later. A published
+# capability has to be recorded per id; nothing about the spelling implies it.
+#
+# 2026-09-23 proved that prediction for a THIRD generation, on a different
+# family: claude-opus-5-5 shipped as the Max-plan default and matched nothing
+# here, so the launcher would have told an operator on the new default model
+# that their window was 200K. The fix is another entry, never a family prefix —
+# a prefix would silently pass any unverified claude-opus-* id as 1M, which is
+# what tests/test_grip_handoff_1m.py::test_an_unknown_model_is_not_silently_treated_as_1m
+# exists to forbid.
+#
+# That miss is now mechanical rather than remembered: tests/test_model_onboarding_parity.py
+# fails, naming this list, when a catalogued 1M Anthropic model is absent.
+_GRIP_1M_MODELS=" claude-opus-5-5 claude-opus-5 claude-opus-4-8 claude-opus-4-7 claude-opus-4-6 claude-sonnet-5-5 claude-sonnet-5 claude-sonnet-4-6 claude-haiku-5-5 claude-fable-5-2 claude-fable-5-1 claude-mythos-5-1 claude-fable-5 claude-mythos-5 "
+
+# Bare aliases resolve to the LATEST of that family (`claude --help`: "an alias
+# for the latest model (e.g. 'fable', 'opus', or 'sonnet')"), and the latest
+# opus/sonnet/fable/mythos/haiku are all 1M. haiku joined on 2026-10-12 with
+# Haiku 5.5, the first Haiku with the 1M window (the vendor prices it by prompt
+# length across that window rather than at one rate). Measured, not inferred:
+# `claude -p "/context" --model haiku` budgeted 950k on Claude Code 2.1.296,
+# the same as claude-haiku-5-5 and claude-haiku-5-5[1m].
+_GRIP_1M_ALIASES=" opus sonnet fable mythos haiku default "
+
+# Does this model id have a 1M context window?
+_grip_model_is_1m() {
+    local m="$1"
+    [[ -z "$m" ]] && return 1
+    # An explicit [1m] variant is 1M by construction.
+    case "$m" in *"[1m]"*) return 0 ;; esac
+    # Strip any variant suffix before matching the base id.
+    local base="${m%%\[*}"
+    case "$_GRIP_1M_MODELS" in *" $base "*) return 0 ;; esac
+    case "$_GRIP_1M_ALIASES" in *" $base "*) return 0 ;; esac
+    return 1
+}
+
+_grip_opt_arg() {
+    local want="$1"; shift
+    local prev="" a out="" found=1
+    for a in "$@"; do
+        if [[ "$a" == "--" ]]; then break; fi
+        # This token is the previous flag's VALUE — skip it entirely.
+        # Skip a token that is some OTHER flag's value. The `!= --$want` guard
+        # is load-bearing: without it, searching for --model skips --model's own
+        # value (the flag is in the list for the symmetric --betas search), and
+        # the parser stops seeing the very option it exists to find. Clear prev
+        # rather than set it to the skipped token, or a consumed value goes on
+        # to act as a pending flag for the word after it.
+        if [[ "$prev" != "--$want" && "$_GRIP_VALUE_FLAGS" == *" $prev "* ]]; then
+            prev=""; continue
+        fi
+        case "$a" in "--$want="*) found=0; out="${a#--$want=}" ;; esac
+        if [[ "$prev" == "--$want" ]]; then found=0; out="$a"; fi
+        prev="$a"
+    done
+    # A trailing `--model` with nothing after it is present with no value.
+    if [[ "$prev" == "--$want" ]]; then found=0; out=""; fi
+    printf '%s' "$out"
+    return "$found"
+}
+
+# Print the FIRST --<name> value for which <predicate> FAILS, and exit 0; exit 1
+# when every value satisfies it (or the flag is absent). Predicate-based rather
+# than substring-based: the question is "does this model have a 1M window", a
+# capability the vendor publishes, not "is this string spelled a certain way".
+#
+# Checking every value rather than "the one that wins" deliberately removes a
+# dependency on whether Claude Code takes the first or the last of a duplicated
+# flag — a question this repo asserted and never measured. Requiring all of
+# them is correct under either rule, so the unverified assumption stops being
+# load-bearing. Printing the offender also keeps the message honest: naming the
+# last value while a different one is at fault points the operator at a model
+# that is not the problem.
+_grip_opt_first_failing() {
+    local want="$1" pred="$2"; shift 2
+    local prev="" a v
+    for a in "$@"; do
+        if [[ "$a" == "--" ]]; then break; fi
+        if [[ "$prev" != "--$want" && "$_GRIP_VALUE_FLAGS" == *" $prev "* ]]; then
+            prev=""; continue
+        fi
+        v=""
+        case "$a" in "--$want="*) v="${a#--$want=}" ;; esac
+        if [[ -n "$v" || "$a" == "--$want=" ]]; then
+            "$pred" "$v" || { printf '%s' "$v"; return 0; }
+        elif [[ "$prev" == "--$want" ]]; then
+            "$pred" "$a" || { printf '%s' "$a"; return 0; }
+        fi
+        prev="$a"
+    done
+    if [[ "$prev" == "--$want" ]]; then return 0; fi
+    return 1
+}
+# ── a model family behind Claude Code (gg++ claude --kimi) ──────────────────
+# GRIP_HARNESS_MODEL names a non-Anthropic model. Claude Code needs a whole
+# TIER MAP for it (lib/grip_harness_family.py claude_env: opus/sonnet/fable/
+# subagent, haiku, compact window, effort), and the main model must land in
+# GRIP_1M_MODEL because grip_handoff execs `--model "$GRIP_1M_MODEL"` — an
+# ANTHROPIC_MODEL export would sit under that flag and be a silent drop. The
+# helper prints `KEY=VALUE` lines; every line must match one of the two shapes
+# below or NOTHING is applied and the launch is refused (all-or-nothing, the
+# same discipline as the gateway wire, and never eval'd).
+#
+# Two routes. The DEFAULT rides the gateway wire (GRIP_INFINITE=1): witnessed,
+# cost-tracked, gateway-credentialed. GRIP_HARNESS_DIRECT=1 talks to the
+# vendor's own Anthropic-compatible endpoint with a bearer read from the
+# keychain in-process — never echoed, never written — and forfeits the witness
+# and cost rows, which is why it is opt-in per launch and never a fallback.
+# Both REFUSE rather than fall through: the gateway seam fails open to a
+# direct-to-Anthropic launch, which for an Anthropic model is harmless and for
+# a Kimi id is a 404 the operator would only meet on the first message.
+_fam_re='^(GRIP_1M_MODEL|ANTHROPIC_DEFAULT_(OPUS|SONNET|HAIKU|FABLE)_MODEL|CLAUDE_CODE_SUBAGENT_MODEL|CLAUDE_CODE_AUTO_COMPACT_WINDOW|CLAUDE_CODE_EFFORT_LEVEL)=[]A-Za-z0-9._[-]+$'
+
+_grip_family_lines_ok() {
+    local l
+    while IFS= read -r l; do
+        [[ -z "$l" ]] && continue
+        [[ "$l" =~ ^ANTHROPIC_BASE_URL=https?://[^[:space:]]+$ ]] && continue
+        [[ "$l" =~ $_fam_re ]] && continue
+        return 1
+    done <<< "$1"
+    return 0
+}
+
+# The tier map as a `--settings` JSON object. Claude Code applies a settings-file
+# `env` value over the launch environment, so a same-named pin in settings.json
+# silently replaced the family's exports. Measured 2026-10-02 with `/context`: an
+# exported ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-8 lost to a settings env
+# claude-opus-5-5[1m], while a `--settings` env entry won over a settings file.
+# So the map rides in --settings as well, and the family decides. Each value has
+# already passed _fam_re, whose character class holds no quote or backslash, so it
+# embeds in JSON as it is. GRIP_1M_MODEL is GRIP's own variable, not Claude Code's.
+_grip_family_settings_json() {
+    local l k json=""
+    while IFS= read -r l; do
+        [[ "$l" =~ $_fam_re ]] || continue
+        k="${l%%=*}"
+        [[ "$k" == "GRIP_1M_MODEL" ]] && continue
+        json="${json:+$json,}\"$k\":\"${l#*=}\""
+    done <<< "$1"
+    [[ -n "$json" ]] && printf '{"env":{%s}}' "$json"
+    return 0
+}
+
+# Returns 0 when a family map was exported, 1 when no family was requested;
+# exits 2 on every refusal (nothing has been exec'd yet, so this is clean).
+# $1 = 1 when grip_handoff will carry the map in --settings (no caller --settings),
+# which also tells the helper its settings.json notice would be false.
+_grip_family_env() {
+    local model="${GRIP_HARNESS_MODEL:-}" carry="${1:-0}"
+    _GRIP_FAMILY_SETTINGS=""
+    [[ -z "$model" ]] && return 1
+    local py mode="gateway" out="" key="" kc=""
+    py="$(_grip_family_path)" || py=""
+    if [[ -z "$py" ]]; then
+        >&2 echo "[grip] GRIP_HARNESS_MODEL=$model but lib/grip_harness_family.py was not found — refusing to launch Claude Code on a model it cannot wire."
+        exit 2
+    fi
+    [[ "${GRIP_HARNESS_DIRECT:-}" == "1" ]] && mode="direct"
+    if [[ "$mode" == "gateway" ]]; then
+        if [[ "${GRIP_INFINITE:-}" != "1" ]]; then
+            >&2 echo "[grip] '$model' is not an Anthropic model, and this launch is not routed through the HAL gateway. Two ways forward:"
+            >&2 echo "[grip]   GRIP_INFINITE=1 gg++ claude --<family>   through HAL :4010 — witnessed and cost-tracked (the default path)"
+            >&2 echo "[grip]   gg++ claude --<family> --direct          straight to the vendor — no witness row, no cost row"
+            exit 2
+        fi
+        if [[ -z "${ANTHROPIC_BASE_URL:-}" ]]; then
+            >&2 echo "[grip] GRIP_INFINITE=1, but nothing routed this launch through the gateway (it did not answer /health, the brake is engaged, or its helper output was rejected)."
+            >&2 echo "[grip] Refusing to send '$model' to Anthropic. Start the gateway (cd ~/.hal && python3 -m lib.hal.gateway --port 4010) or pass --direct."
+            exit 2
+        fi
+    else
+        kc="$(python3 "$py" direct-keychain "$model" 2>/dev/null)" || kc=""
+        [[ -n "$kc" ]] && key="$(security find-generic-password -s "$kc" -w 2>/dev/null || true)"
+        if [[ -z "$key" ]]; then
+            >&2 echo "[grip] --direct needs the vendor key in keychain entry '${kc:-<none for this family>}', and it is not there."
+            >&2 echo "[grip] Store it with bin/grip-keyring install (or grip-keys-to-keyring, which moves keys out of a shell profile), then retry."
+            exit 2
+        fi
+    fi
+    local -a args=(claude-env "$model")
+    [[ -n "${GRIP_HARNESS_EFFORT:-}" ]] && args+=(--effort "$GRIP_HARNESS_EFFORT")
+    [[ "$mode" == "direct" ]] && args+=(--direct)
+    [[ "$carry" == 1 ]] && args+=(--carried)
+    out="$(python3 "$py" "${args[@]}")" || out=""
+    if [[ -z "$out" ]] || ! _grip_family_lines_ok "$out"; then
+        >&2 echo "[grip] model-family helper gave no usable tier map for '$model' — refusing to launch Claude Code on a model it cannot wire."
+        exit 2
+    fi
+    local l
+    while IFS= read -r l; do [[ -n "$l" ]] && export "$l"; done <<< "$out"
+    [[ "$carry" == 1 ]] && _GRIP_FAMILY_SETTINGS="$(_grip_family_settings_json "$out")"
+    if [[ "$mode" == "direct" ]]; then
+        export ANTHROPIC_AUTH_TOKEN="$key"
+        >&2 echo "[grip] DIRECT: Claude Code -> $ANTHROPIC_BASE_URL on $GRIP_1M_MODEL. The HAL witness and cost rows are NOT recorded on this path."
+    else
+        >&2 echo "[grip] model family: $GRIP_1M_MODEL via the HAL gateway at $ANTHROPIC_BASE_URL"
+    fi
+    return 0
+}
+
+# ── the HAL wire (ADR-0016 Step 3): the line shapes grip_handoff accepts ────
+# lib/grip_infinite.py's proxy rung emits these; its is_wire_line() is their
+# Python twin, and tests/test_grip_infinite.py runs both over one corpus.
+# Loopback only for the proxy: decrypted traffic never leaves this host
+# (ADR-0016 decision 4). No character class here admits a quote or a
+# backslash, so a value that passes embeds in --settings JSON as it stands.
+_GRIP_WIRE_PROXY_RE='^(HTTPS_PROXY|https_proxy)=http://127\.0\.0\.1:([1-9][0-9]{0,4})$'
+_GRIP_WIRE_NOPROXY_RE='^(NO_PROXY|no_proxy)=[A-Za-z0-9.*:/_-]+(,[A-Za-z0-9.*:/_-]+)*$'
+_GRIP_WIRE_CA_RE='^NODE_EXTRA_CA_CERTS=/[^"\\[:cntrl:]]+\.pem$'
+# The script Claude Code runs before each Bash command, so commands go direct
+# while Claude Code's own traffic rides the wire (GRIP#7460). A shell runs it,
+# so its path admits no space, quote or shell metacharacter at all.
+_GRIP_WIRE_TIMEOUT_RE='^(API_TIMEOUT_MS|CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS|CLAUDE_STREAM_IDLE_TIMEOUT_MS|CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS)=[1-9][0-9]{0,8}$'
+_GRIP_WIRE_ENVFILE_RE='^CLAUDE_ENV_FILE=/[A-Za-z0-9._/@+-]+\.sh$'
+# Claude Code sends its gateway hint headers (the prompt id and request class
+# the wire reads) behind a custom base URL only with this set (GRIP#8456). The
+# helper emits exactly `=1`, so the shape admits nothing else.
+_GRIP_WIRE_HINTS_RE='^CLAUDE_CODE_GATEWAY_HINT_HEADERS=1$'
+
+# One helper line in the wire's shapes. The port bound lives here because a
+# regex cannot say "at most 65535" readably.
+_grip_wire_line_ok() {
+    if [[ "$1" =~ $_GRIP_WIRE_PROXY_RE ]]; then
+        (( BASH_REMATCH[2] <= 65535 ))
+        return
+    fi
+    [[ "$1" =~ $_GRIP_WIRE_NOPROXY_RE || "$1" =~ $_GRIP_WIRE_CA_RE ||
+       "$1" =~ $_GRIP_WIRE_ENVFILE_RE || "$1" =~ $_GRIP_WIRE_TIMEOUT_RE ||
+       "$1" =~ $_GRIP_WIRE_HINTS_RE ]]
+}
+
+# The wire's values as a --settings JSON object. Claude Code applies a settings
+# `env` over the launch environment, and background agents run under a shared
+# supervisor that may not have inherited this shell (vendor network-config
+# page, "Set network variables in settings, not the shell"), so the values ride
+# in --settings as well as in the shell. Every value has passed the shapes above.
+_grip_wire_settings_json() {
+    local l json=""
+    while IFS= read -r l; do
+        _grip_wire_line_ok "$l" || continue
+        json="${json:+$json,}\"${l%%=*}\":\"${l#*=}\""
+    done <<< "$1"
+    [[ -n "$json" ]] && printf '{"env":{%s}}' "$json"
+    return 0
+}
+
+# A session id this launch can name before Claude Code starts, passed to it as
+# --session-id so the launch receipt joins the session it became. None when the
+# argv already names or selects a session (a resume, a continue, a fork, a PR or
+# teleport session, a background launch, or the caller's own --session-id), or
+# when no uuid source exists: the receipt then records null, never a guess.
+# A single-dash cluster holding c or r (-c, -r, -rc ...) counts as selecting one.
+_grip_launch_session_id() {
+    local a id
+    for a in "$@"; do
+        if [[ "$a" == "--" ]]; then break; fi
+        case "$a" in
+            --session-id*|--resume*|--continue|--fork-session|--from-pr*|--teleport*|--cloud*|--bg|--background) return 1 ;;
+            --*) ;;
+            -*[cr]*) return 1 ;;
+        esac
+    done
+    id="$( { { uuidgen || cat /proc/sys/kernel/random/uuid; } | tr 'A-F' 'a-f'; } 2>/dev/null || true)"
+    [[ "$id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || return 1
+    printf '%s' "$id"
+}
+
+# Record the harness mode, not whether the launcher happened to own a TTY.
+# Legacy receipts without this field cannot establish an interactive denominator.
+_grip_launch_interactivity() {
+    local a
+    for a in "$@"; do
+        [[ "$a" == "--" ]] && break
+        case "$a" in
+            --print|--print=*|--bg|--background|--cloud|--cloud=*) printf '%s' --non-interactive; return ;;
+            --*) ;;
+            -*p*) printf '%s' --non-interactive; return ;;
+        esac
+    done
+    printf '%s' --interactive
+}
+
+# ── the tick's throttle flag (V>> 2026-10-29) ──────────────────────────────
+# While state/session/throttle.json is set (the always-on tick raises it, in
+# lib/tick_throttle.py, when the weekly Claude spend reaches the operator's
+# signed soft cap), a headless GRIP-started launch refuses to start and an
+# interactive session prints one line and runs. Existence decides, read by the
+# shell, so the refusal never depends on an interpreter; the line itself comes
+# from `python3 lib/throttle_flag.py describe` (the flag's read-only half, which
+# writes no record), with a plain fallback when nothing answers. Deleting the file is
+# the reversal. $1 is --interactive or --non-interactive, as
+# _grip_launch_interactivity reports it. Returns 1 only for a refused headless
+# launch; every other path returns 0.
+_grip_throttle_flag() {
+    printf '%s' "${CLAUDE_DIR:-$HOME/.claude}/state/session/throttle.json"
+}
+_grip_throttle_gate() {
+    local flag line reader
+    flag="$(_grip_throttle_flag)"
+    [[ -e "$flag" ]] || return 0
+    reader="${CLAUDE_DIR:-$HOME/.claude}/lib/throttle_flag.py"
+    line=""
+    if [[ -f "$reader" ]]; then
+        line="$(python3 "$reader" describe 2>/dev/null)" || line=""
+    fi
+    [[ -n "$line" ]] || line="throttle flag set at $flag; remove it to launch"
+    if [[ "$1" == "--non-interactive" ]]; then
+        >&2 echo "[grip] $line"
+        >&2 echo "[grip] a headless GRIP-started run refuses to start while the flag is set (V>> 2026-10-29): not launching."
+        return 1
+    fi
+    >&2 echo "[grip] note: $line"
+    >&2 echo "[grip]       this interactive session runs; headless GRIP runs refuse until the flag clears."
+    return 0
+}
+
+# ── the never-ending cycle (ADR-0016 Step 7, W1): per launch, opt-in only ───
+# GRIP_INFINITE_CYCLE=1 adds the cycle's two hooks to THIS session's
+# --settings, never to settings.json or config/settings.reference.json: a merge
+# touching the reference rewrites every live session's settings, and default-on
+# (D5) waits for the operator's manual QA. lib/infinite_cycle_launch.py decides
+# (the opt-in, the brake, a caller's own --settings) and merges the hooks into
+# the object this launch already carries, the wire's or the model family's, so
+# there is still exactly one --settings. Its output is one JSON object on one
+# line, or nothing; anything else is ignored with one visible line and the
+# launch goes ahead without the cycle (fail-open: the cycle is an extra, never
+# a gate). Never eval'd.
+# $1 = 1 for a model-family launch; $2 = 1 when grip_handoff carries --settings.
+_grip_cycle_merge() {
+    [[ "${GRIP_INFINITE_CYCLE:-}" == "1" ]] || return 0
+    local fam="$1" carry="$2" py base="" out=""
+    py="$(_grip_cycle_path)" || {
+        >&2 echo "[grip-cycle] GRIP_INFINITE_CYCLE=1 but lib/infinite_cycle_launch.py was not found — launching without the cycle"
+        return 0
+    }
+    if [[ "$carry" != 1 ]]; then
+        python3 "$py" settings --caller-settings >/dev/null || true   # it says why on stderr
+        return 0
+    fi
+    if [[ "$fam" == 1 ]]; then base="${_GRIP_FAMILY_SETTINGS:-}"; else base="${_inf_wire:-}"; fi
+    out="$(python3 "$py" settings --merge "$base")" || out=""
+    [[ -z "$out" ]] && return 0
+    if [[ "$out" != \{*\} || "$out" == *$'\n'* ]]; then
+        >&2 echo "[grip-cycle] helper output malformed — launching without the cycle"
+        return 0
+    fi
+    if [[ "$fam" == 1 ]]; then _GRIP_FAMILY_SETTINGS="$out"; else _inf_wire="$out"; fi
+    return 0
+}
+
+grip_handoff() {
+    # Independently gate the beta header and the model variant: GRIP_NO_1M or a
+    # caller-supplied flag can suppress either without disabling the other.
+    # Fully-quoted values (the [1m] brackets would glob unquoted); no arrays
+    # (bash 3.2 + set -u empty-array crash — this file stores such lists as
+    # strings, never arrays).
+    # ── hal/infinite (ADR-0002 W0, opt-in; ADR-0016 Step 3): route this launch
+    # through HAL — its wire (a loopback intercepting proxy on :4011) when that
+    # answers, its gateway by base URL when only that does, else direct.
+    # GRIP_INFINITE=1 is the per-machine opt-in (D3) — the exact string, the
+    # same test lib/grip_infinite.py applies, so no value one surface accepts
+    # is unreachable through the other. All deciding (brake, caller-wins,
+    # strict /health identity probes, the wire's CA, custody) lives in the
+    # helper, which emits a VALIDATED line protocol: `ANTHROPIC_BASE_URL=<url>`
+    # or the wire's values (HTTPS_PROXY, https_proxy, NO_PROXY, no_proxy,
+    # NODE_EXTRA_CA_CERTS, CLAUDE_ENV_FILE, which sends Bash commands direct,
+    # the four timeout values, and CLAUDE_CODE_GATEWAY_HINT_HEADERS=1, which
+    # turns on the hint headers the wire reads — the shapes above) to export, and
+    # `UNSET <allowlisted var>` to remove (the base URL the wire replaces or
+    # the brake detaches, an inherited wire, and the H-INF-3 custody scrub —
+    # an ambient API key silently moves a headless session onto per-token
+    # billing, measured live 2026-08-24). Any line failing the strict shapes
+    # rejects EVERYTHING loudly (all-or-nothing): a malformed line can never
+    # strip auth without wiring. No output, any helper failure, or no HAL at
+    # all → plain direct launch (fail-open). There is deliberately no eval of
+    # helper output.
+    # The tick's throttle flag, before any wiring: a headless launch refuses
+    # here and wires nothing; an interactive one is warned once and goes on
+    # (_grip_throttle_gate; V>> 2026-10-29).
+    _grip_throttle_gate "$(_grip_launch_interactivity "$@")" || exit 2
+
+    # Tidy the shared settings file before Claude Code reads it (GRIP#9208).
+    _grip_model_pin_tidy
+
+    local _inf_sid="" _inf_wire=""
+    if [[ "${GRIP_INFINITE:-}" == "1" ]]; then
+        local _inf_py _inf_out _inf_l _inf_ok _inf_interactivity
+        _inf_py="$(_grip_infinite_path)" || true
+        if [[ -z "$_inf_py" ]]; then
+            >&2 echo "[grip-infinite] GRIP_INFINITE=1 but lib/grip_infinite.py was not found — launching DIRECT (fail-open)"
+        else
+            _inf_sid="$(_grip_launch_session_id "$@")" || _inf_sid=""
+            _inf_interactivity="$(_grip_launch_interactivity "$@")"
+            if [[ -n "$_inf_sid" ]]; then
+                _inf_out="$(python3 "$_inf_py" --launch-env "$_inf_interactivity" --session-id "$_inf_sid" || true)"
+            else
+                _inf_out="$(python3 "$_inf_py" --launch-env "$_inf_interactivity" || true)"
+            fi
+            _inf_ok=1
+            while IFS= read -r _inf_l; do
+                [[ -z "$_inf_l" ]] && continue
+                if [[ "$_inf_l" =~ ^ANTHROPIC_BASE_URL=https?://[^[:space:]]+$ ]]; then continue; fi
+                if _grip_wire_line_ok "$_inf_l"; then continue; fi
+                case "$_inf_l" in
+                    "UNSET ANTHROPIC_API_KEY"|"UNSET ANTHROPIC_AUTH_TOKEN"|"UNSET ANTHROPIC_BASE_URL") continue ;;
+                    "UNSET HTTPS_PROXY"|"UNSET https_proxy"|"UNSET NO_PROXY"|"UNSET no_proxy"|"UNSET NODE_EXTRA_CA_CERTS") continue ;;
+                    "UNSET CLAUDE_CODE_GATEWAY_HINT_HEADERS") continue ;;
+                esac
+                _inf_ok=0
+            done <<< "$_inf_out"
+            if [[ "$_inf_ok" == 1 ]]; then
+                while IFS= read -r _inf_l; do
+                    [[ -z "$_inf_l" ]] && continue
+                    if [[ "$_inf_l" == UNSET\ * ]]; then
+                        unset "${_inf_l#UNSET }"
+                    else
+                        export "$_inf_l"
+                    fi
+                done <<< "$_inf_out"
+                _inf_wire="$(_grip_wire_settings_json "$_inf_out")"
+            elif [[ -n "$_inf_out" ]]; then
+                >&2 echo "[grip-infinite] helper output malformed — ignoring it, launching DIRECT (fail-open)"
+            fi
+        fi
+    fi
+
+    # Model family (gg++ claude --kimi), AFTER the gateway wire so it can see
+    # whether this launch is actually routed. Exports the tier map + sets
+    # GRIP_1M_MODEL, or refuses (exit 2). See _grip_family_env above.
+    # A caller-supplied --settings is the operator's own file, and a second
+    # --settings beside it would leave Claude Code to pick one. Then the map rides
+    # on exported variables only, and the helper names any settings.json pin.
+    local _carry=1
+    _grip_opt_arg settings "$@" >/dev/null && _carry=0
+    local _fam_active=0
+    if _grip_family_env "$_carry"; then _fam_active=1; fi
+
+    # Suppression is decided by the SAME parser the warning uses, so a
+    # `--model` that is not an option (after `--`, or inside prompt text)
+    # can neither suppress the pin nor silence the warning. The old substring
+    # tests on "$*" did both at once. `--betas` gets the same treatment: it
+    # carried the identical defect, just with a milder consequence.
+    local _m="" _b="" _m_present=0 _b_present=0
+    _m="$(_grip_opt_arg model "$@")" && _m_present=1
+    _b="$(_grip_opt_arg betas "$@")" && _b_present=1
+
+    # The machine-local pin (config/model-pin.local.json, written by
+    # bin/grip-model-default) becomes the launch model HERE, where a Claude
+    # launch is certain and the pin would be used: not for a caller's
+    # GRIP_1M_MODEL or --model, not for a model family, not under GRIP_NO_1M.
+    # A pin file that cannot be read or names no valid model refuses THIS
+    # launch with its cause, because booting the account default in silence is
+    # the downgrade the pin exists to prevent. Other commands never read it.
+    if [[ -z "${_GRIP_1M_MODEL_CALLER:-}" && "$_m_present" == 0 && "$_fam_active" == 0 && -z "${GRIP_NO_1M:-}" ]]; then
+        local _pin="" _pin_rc=0
+        _pin="$(_grip_model_pin)" || _pin_rc=$?
+        if [[ "$_pin_rc" == 0 && -n "$_pin" ]]; then
+            GRIP_1M_MODEL="$_pin"
+        elif [[ "$_pin_rc" != 3 ]]; then
+            >&2 echo "[grip] config/model-pin.local.json cannot be read or names no valid model (exit $_pin_rc)."
+            >&2 echo "[grip] Fix it, or run: grip-model-default default -- refusing to launch Claude Code on a silent default."
+            exit 2
+        fi
+    fi
+
+    local want_beta=1 want_model=1
+    if [[ -n "${GRIP_NO_1M:-}" ]]; then want_beta=0; want_model=0; fi
+    # A model family pins ITS model whatever GRIP_NO_1M says — there it is not a
+    # 1M-forcing but the model the operator asked for — and never sends the
+    # Anthropic context-1m beta header: on a non-Anthropic model the window
+    # comes from the [1m] variant plus CLAUDE_CODE_AUTO_COMPACT_WINDOW, and how
+    # a third-party endpoint treats an unknown beta is UNVERIFIED (may 400).
+    if [[ "$_fam_active" == 1 ]]; then want_beta=0; want_model=1; fi
+    # PRESENCE suppresses, not a non-empty value: an empty `--model=` still
+    # occupies the flag on the exec line, so injecting the pin beside it puts
+    # two --model tokens there and lets the empty one decide.
+    if [[ "$_b_present" == 1 ]]; then want_beta=0; fi
+    if [[ "$_m_present" == 1 ]]; then want_model=0; fi
+
+    # A caller-supplied --model suppresses the pin above. If that model does
+    # not itself name a 1M variant, Claude Code boots the account's ambient
+    # window — often the 200K base — and NOTHING says so: the launch looks
+    # identical and the ceiling is five times lower. Observed 2026-08-25, a
+    # session sat at 243K against a 200K window retrying every request, having
+    # been switched off the pinned Opus variant. Warn, never block: the
+    # operator's model choice is theirs, the silence was the bug.
+    # Not for a family launch: there the compact window was set explicitly from
+    # the catalogue, so "boots the ambient window" would be a false statement.
+    if [[ -z "${GRIP_NO_1M:-}" && "$_m_present" == 0 && "$_fam_active" == 0 ]] && ! _grip_model_is_1m "$GRIP_1M_MODEL"; then
+        # The override is the PR's own escape hatch for unverified ids, and it
+        # could pin a bare model with nothing said — the same silence, arriving
+        # through the mechanism meant to cure it. Warn on the EFFECTIVE model,
+        # whoever chose it.
+        >&2 echo "[grip] note: GRIP_1M_MODEL='$GRIP_1M_MODEL' is not a 1M-context model."
+        >&2 echo "[grip]       Claude Code boots this model's ambient window — often 200K, not 1M."
+    fi
+
+    if [[ "$_m_present" == 1 && -z "${GRIP_NO_1M:-}" ]]; then
+        # Warn unless EVERY --model carries [1m]: correct whether the runtime
+        # takes the first or the last of a duplicated flag.
+        local _bad
+        if _bad="$(_grip_opt_first_failing model _grip_model_is_1m "$@")"; then
+            # The remediation must be one that WORKS. GRIP_1M_MODEL is read
+            # only on the pin branch, which a caller --model has already
+            # suppressed — so telling the operator to set it while keeping
+            # their flag sends them round the same loop forever, warning
+            # unchanged. Verified 2026-08-25: with --model claude-fable-5 and
+            # GRIP_1M_MODEL=claude-fable-5[1m] the exec line still carried no
+            # [1m]. Name the two things that actually change the window.
+            # Conditional, not assertive. This branch deliberately refuses to
+            # know WHICH of several --model flags the runtime honours, so the
+            # message must not assert that this one decides the window: under a
+            # last-wins runtime `--model bare --model x[1m]` boots 1M, and
+            # telling the operator otherwise on every launch is a new false
+            # statement in the channel built to end the silence. The override
+            # warning above stays assertive because there the effective model
+            # genuinely IS known.
+            # Two different sentences, because they have two different causes.
+            # The pin is skipped because the flag is PRESENT, not because its
+            # value lacks [1m] — writing "names no [1m] variant, SO the pin is
+            # skipped" asserted a causal chain the code does not implement, and
+            # was simply wrong for an empty value (which claude rejects outright
+            # rather than booting a 200K window).
+            >&2 echo "[grip] note: a --model was passed, so GRIP's 1M pin is skipped."
+            if [[ -n "$_bad" ]]; then
+                >&2 echo "[grip]       '$_bad' is not a 1M-context model; if that is the value Claude Code"
+                >&2 echo "[grip]       honours, the session window is often 200K, not 1M."
+            else
+                >&2 echo "[grip]       That --model carries no value; Claude Code will reject it."
+            fi
+            >&2 echo "[grip]       For 1M either pass a 1M model yourself, or drop --model"
+            >&2 echo "[grip]       so GRIP's own pin applies (that pin is what GRIP_1M_MODEL overrides)."
+        fi
+    fi
+
+    # The never-ending cycle's hooks join whichever settings object this launch
+    # carries below (see _grip_cycle_merge): never a second --settings, never a
+    # shared settings file, and nothing at all unless GRIP_INFINITE_CYCLE=1.
+    _grip_cycle_merge "$_fam_active" "$_carry"
+
+    # The family's tier map outranks settings.json only from --settings (see
+    # _grip_family_settings_json). Prepended after every flag search above, so
+    # those parsers only ever see the caller's own argv.
+    if [[ "$_fam_active" == 1 && "$_carry" == 1 && -n "${_GRIP_FAMILY_SETTINGS:-}" ]]; then
+        set -- --settings "$_GRIP_FAMILY_SETTINGS" "$@"
+    fi
+    # The wire's values ride in --settings too (_grip_wire_settings_json), unless
+    # the caller brought a --settings of their own: Claude Code would then pick
+    # one of two, so the values ride on the shell alone. A model family never
+    # carries wire values (it keeps the base URL), so the two builders never meet.
+    if [[ "$_fam_active" == 0 && "$_carry" == 1 && -n "$_inf_wire" ]]; then
+        set -- --settings "$_inf_wire" "$@"
+    fi
+    # The id the launch receipt recorded (_grip_launch_session_id), so the
+    # receipt names the session Claude Code actually runs.
+    if [[ -n "$_inf_sid" ]]; then
+        set -- --session-id "$_inf_sid" "$@"
+    fi
+
+    if [[ "$want_beta" == 1 && "$want_model" == 1 ]]; then
+        exec claude --betas "$GRIP_CONTEXT_1M_BETA" --model "$GRIP_1M_MODEL" "$@"
+    elif [[ "$want_beta" == 1 ]]; then
+        exec claude --betas "$GRIP_CONTEXT_1M_BETA" "$@"
+    elif [[ "$want_model" == 1 ]]; then
+        exec claude --model "$GRIP_1M_MODEL" "$@"
+    fi
+    exec claude "$@"
+}
+
+# ============================================================================
+# CHANNEL AUTO-DETECTION
+# ============================================================================
+#
+# Claude Code >= 2.1.75 has a regression where the
+# --dangerously-load-development-channels flag globally suppresses the
+# AskUserQuestion, ExitPlanMode, and EnterPlanMode tools from the entire
+# session's tool registry. This breaks GRIP's PARAMOUNT HITL protocol
+# (asking-users skill), plan mode, and creating-wizards.
+#
+# Upstream tracking:
+#   - anthropics/claude-code#39342 (direct match, labelled regression)
+#   - anthropics/claude-code#41787 (proposes per-prompt gating fix)
+#   - anthropics/claude-code#42292 (isolation matrix — --channels is sole variable)
+#   - anthropics/claude-code#40644 (AskUserQuestion specifically)
+#   - anthropics/claude-code#45294 (Opus 4.6 1M context deferred registry)
+#
+# As of 2026-05-03 the channels flag is wizard-mediated by default: on first
+# launch, `grip` invokes lib/grip_channels_wizard.py to inform the operator of
+# the HITL trade-off and persist their choice to state/grip-channels-config.json.
+# `GRIP_CHANNELS_FLAG` still wins for backward compatibility (force/on/off).
+#
+# Resolution order:
+#   1. GRIP_CHANNELS_FLAG env var (force/on → ON, off → OFF)
+#   2. state/grip-channels-config.json "choice" field (enabled/disabled/ask)
+#   3. No persisted config → wizard runs interactively on first launch
+#      (or, if stdin is not a tty: enabled with stderr note)
+# Run `grip channels` anytime to revisit the choice.
+
+# Inject the dev-channel load flag ONLY when grip-channel is a LOCAL
+# (command-based) MCP server. Post-W10 the canonical grip-channel is a
+# remote {"type":"http"} entry (the VPS relay-dispatcher, GRIP #2678) which
+# CANNOT be loaded via --dangerously-load-development-channels (Claude Code
+# reports `server:grip-channel not found` at startup) and MUST NOT be — a
+# laptop subscriber races the VPS relay (the 2026-05-13 #nexus-chats incident).
+# Outbound (channel_reply) is unaffected: grip-channel stays a normal http
+# MCP server, it just isn't loaded as an inbound dev-channel subscriber.
+_grip_channel_registered() {
+    local mcp_json="$HOME/.claude/.mcp.json"
+    [[ -f "$mcp_json" ]] || return 1
+    python3 -c "
+import json, sys
+with open('$mcp_json') as f:
+    cfg = json.load(f)
+gc = (cfg.get('mcpServers') or {}).get('grip-channel') or {}
+sys.exit(0 if gc.get('command') and gc.get('type') != 'http' else 1)
+" 2>/dev/null
+}
+
+# Locate the wizard. Prefer the script-relative lib (worktree-friendly), then
+# CLAUDE_DIR/lib, then the canonical $HOME/.claude/lib. GRIP_LIB_DIR overrides.
+_grip_channels_wizard_path() {
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local candidate
+    for candidate in \
+        "${GRIP_LIB_DIR:-/__none__}/grip_channels_wizard.py" \
+        "${script_dir%/bin}/lib/grip_channels_wizard.py" \
+        "${CLAUDE_DIR:-$HOME/.claude}/lib/grip_channels_wizard.py"; do
+        if [[ -f "$candidate" ]]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Resolve via the wizard's --resolve gate. Returns enabled / disabled / WIZARD.
+_resolve_channels_choice() {
+    local wizard_py
+    wizard_py="$(_grip_channels_wizard_path)" || { echo "WIZARD"; return; }
+    python3 "$wizard_py" --resolve 2>/dev/null || echo "WIZARD"
+}
+
+# Run the interactive wizard. Headless fallback (non-tty stdin): enabled.
+_run_channels_wizard_or_fallback() {
+    local wizard_py
+    wizard_py="$(_grip_channels_wizard_path)" || { echo "enabled"; return; }
+    if [[ -t 0 ]] && [[ -t 1 ]]; then
+        python3 "$wizard_py" </dev/tty >/dev/tty 2>&1 || true
+        # Re-resolve after the wizard ran. If the user persisted "ask" or
+        # quit without persisting, treat as enabled (single-shot).
+        local after
+        after="$(_resolve_channels_choice)"
+        if [[ "$after" == "WIZARD" ]] || [[ "$after" == "enabled" ]]; then
+            echo "enabled"
+        else
+            echo "$after"
+        fi
+    else
+        >&2 echo "[grip] channels enabled by default; run \`grip channels\` to configure"
+        echo "enabled"
+    fi
+}
+
+build_channel_flags() {
+    local choice
+    choice="$(_resolve_channels_choice)"
+
+    if [[ "$choice" == "WIZARD" ]]; then
+        choice="$(_run_channels_wizard_or_fallback)"
+    fi
+
+    if [[ "$choice" != "enabled" ]]; then
+        return 0
+    fi
+
+    if _grip_channel_registered; then
+        echo "--dangerously-load-development-channels server:grip-channel"
+        >&2 echo "[grip] inbound channel relay ENABLED (run \`grip channels\` to change)"
+        >&2 echo "[grip] AskUserQuestion / ExitPlanMode / EnterPlanMode will be unavailable"
+        >&2 echo "[grip] upstream regression tracker: anthropics/claude-code#39342"
+    else
+        >&2 echo "[grip] grip-channel inbound is VPS-side (relay-dispatcher, GRIP #2678) — not loaded as a laptop subscriber. Outbound channel_reply still works."
+    fi
+}
+
+# Shim startup guard — surfaces grip-channel daemon + bridge state at launch
+# when persisted choice = enabled. Output is informational; never blocks.
+# Generic registry in lib/shim_health.py: future shims (HAL, hal-server,
+# happi-api) can register their own probes there.
+_run_shim_health_probe() {
+    local shim_health_py
+    shim_health_py="${CLAUDE_DIR:-$HOME/.claude}/lib/shim_health.py"
+    [[ -f "$shim_health_py" ]] || return 0
+    local py
+    py="$(_grip_resolve_python "${CLAUDE_DIR:-$HOME/.claude}/venv")"
+    PYTHONPATH="${CLAUDE_DIR:-$HOME/.claude}" "$py" "$shim_health_py" || true
+}
+
+# The directory holding THIS grip, with symlinks resolved (macOS has no
+# `readlink -f`, hence the loop -- the same one _grip_infinite_path uses). The
+# early pass-throughs below need it because `script_dir` is NOT set at top
+# level: it is local to the resolver functions defined further down, so a
+# `${script_dir%/bin}` fallback here expanded to `/bin/...` and never resolved
+# (GRIP#6644). Called in a $(...) subshell, so its cd never leaks.
+_grip_bin_dir() {
+    local src="${BASH_SOURCE[0]}" dir
+    while [[ -L "$src" ]]; do
+        dir="$(cd -P "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        [[ "$src" != /* ]] && src="$dir/$src"
+    done
+    cd -P "$(dirname "$src")" && pwd
+}
+
+# Store as string, not array — avoids bash 3.2 empty-array + set -u crash.
+# Skip resolution entirely for the `channels` subcommand (the wizard runs itself).
+# GRIP #2776 — thin `grip output-tier <tier|status>` CLI (resolver only,
+# no wizard — KISS, design LOCKED in
+# drafts/default-plain-output-mesh-2026-05-16.md). Handled early so a
+# config get/set never triggers channel-flag / shim / preload machinery.
+if [[ "${1:-}" == "output-tier" ]]; then
+    _ot_py="${CLAUDE_DIR:-$HOME/.claude}/lib/output_tier.py"
+    [[ -f "$_ot_py" ]] || _ot_py="$(_grip_bin_dir)/../lib/output_tier.py"
+    if [[ ! -f "$_ot_py" ]]; then
+        # HAL #2785 B1: graceful failure (plain message + non-zero exit),
+        # mirrors the channels-wizard `|| { echo …; }` precedent — never
+        # exec into a raw Python traceback (e.g. symlinked bin/grip with
+        # no CLAUDE_DIR and no ~/.claude).
+        echo "grip output-tier: resolver not found (looked in \$CLAUDE_DIR/lib and the bin-relative lib). Set CLAUDE_DIR or reinstall GRIP." >&2
+        exit 1
+    fi
+    exec python3 "$_ot_py" "${@:2}"
+fi
+
+# grip-tier (2026-05-28) — thin `grip tier <pro|max|api|auto|status>` CLI
+# (resolver only, no wizard — KISS, mirrors output-tier). Handled early so a
+# config get/set never triggers channel-flag / shim / preload machinery.
+# Resolves the plan-tier context-window envelope (see docs/grip-tier-1m-context.md).
+if [[ "${1:-}" == "tier" ]]; then
+    _gt_py="${CLAUDE_DIR:-$HOME/.claude}/lib/grip_tier.py"
+    [[ -f "$_gt_py" ]] || _gt_py="$(_grip_bin_dir)/../lib/grip_tier.py"
+    if [[ ! -f "$_gt_py" ]]; then
+        echo "grip tier: resolver not found (looked in \$CLAUDE_DIR/lib and the bin-relative lib). Set CLAUDE_DIR or reinstall GRIP." >&2
+        exit 1
+    fi
+    exec python3 "$_gt_py" "${@:2}"
+fi
+
+# grip-meet (2026-06-17, #2153) — thin `grip meet <start|status|doctor|…>`
+# pass-through to bin/grip-meet (live meeting intelligence). Handled early so a
+# meeting op never triggers channel-flag / shim / preload machinery. The direct
+# bin/grip-meet path stays valid; this just makes it discoverable from `grip`.
+if [[ "${1:-}" == "meet" ]]; then
+    _gm="${CLAUDE_DIR:-$HOME/.claude}/bin/grip-meet"
+    [[ -x "$_gm" ]] || _gm="$(_grip_bin_dir)/grip-meet"
+    if [[ ! -x "$_gm" ]]; then
+        echo "grip meet: bin/grip-meet not found (looked in \$CLAUDE_DIR/bin and the bin-relative path). Set CLAUDE_DIR or reinstall GRIP." >&2
+        exit 1
+    fi
+    exec "$_gm" "${@:2}"
+fi
+
+# grip-happiverse — single door to the HAPPIVERSE (routing facade, no new capability).
+if [[ "${1:-}" == "happiverse" ]]; then
+    _ghv="${CLAUDE_DIR:-$HOME/.claude}/bin/grip-happiverse"
+    [[ -x "$_ghv" ]] || _ghv="$(_grip_bin_dir)/grip-happiverse"
+    if [[ ! -x "$_ghv" ]]; then
+        echo "grip happiverse: bin/grip-happiverse not found. Set CLAUDE_DIR or reinstall GRIP." >&2
+        exit 1
+    fi
+    exec "$_ghv" "${@:2}"
+fi
+
+# grip-ownership — the Clean Ledger's reader: which session owns each dirty file
+# and stash (thin pass-through to bin/grip-ownership, no new capability here).
+# The sibling of THIS grip is tried first, so a worktree's grip reads with that
+# worktree's code; then $CLAUDE_DIR.
+if [[ "${1:-}" == "ownership" ]]; then
+    _gown="$(_grip_bin_dir)/grip-ownership"
+    [[ -x "$_gown" ]] || _gown="${CLAUDE_DIR:-$HOME/.claude}/bin/grip-ownership"
+    if [[ ! -x "$_gown" ]]; then
+        echo "grip ownership: bin/grip-ownership not found. Set CLAUDE_DIR or reinstall GRIP." >&2
+        exit 1
+    fi
+    exec "$_gown" "${@:2}"
+fi
+
+if [[ "${1:-}" == "embeddings-warm" ]]; then
+    # Opt-in always-warm semantic memory wizard (lib/embeddings_warm_wizard.py).
+    # Self-contained early-exit, mirroring the `channels` subcommand: resolve the
+    # wizard path, then exec it with the remaining args. Never reaches the launcher.
+    _ew_wizard=""
+    for _ew_c in "${GRIP_LIB_DIR:-/__none__}/embeddings_warm_wizard.py" \
+                 "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/embeddings_warm_wizard.py" \
+                 "${CLAUDE_DIR:-$HOME/.claude}/lib/embeddings_warm_wizard.py"; do
+        [[ -f "$_ew_c" ]] && { _ew_wizard="$_ew_c"; break; }
+    done
+    [[ -n "$_ew_wizard" ]] || { >&2 echo "[grip] embeddings-warm wizard not found"; exit 1; }
+    _ew_py="$(_grip_resolve_python "${CLAUDE_DIR:-$HOME/.claude}/venv")"
+    exec env PYTHONPATH="$(cd "$(dirname "$_ew_wizard")/.." && pwd)" "$_ew_py" "$_ew_wizard" "${@:2}"
+fi
+
+if [[ "${1:-}" == "channels" ]]; then
+    GRIP_CHANNEL_FLAGS=""
+else
+    GRIP_CHANNEL_FLAGS="$(build_channel_flags)"
+    _run_shim_health_probe
+fi
+
+# ============================================================================
+# HARNESS PICKER (#2212) — "which harness do you want to open?"
+# ============================================================================
+#
+# At a bare `grip` launch, offer the AI harnesses INSTALLED on this machine:
+# always Claude Code (the native GRIP flow); plus Codex / Aider / opencode /
+# Hermes when their binary is on PATH. Claude → fall through to the existing
+# launch. Any other harness → launch IT (already wired at GRIP's HAL :4010 by
+# `grip-harness <name>`); we best-effort (re)wire the wireable ones first.
+#
+# Frictionless + additive: a clear default (Claude / the remembered choice),
+# `--harness <name>` and GRIP_HARNESS as no-prompt fast-paths, the menu is
+# never shown for a 1-harness (Claude-only) install, and a non-TTY launch
+# (relay / CI / pipe) silently uses Claude. The pure precedence + TUI live in
+# lib/grip_harness_picker.py (unit-tested); this shell only acts on the one
+# directive line it emits.
+
+_grip_harness_picker_path() {
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local candidate
+    for candidate in \
+        "${GRIP_LIB_DIR:-/__none__}/grip_harness_picker.py" \
+        "${script_dir%/bin}/lib/grip_harness_picker.py" \
+        "${CLAUDE_DIR:-$HOME/.claude}/lib/grip_harness_picker.py"; do
+        [[ -f "$candidate" ]] && { echo "$candidate"; return 0; }
+    done
+    return 1
+}
+
+_grip_infinite_path() {
+    # Resolve symlinks before deriving the install root. A `grip` symlinked
+    # into ~/bin reports the SYMLINK's directory in BASH_SOURCE[0], so the
+    # repo-relative candidate would miss and the feature would vanish with no
+    # diagnostic (AGORA #5020 round 2). macOS has no `readlink -f`, hence the
+    # loop. The two sibling resolvers above share this weakness; they are left
+    # alone deliberately — changing the live harness launch path is a bigger
+    # blast radius than this fix earns.
+    local src="${BASH_SOURCE[0]}" dir
+    while [[ -L "$src" ]]; do
+        dir="$(cd -P "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        [[ "$src" != /* ]] && src="$dir/$src"
+    done
+    local script_dir
+    script_dir="$(cd -P "$(dirname "$src")" && pwd)"
+    local candidate
+    for candidate in \
+        "${GRIP_LIB_DIR:-/__none__}/grip_infinite.py" \
+        "${script_dir%/bin}/lib/grip_infinite.py" \
+        "${CLAUDE_DIR:-$HOME/.claude}/lib/grip_infinite.py"; do
+        [[ -f "$candidate" ]] && { echo "$candidate"; return 0; }
+    done
+    return 1
+}
+
+# Same cascade and the same symlink resolution as _grip_infinite_path: the
+# family helper is read on the identical launch path, from the identical tree.
+_grip_family_path() {
+    local src="${BASH_SOURCE[0]}" dir
+    while [[ -L "$src" ]]; do
+        dir="$(cd -P "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        [[ "$src" != /* ]] && src="$dir/$src"
+    done
+    local script_dir
+    script_dir="$(cd -P "$(dirname "$src")" && pwd)"
+    local candidate
+    for candidate in \
+        "${GRIP_LIB_DIR:-/__none__}/grip_harness_family.py" \
+        "${script_dir%/bin}/lib/grip_harness_family.py" \
+        "${CLAUDE_DIR:-$HOME/.claude}/lib/grip_harness_family.py"; do
+        [[ -f "$candidate" ]] && { echo "$candidate"; return 0; }
+    done
+    return 1
+}
+
+# The cycle's launch helper ships in the same lib/ as grip_infinite.py, so it is
+# found BESIDE whatever _grip_infinite_path resolves: the same cascade and the
+# same tree, with no third copy of the symlink loop.
+_grip_cycle_path() {
+    local inf candidate
+    inf="$(_grip_infinite_path)" || return 1
+    candidate="${inf%/grip_infinite.py}/infinite_cycle_launch.py"
+    [[ -f "$candidate" ]] && { echo "$candidate"; return 0; }
+    return 1
+}
+
+_grip_harness_model_path() {
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local candidate
+    for candidate in \
+        "${GRIP_LIB_DIR:-/__none__}/grip_harness_model.py" \
+        "${script_dir%/bin}/lib/grip_harness_model.py" \
+        "${CLAUDE_DIR:-$HOME/.claude}/lib/grip_harness_model.py"; do
+        [[ -f "$candidate" ]] && { echo "$candidate"; return 0; }
+    done
+    return 1
+}
+
+# --direct on a wireable harness. Today only codex has a vendor profile wire:
+# `lib/grip_harness_family.py codex-direct` writes
+# ~/.codex/<family>-direct.config.toml naming the vendor endpoint with
+# `env_key = "<VAR>"` and NO credential, and prints PROFILE / ENV_KEY /
+# KEYCHAIN. The credential is read from the keychain here and handed ONLY to
+# the child on the exec line (an env(1) assignment held in
+# _GRIP_CODEX_DIRECT_ENV) — it never enters this launcher's own environment,
+# is never echoed and never written. The profile is selected with
+# `-p <family>-direct`, never the bare family name: bin/grip-harness
+# --profiles owns ~/.codex/<name>.config.toml for GATEWAY-routed profiles, and
+# one file with two writers of opposite meaning would flip silently. Claude
+# Code's direct path is _grip_family_env; the classifier refuses --direct for
+# every other harness, so reaching here with one means the classifier and this
+# launcher disagree — refuse, never launch it through HAL as if the flag had
+# been honoured. Returns 1 on every refusal.
+_GRIP_CODEX_DIRECT_PROFILE=""
+_grip_codex_direct_env() {
+    local bin="$1" py out l profile="" var="" kc="" bearer=""
+    if [[ "$bin" != codex* ]]; then
+        >&2 echo "[grip] --direct has no vendor wire for $bin (claude and codex only) — refusing."
+        return 1
+    fi
+    py="$(_grip_family_path)" || py=""
+    if [[ -z "$py" ]]; then
+        >&2 echo "[grip] --direct: lib/grip_harness_family.py not found — refusing."
+        return 1
+    fi
+    out="$(python3 "$py" codex-direct "$GRIP_HARNESS_MODEL")" || out=""
+    while IFS= read -r l; do
+        case "$l" in
+            "PROFILE "*)  profile="${l#PROFILE }" ;;
+            "ENV_KEY "*)  var="${l#ENV_KEY }" ;;
+            "KEYCHAIN "*) kc="${l#KEYCHAIN }" ;;
+        esac
+    done <<< "$out"
+    if ! [[ "$profile" =~ ^[a-z0-9-]+$ && "$var" =~ ^[A-Z][A-Z0-9_]*$ && "$kc" =~ ^grip-[a-z0-9-]+$ ]]; then
+        >&2 echo "[grip] --direct: could not write a codex profile for '$GRIP_HARNESS_MODEL' — refusing."
+        return 1
+    fi
+    bearer="$(security find-generic-password -s "$kc" -w 2>/dev/null || true)"
+    if [[ -z "$bearer" ]]; then
+        >&2 echo "[grip] --direct needs the vendor credential in keychain entry '$kc', and it is not there."
+        >&2 echo "[grip] Store it with bin/grip-keyring install (or grip-keys-to-keyring, which moves credentials out of a shell profile), then retry."
+        return 1
+    fi
+    _GRIP_CODEX_DIRECT_ENV=("$var=$bearer")
+    _GRIP_CODEX_DIRECT_PROFILE="$profile"
+    >&2 echo "[grip] DIRECT: codex profile '$profile' -> the vendor endpoint on $GRIP_HARNESS_MODEL. The HAL witness and cost rows are NOT recorded on this path."
+    return 0
+}
+
+# Launch the harness named by a resolved directive. CLAUDE → return (fall
+# through). LAUNCH <wire> <bin> [args] → best-effort wire, then exec the binary
+# (replacing this process — Claude Code is never reached). Unknown/binary-gone
+# → loud stderr + return (never a silent mis-launch; the normal flow resumes).
+_harness_exec_directive() {
+    local wire="$1"; shift
+    local bin="$1"; shift
+    if ! command -v "$bin" >/dev/null 2>&1; then
+        >&2 echo "[grip] harness '$bin' is no longer on PATH — launching Claude Code instead."
+        return 0
+    fi
+    if [[ "$wire" != "-" ]]; then
+        # Interactive model step (TTY only). The picker persists the choice; the
+        # rewire below reads it via grip_harness_model.resolve_model(). Non-TTY /
+        # relay launches never reach here (the harness picker falls through to
+        # CLAUDE). stdout (the chosen id) is discarded — persistence is the channel;
+        # the TUI renders on /dev/tty.
+        if [[ -t 0 && -t 1 ]]; then
+            local mdl_py mdl_rc=0; mdl_py="$(_grip_harness_model_path)" || true
+            [[ -n "$mdl_py" ]] && { python3 "$mdl_py" pick "$wire" >/dev/null 2>/dev/tty </dev/tty || mdl_rc=$?; }
+            # 130 = Ctrl-C at the model menu: the operator cancelled, so launch
+            # nothing. Any other failure keeps the old fail-open behaviour.
+            [[ $mdl_rc -eq 130 ]] && exit 130
+        fi
+        # HAL never shares ChatGPT.app or another Codex account's refresh store.
+        if [[ "$wire" == "codex" && "${GRIP_HARNESS_DIRECT:-}" != "1" ]]; then
+            export CODEX_HOME="$HOME/.codex-hal"
+        fi
+        local gh_bin="${CLAUDE_DIR:-$HOME/.claude}/bin/grip-harness"
+        [[ -x "$gh_bin" ]] && "$gh_bin" "$wire" >/dev/null 2>&1 || true
+        # Export the HAL gateway key into the harness env BEFORE exec. The wired
+        # config tells the harness to read HAL_GATEWAY_KEY (codex/opencode) or
+        # OPENAI_API_KEY (aider/litellm); with it unset the harness refuses to start
+        # ("Missing env HAL_GATEWAY_KEY" / litellm AuthenticationError) — the launch
+        # bug. Value = the canonical gateway key (grip-anthropic-external): for a
+        # gpt-* default the gateway same-wires to OpenAI and ignores this bearer; for
+        # a claude-* model it is translated to x-api-key. Secret stays in-process.
+        local _hal_key
+        _hal_key="$(security find-generic-password -s grip-anthropic-external -w 2>/dev/null || true)"
+        if [[ -n "$_hal_key" ]]; then
+            export HAL_GATEWAY_KEY="$_hal_key"
+            export AIDER_OPENAI_API_KEY="$_hal_key"
+            # NOT for codex. This value is an ANTHROPIC key, and codex reads
+            # OPENAI_API_KEY as a real credential for its `openai` provider — so
+            # exporting it there advertises an API-key login that would fail on
+            # auth, and shadows the ChatGPT SUBSCRIPTION the operator wants tried
+            # first (V>> 2026-08-18: prefer subscription tokens over API-key
+            # tokens; see bin/grip-codex-ladder). aider/litellm keep it, because
+            # they are pointed at the HAL gateway where this bearer is correct.
+            # Prefix match, not equality. AGORA raised the exact-match as a leak
+            # risk; as written the concern does not fire, because $bin must pass
+            # `command -v` a few lines above and "codex exec" does not resolve as a
+            # single argv entry. But the SHAPE is fail-open: a future harness named
+            # codex-next or codex2 would fall through and get an Anthropic key
+            # exported as OPENAI_API_KEY. Cheap to close, and the failure it guards
+            # against is silent misauthentication plus a demotion to metered
+            # billing, so the safe direction is to over-match rather than under.
+            if [[ "$bin" != codex* ]]; then
+                export OPENAI_API_KEY="$_hal_key"
+            fi
+        else
+            >&2 echo "[grip] warning: keychain 'grip-anthropic-external' not found — $bin may fail to authenticate to HAL :4010"
+        fi
+        # Sovereign provider keys (parity with bin/grip-opencode): let a direct,
+        # non-HAL provider entry in the harness config authenticate. HAL-routed
+        # models do NOT need these — the gateway injects keychain keys internally;
+        # this is launcher-consistency + belt-and-braces. Each is optional.
+        local _ds_key _gm_key
+        _ds_key="$(security find-generic-password -s grip-deepseek -w 2>/dev/null || true)"
+        if [[ -n "$_ds_key" ]]; then export DEEPSEEK_API_KEY="$_ds_key"; fi
+        _gm_key="$(security find-generic-password -s grip-gemini -w 2>/dev/null || true)"
+        if [[ -n "$_gm_key" ]]; then export GEMINI_API_KEY="$_gm_key"; fi
+    fi
+    # --direct (gg++ codex --kimi --direct): vendor profile + keychain key for
+    # this one exec. Refusal exits 2 before anything is launched.
+    if [[ "${GRIP_HARNESS_DIRECT:-}" == "1" && -n "${GRIP_HARNESS_MODEL:-}" ]]; then
+        _grip_codex_direct_env "$bin" || exit 2
+        set -- -p "$_GRIP_CODEX_DIRECT_PROFILE" "$@"
+    fi
+    # Reasoning effort, only when the operator asked for one. Assembly lives in
+    # lib/grip-effort.sh because the code here sits immediately before an exec
+    # and is therefore untestable in place. The python call is paid only on this
+    # opt-in path, never on an ordinary launch.
+    if [[ -n "${GRIP_HARNESS_EFFORT:-}" ]]; then
+        local _eff_lib="${CLAUDE_DIR:-$HOME/.claude}/lib/grip-effort.sh"
+        local -a _eff_argv=()
+        local _eff_line
+        if [[ -f "$_eff_lib" ]]; then
+            source "$_eff_lib"
+            while IFS= read -r _eff_line; do
+                [[ -n "$_eff_line" ]] && _eff_argv+=("$_eff_line")
+            done < <(grip_effort_argv "$bin" "$GRIP_HARNESS_EFFORT")
+        fi
+        if [[ ${#_eff_argv[@]} -gt 0 ]]; then
+            >&2 echo "[grip] reasoning effort: $GRIP_HARNESS_EFFORT"
+            set -- "$@" "${_eff_argv[@]}"
+        else
+            # Say so rather than launching silently at the default. gg++ should
+            # already have refused, so reaching here means the classifier and
+            # the registry disagree — which the operator needs to see.
+            >&2 echo "[grip] warning: $bin cannot take a reasoning-effort setting; launching at its default"
+        fi
+    fi
+    if [[ -n "${_GRIP_CODEX_DIRECT_PROFILE:-}" ]]; then
+        # The vendor credential rides ONLY on this exec line (env(1)), never in
+        # the launcher's own environment. Set by _grip_codex_direct_env above.
+        >&2 echo "[grip] opening $bin (DIRECT to the vendor — not via HAL :4010)"
+        exec env "${_GRIP_CODEX_DIRECT_ENV[@]}" "$bin" "$@"
+    fi
+    # Codex reaches HAL through a PROFILE, never its base config: a plain
+    # `codex` must stay on the operator's ChatGPT subscription (V>> 2026-10-01,
+    # subscriptions first), so grip-harness writes the gateway pin to
+    # hal.config.toml and this launch selects it. No profile, no HAL: say so.
+    if [[ "$bin" == codex* ]]; then
+        if [[ -f "${CODEX_HOME:-$HOME/.codex}/hal.config.toml" ]]; then
+            set -- -p hal "$@"
+        else
+            >&2 echo "[grip] opening $bin on its own login -- no HAL profile at ${CODEX_HOME:-$HOME/.codex}/hal.config.toml"
+            exec "$bin" "$@"
+        fi
+    fi
+    >&2 echo "[grip] opening $bin (GRIP substrate via HAL :4010)"
+    exec "$bin" "$@"
+}
+
+# Resolve + dispatch the harness choice. Only fires for session-launching
+# commands; everything else (config subcommands, resume, etc.) returns
+# immediately so a `grip doctor` / `grip channels` never sees a picker.
+_resolve_harness_launch() {
+    case "${1:-}" in
+        auto|""|fresh|f) : ;;     # bare launch / fresh — the only picker surface
+        *) return 0 ;;
+    esac
+    local picker_py
+    picker_py="$(_grip_harness_picker_path)" || return 0
+    local tty_flag=""
+    [[ -t 0 && -t 1 ]] && tty_flag="--tty"
+    local directive rc
+    directive="$(python3 "$picker_py" resolve --flag "$GRIP_HARNESS_FLAG" $tty_flag 2>/dev/null)"
+    rc=$?
+    # An ERROR directive exits 2 on purpose: it is a deliberate REFUSAL (the
+    # operator named a harness that does not exist), not a failure to resolve.
+    # Treating it like any other non-zero here would `return 0` and fall through
+    # to Claude Code -- silently giving the operator a different harness than
+    # the one they asked for. Genuine failures still fall through.
+    case "$directive" in
+        ERROR\ *) : ;;
+        *) [[ $rc -ne 0 ]] && return 0 ;;
+    esac
+
+    read -r verb a b rest <<<"$directive"
+    if [[ "$verb" == "PROMPT" ]]; then
+        # Interactive single-screen TUI → chosen name (also remembered). The TUI
+        # renders on the picker's STDERR (→ /dev/tty, visible); only the chosen
+        # name is on STDOUT, which $() captures. The old `>/dev/tty 2>&1` sent
+        # stdout to the tty too, so $() captured "" and EVERY pick fell through
+        # to Claude (#2212). Tests: tests/test_grip_harness_picker.py.
+        # Exit 130 is Ctrl-C at the menu: a cancel, so launch nothing. Any other
+        # failure still falls through to Claude Code, as before.
+        local chosen pick_rc=0
+        chosen="$(python3 "$picker_py" pick </dev/tty 2>/dev/tty)" || pick_rc=$?
+        [[ $pick_rc -eq 130 ]] && exit 130
+        [[ $pick_rc -ne 0 ]] && return 0
+        [[ -z "$chosen" ]] && return 0
+        directive="$(python3 "$picker_py" plan "$chosen" 2>/dev/null)" || return 0
+        read -r verb a b rest <<<"$directive"
+    fi
+
+    case "$verb" in
+        LAUNCH) _harness_exec_directive "$a" "$b" $rest ;;   # execs (no return)
+        ERROR)
+            echo "[grip] '$a' is not a known harness — refusing to launch." >&2
+            echo "[grip] known: $b $rest" >&2
+            echo "[grip] (clear a stale value with: unset GRIP_HARNESS)" >&2
+            exit 2
+            ;;
+        *) return 0 ;;                                       # CLAUDE → fall through
+    esac
+}
+
+# ============================================================================
+# SESSION ISOLATION (pre-launch worktree guard — Rule 13)
+# ============================================================================
+#
+# ~/.claude IS the git-crypt GRIP repo. Concurrent `claude` sessions share one
+# working tree → one .git/HEAD, so any `git checkout` by any session flips HEAD
+# for ALL of them (branch contamination, Gen 348/509). A SessionStart hook
+# cannot prevent this — it fires after claude boots in the shared tree, and
+# AskUserQuestion is unavailable when channels are loaded. Only this pre-exec
+# shell can `cd` into an isolated worktree before `claude` launches.
+#
+# The gate fires ONLY when ≥2 concurrent claude sessions exist (proportional
+# cost; solo → silent main, zero friction — PARAMOUNT Execution Bias). It emits
+# a final `DIRECTIVE main` or `DIRECTIVE worktree <path>` line on stdout; we cd
+# into the worktree for the `worktree` directive so `claude` launches there.
+#
+# Resolution order (in lib/grip_session_wizard.py):
+#   1. GRIP_SESSION_ISOLATION env var (main/worktree/ask)
+#   2. state/session-isolation-config.json "choice"
+#   3. no standing choice + ≥2 sessions → AUTO-WORKTREE off origin/main
+#      (2026-07-12 default flip; TTY only — non-tty stays main + note).
+#      An explicit persisted/env "ask" keeps the interactive wizard.
+# Run `grip session` anytime to revisit the choice.
+
+_grip_session_wizard_path() {
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local candidate
+    for candidate in \
+        "${GRIP_LIB_DIR:-/__none__}/grip_session_wizard.py" \
+        "${script_dir%/bin}/lib/grip_session_wizard.py" \
+        "${CLAUDE_DIR:-$HOME/.claude}/lib/grip_session_wizard.py"; do
+        if [[ -f "$candidate" ]]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Run the directive gate and, for a `worktree` directive, cd into the isolated
+# copy before launch. Best-effort: a missing wizard or any error stays on main
+# (never strands the operator).
+#
+# ALLOWLIST, not denylist: the gate runs ONLY for invocations that launch a
+# harness in this tree — bare `grip`, `auto`, a numeric budget, `fresh`,
+# `resume`, `bounce`. Config/utility subcommands never spawn a worktree.
+# The previous denylist accidentally swept `fresh|f` and `resume|r` into the
+# skip set — the exact paths gg++/gogrip use (`grip fresh latest N`) — so NO
+# gg++ launch was ever isolation-gated (root cause #1 of the 2026-07-12
+# four-sessions-on-shared-main incident; root cause #2, the floor-at-1
+# session counter, is fixed in lib/grip_session_wizard.py).
+_apply_session_isolation() {
+    local first="${1:-}"
+    case "$first" in
+        ""|auto|fresh|f|resume|r|bounce|b)
+            : ;;  # claude-launching paths — gate runs
+        *)
+            # Numeric budget (`grip 12000`) also launches; anything else is
+            # a config/utility subcommand — never gate those.
+            [[ "$first" =~ ^[0-9]+$ ]] || return 0
+            ;;
+    esac
+    local wizard_py
+    wizard_py="$(_grip_session_wizard_path)" || return 0
+    local directive
+    # GRIP_LAUNCHER_PID: this shell's PID becomes the claude PID via exec —
+    # the wizard's launch-claim uses it to close the simultaneous-launch
+    # TOCTOU (two launchers counting before either claude spawns).
+    directive="$(GRIP_LAUNCHER_PID=$$ python3 "$wizard_py" --directive 2>/dev/tty | tail -n 1)" || return 0
+    case "$directive" in
+        "DIRECTIVE worktree "*)
+            local wt_path="${directive#DIRECTIVE worktree }"
+            if [[ -n "$wt_path" && -d "$wt_path" ]]; then
+                cd "$wt_path" || return 0
+                >&2 echo "[grip session] launching in isolated worktree: $wt_path"
+            fi
+            ;;
+        *) : ;;  # DIRECTIVE main (or empty) — stay in the shared tree
+    esac
+}
+
+_apply_session_isolation "${1:-}"
+
+# TF>> liberation (commit 77ed9bc): inject cli-internal-2026-02-09 beta header
+# for all CC sessions. Upstream this was ant-only; the gate was removed in TF>>.
+# Enables preview models + advisor tool (tengu_sage_compass) via API-side unlock.
+# Stock CC binary reads CLAUDE_CODE_CLI_INTERNAL_BETA since TF>> 77ed9bc;
+# no-op on older binaries. Set to empty string to disable.
+export CLAUDE_CODE_CLI_INTERNAL_BETA="${CLAUDE_CODE_CLI_INTERNAL_BETA:-cli-internal-2026-02-09}"
+
+# grip-tier envelope application (2026-05-28). Resolve the plan tier and, for
+# tiers with an advisory compact window (pro → 180K), export
+# CLAUDE_CODE_AUTO_COMPACT_WINDOW so the session compacts BEFORE the 200K wall.
+# Pro/Max/Enterprise users have a credit-gated 1M window; the resolver assumes
+# the safe floor (see docs/grip-tier-1m-context.md). Operator override always
+# wins: if CLAUDE_CODE_AUTO_COMPACT_WINDOW is already set, we never clobber it.
+# Best-effort + silent: a missing resolver or non-pro tier is a no-op, never a
+# launch blocker.
+if [[ -z "${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-}" ]]; then
+    _gt_py="${CLAUDE_DIR:-$HOME/.claude}/lib/grip_tier.py"
+    [[ -f "$_gt_py" ]] || _gt_py="$(_grip_bin_dir)/../lib/grip_tier.py"
+    if [[ -f "$_gt_py" ]]; then
+        # Single call, no pipe: --compact-window prints the integer (or an
+        # empty line). The resolver does the JSON itself, so there is no
+        # second python reading stdin (no hang risk on a broken resolver).
+        # A resolver that exits non-zero must neither end grip here under
+        # set -e (GRIP#7837) nor leak partial stdout into the env, so its
+        # output is dropped on failure and only an integer is exported.
+        _gt_acw="$(python3 "$_gt_py" --compact-window 2>/dev/null)" || _gt_acw=""
+        if [[ "$_gt_acw" =~ ^[0-9]+$ ]]; then
+            export CLAUDE_CODE_AUTO_COMPACT_WINDOW="$_gt_acw"
+        fi
+        unset _gt_acw
+    fi
+    unset _gt_py
+fi
+
+# grip-tier CONTEXT_GATE_MAX export. GRIP's own context gate derives its
+# CRITICAL checkpoint threshold as a FRACTION of CONTEXT_GATE_MAX (85% by
+# default — lib/gates/context_gate.py). Left unset, the gate assumes the full
+# 1M window even on a Pro session, so CRITICAL never fires before Claude
+# Code's native 180K auto-compact. Export the tier's assumed_window so
+# CRITICAL scales to the real window (Pro: 200K assumed -> CRITICAL ~170K,
+# below the 180K auto-compact, so GRIP checkpoints first). Operator override
+# always wins: if CONTEXT_GATE_MAX is already set, we never clobber it.
+# Best-effort + silent: a missing resolver or non-pro tier is a no-op, never a
+# launch blocker.
+if [[ -z "${CONTEXT_GATE_MAX:-}" ]]; then
+    _gt_py="${CLAUDE_DIR:-$HOME/.claude}/lib/grip_tier.py"
+    [[ -f "$_gt_py" ]] || _gt_py="$(_grip_bin_dir)/../lib/grip_tier.py"
+    if [[ -f "$_gt_py" ]]; then
+        # Single call, no pipe: --gate-max prints the integer (or an empty
+        # line). The resolver does the JSON itself, so there is no second
+        # python reading stdin (no hang risk on a broken resolver). A
+        # resolver that exits non-zero must neither end grip here under
+        # set -e (GRIP#7837) nor leak partial stdout into the env, so its
+        # output is dropped on failure and only an integer is exported.
+        _gt_gmax="$(python3 "$_gt_py" --gate-max 2>/dev/null)" || _gt_gmax=""
+        # The integer match also keeps the resolver's empty line (no concrete
+        # tier configured) from exporting an empty value (GRIP#8321).
+        if [[ "$_gt_gmax" =~ ^[0-9]+$ ]]; then
+            export CONTEXT_GATE_MAX="$_gt_gmax"
+        fi
+        unset _gt_gmax
+    fi
+    unset _gt_py
+fi
+
+# grip-tier first-run banner (#2147 D2): show the resolved-tier one-liner ONCE on
+# an interactive launch so a Pro user SEES the otherwise-invisible 180K compaction
+# protection. The show-once + marker logic lives in grip_tier.py
+# (--banner-if-unseen, unit-tested); bin/grip only gates on an interactive TTY so
+# a relay / CI / piped launch stays silent. Best-effort — never a launch blocker.
+if [[ -t 1 ]]; then
+    _gt_banner_py="${CLAUDE_DIR:-$HOME/.claude}/lib/grip_tier.py"
+    [[ -f "$_gt_banner_py" ]] || _gt_banner_py="$(_grip_bin_dir)/../lib/grip_tier.py"
+    [[ -f "$_gt_banner_py" ]] && python3 "$_gt_banner_py" --banner-if-unseen 2>/dev/null || true
+    unset _gt_banner_py
+fi
+
+# ============================================================================
+# KONO PRELOAD — warm session start
+# ============================================================================
+
+run_kono_preload() {
+    # Warm-start: query KONO + instance state, write session-context.md.
+    # MUST run under a Python that has `apsw` (the KONO substrate engine).
+    # The GRIP venv has apsw; the system python3 typically does not — running
+    # the preload under system python3 made KONO silently recall 0 memories
+    # for every project (the import error was swallowed). Prefer the venv,
+    # fall back to python3 only if the venv is absent.
+    local preload_flag
+    if [[ "$GRIP_WARM" == "1" ]]; then
+        preload_flag=""
+    else
+        preload_flag="--cold"
+    fi
+    # $GRIP_PYTHON still wins; otherwise resolve the venv (any platform layout).
+    local _kono_py="${GRIP_PYTHON:-}"
+    [[ -x "$_kono_py" ]] || _kono_py="$(_grip_resolve_python "$(dirname "$LIB_DIR")/venv")"
+    "$_kono_py" "$LIB_DIR/kono_preload.py" --project "$(pwd)" $preload_flag 2>&1 || true
+}
+
+# ============================================================================
+# CLAUDE CODE DEPENDENCY CHECK
+# ============================================================================
+
+ensure_claude_code() {
+    if command -v claude &>/dev/null; then
+        return 0
+    fi
+
+    echo ""
+    echo "[GRIP] Claude Code not found."
+    echo ""
+
+    # Detect platform and offer official installer
+    case "$(uname -s)" in
+        Darwin|Linux)
+            read -p "Install Claude Code now? (official installer) [Y/n] " response
+            case "$response" in
+                [nN]|[nN][oO])
+                    echo ""
+                    echo "To install manually:"
+                    echo "  curl -fsSL https://claude.ai/install.sh | bash"
+                    exit 1
+                    ;;
+                *)
+                    echo ""
+                    echo "Installing Claude Code..."
+                    curl -fsSL https://claude.ai/install.sh | bash || {
+                        echo "[GRIP ERROR] Installation failed."
+                        exit 1
+                    }
+                    # Reload PATH
+                    export PATH="$HOME/.claude/bin:$HOME/.local/bin:$PATH"
+                    ;;
+            esac
+            ;;
+        MINGW*|MSYS*|CYGWIN*)
+            echo "Windows detected. Run in PowerShell:"
+            echo "  irm https://claude.ai/install.ps1 | iex"
+            echo ""
+            echo "Then run 'grip' again."
+            exit 1
+            ;;
+        *)
+            echo "Unknown platform. Install manually:"
+            echo "  https://code.claude.com/docs/en/setup"
+            exit 1
+            ;;
+    esac
+}
+
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+
+[[ -z "${CLAUDE_DIR:-}" ]] && readonly CLAUDE_DIR="$HOME/.claude"
+[[ -z "${LIB_DIR:-}" ]] && readonly LIB_DIR="$CLAUDE_DIR/lib"
+[[ -z "${CONTEXTS_DIR:-}" ]] && readonly CONTEXTS_DIR="$CLAUDE_DIR/contexts"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+
+log_info() {
+    # Silent by default. Set GRIP_VERBOSE=1 for debug output.
+    [[ "${GRIP_VERBOSE:-0}" == "1" ]] && echo "[GRIP] $*" >&2
+    return 0
+}
+
+log_error() {
+    echo "[GRIP ERROR] $*" >&2
+}
+
+validate_prompt_path() {
+    local prompt_file="$1"
+    local resolved
+    resolved=$(readlink -f "$prompt_file" 2>/dev/null || echo "$prompt_file")
+    # Resolve CLAUDE_DIR too. ~/.claude is a symlink to the GRIP checkout on a
+    # standard install, so comparing a RESOLVED path against the UNRESOLVED
+    # prefix rejects files that are genuinely inside it. Same both-sides shape
+    # as scripts/grip-windows-onboard.sh:142-144.
+    local root
+    root=$(readlink -f "$CLAUDE_DIR" 2>/dev/null || echo "$CLAUDE_DIR")
+
+    # Must resolve under CLAUDE_DIR
+    if [[ "$resolved" != "$root"/* ]]; then
+        log_error "System prompt path resolves outside CLAUDE_DIR: $resolved"
+        exit 1
+    fi
+    # Must not be a symlink
+    if [[ -L "$prompt_file" ]]; then
+        log_error "System prompt is a symlink (potential attack): $prompt_file"
+        exit 1
+    fi
+}
+
+sed_escape() {
+    # Escape sed special characters in replacement strings (&, /, \, newlines)
+    # Prevents injection when variables are used in sed replacement patterns
+    printf '%s' "$1" | sed -e 's/[&/\]/\\&/g'
+}
+
+encode_project_path() {
+    pwd | sed 's|/|-|g' | sed 's|\.|-|g'
+}
+
+ensure_contexts_dir() {
+    local project_encoded
+    project_encoded=$(encode_project_path)
+    local context_dir="$CONTEXTS_DIR/$project_encoded"
+    mkdir -p "$context_dir"
+    echo "$context_dir"
+}
+
+# ============================================================================
+# BOOTSTRAP FUNCTIONS
+# ============================================================================
+
+has_grip_infrastructure() {
+    [[ -d "$CLAUDE_DIR/lib" ]] && \
+    [[ -d "$CLAUDE_DIR/skills" ]] && \
+    [[ -f "$CLAUDE_DIR/CLAUDE.md" ]] && \
+    [[ -f "$CLAUDE_DIR/hooks/session-start.sh" ]]
+}
+
+generate_gitignore() {
+    cat > "$CLAUDE_DIR/.gitignore" <<'GITIGNORE'
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Database
+embeddings.db
+*.db
+
+# Session data
+history.jsonl
+metrics.jsonl
+commands-index.json
+
+# Cache/ephemeral
+cache/
+contexts/
+debug/
+file-history/
+image-cache/
+plans/
+projects/
+session-env/
+shell-snapshots/
+statsig/
+todos/
+
+# macOS
+.DS_Store
+*.swp
+
+# Backups
+*.pre-bounce/
+*-pre-bounce/
+
+# Logs
+*.log
+.hooks.log
+
+# Plugin repos (submodules)
+plugins/marketplaces/*/
+GITIGNORE
+}
+
+# Resolve the canonical onboarding system-prompt SOURCE we can copy from.
+# Echoes the first existing source path, or nothing. Two source flavours:
+#   (a) brew distribution — $GRIP_SHARE_DIR/.../boot/system-prompt.txt
+#   (b) from-source clone (~/.grip or ~/.claude) — the tracked canonical now
+#       lives under skills/_archived/ (the authenticating-with-claude skill was
+#       archived). A from-source install has NO brew share dir, so (b) is the
+#       only source on the BLACKBOOK; without it `grip` onboarding errored with
+#       "System prompt not found / brew reinstall grip" (wrong remedy for source).
+_resolve_system_prompt_source() {
+    local rel="skills/authenticating-with-claude/boot/system-prompt.txt"
+    local archived_rel="skills/_archived/authenticating-with-claude/boot/system-prompt.txt"
+    local candidate
+    for candidate in \
+        "$GRIP_SHARE_DIR/$rel" \
+        "$CLAUDE_DIR/$archived_rel"; do
+        if [[ -f "$candidate" ]]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+ensure_system_prompt() {
+    local boot_dir="$CLAUDE_DIR/skills/authenticating-with-claude/boot"
+    local system_prompt="$boot_dir/system-prompt.txt"
+
+    if [[ ! -f "$system_prompt" ]]; then
+        local src
+        if src="$(_resolve_system_prompt_source)"; then
+            mkdir -p "$boot_dir"
+            cp "$src" "$system_prompt"
+        fi
+    fi
+}
+
+# True (0) when the operator has completed onboarding by EITHER marker: the
+# structured .onboarded.json the /activate-grip wizard writes
+# (lib/activate_grip_state.py; the one CLAUDE.md's session protocol treats as
+# canonical) or the legacy extensionless .onboarded the bash paths wrote.
+# Checking only the legacy name sent every wizard-activated install back into
+# onboarding on each bare `grip` (the gift-kit review, 2026-10-16).
+# lib/first-run-detector.sh's is_onboarded makes the same two-marker check;
+# this copy stays correct when that file is not sourced.
+_grip_is_onboarded() {
+    [[ -f "$CLAUDE_DIR/.onboarded" || -f "$CLAUDE_DIR/.onboarded.json" ]]
+}
+
+# True (0) when GRIP was installed from a git clone (~/.grip / ~/.claude), i.e.
+# CLAUDE_DIR is itself the repo — the `clone-as-home` case cmd_doctor detects.
+# Used to give the correct remediation (NOT "brew reinstall grip") on a source
+# install when an asset is genuinely missing.
+_is_source_install() {
+    [[ -d "$CLAUDE_DIR/.git" ]]
+}
+
+cmd_bootstrap_check() {
+    local command="${1:-auto}"
+
+    # Skip for help/version commands
+    [[ "$command" == "help" || "$command" == "--help" || "$command" == "-h" ]] && return 0
+    [[ "$command" == "--version" || "$command" == "-v" || "$command" == "version" ]] && return 0
+
+    # Case 1: No ~/.claude at all
+    if [[ ! -d "$CLAUDE_DIR" ]]; then
+        log_info "First run detected - bootstrapping GRIP..."
+        cmd_bootstrap_full
+        exit 0
+    fi
+
+    # Case 2: ~/.claude exists but no GRIP infrastructure
+    if ! has_grip_infrastructure; then
+        log_info "Partial GRIP detected - running upgrade wizard..."
+        cmd_bootstrap_partial
+        exit 0
+    fi
+
+    # Case 3: Full GRIP but not onboarded (by either marker)
+    if ! _grip_is_onboarded; then
+        case "$command" in
+            auto|""|onboard)
+                log_info "GRIP ready - starting onboarding..."
+                cmd_onboard
+                exit 0
+                ;;
+        esac
+    fi
+
+    # Case 4: Everything ready
+    return 0
+}
+
+cmd_bootstrap_full() {
+    log_info "Creating GRIP infrastructure at $CLAUDE_DIR..."
+
+    # Verify share directory exists
+    if [[ ! -d "$GRIP_SHARE_DIR" ]]; then
+        # Fallback: check if we have local GRIP (dev mode)
+        if [[ -d "$HOME/.claude" ]] && has_grip_infrastructure; then
+            GRIP_SHARE_DIR="$HOME/.claude"
+            log_info "Using local GRIP as source (dev mode)"
+        else
+            log_error "GRIP assets not found at $GRIP_SHARE_DIR"
+            log_error "Please reinstall: brew reinstall grip"
+            exit 1
+        fi
+    fi
+
+    # Create directory
+    mkdir -p "$CLAUDE_DIR"
+
+    # Copy bundled assets
+    cp -r "$GRIP_SHARE_DIR"/* "$CLAUDE_DIR/"
+    log_info "Copied GRIP assets"
+
+    # Generate .gitignore (always fresh)
+    generate_gitignore
+
+    # Create .env template if not exists
+    if [[ ! -f "$CLAUDE_DIR/.env" ]]; then
+        cat > "$CLAUDE_DIR/.env" <<'ENVFILE'
+# GRIP Configuration
+# Team password for 5-Mind system (set by team admin)
+# GRIP_TEAM_PASSWORD="your-team-password"
+ENVFILE
+        log_info "Created .env template"
+    fi
+
+    # Remove any stale markers
+    rm -f "$CLAUDE_DIR/.onboarded"
+
+    # Check for embeddings setup
+    if [[ ! -d "$CLAUDE_DIR/venv" ]]; then
+        echo ""
+        log_info "Semantic RL++ (pattern learning) not yet configured."
+        log_info "Run after onboarding: $CLAUDE_DIR/scripts/bootstrap-semantic-rl.sh"
+        echo ""
+    fi
+
+    # Install shell aliases
+    log_info "Installing shell aliases..."
+    cmd_install_aliases
+
+    log_info "Bootstrap complete. Starting onboarding..."
+    cmd_onboard
+}
+
+cmd_bootstrap_partial() {
+    # Generate wizard context for Claude
+    local wizard_context="$CLAUDE_DIR/contexts/upgrade-wizard.md"
+    mkdir -p "$CLAUDE_DIR/contexts"
+
+    # Detect current state
+    local has_lib
+    local has_skills
+    local has_rules
+    local has_claude_md
+    local has_hooks
+    has_lib=$(test -d "$CLAUDE_DIR/lib" && echo "YES" || echo "NO")
+    has_skills=$(test -d "$CLAUDE_DIR/skills" && echo "YES" || echo "NO")
+    has_rules=$(test -d "$CLAUDE_DIR/rules" && echo "YES" || echo "NO")
+    has_claude_md=$(test -f "$CLAUDE_DIR/CLAUDE.md" && echo "YES" || echo "NO")
+    has_hooks=$(test -d "$CLAUDE_DIR/hooks" && echo "YES" || echo "NO")
+
+    cat > "$wizard_context" <<WIZARD
+# GRIP Upgrade Wizard
+
+User has ~/.claude but missing GRIP infrastructure.
+
+## Current State
+| Component | Present |
+|-----------|---------|
+| lib/ | $has_lib |
+| skills/ | $has_skills |
+| rules/ | $has_rules |
+| CLAUDE.md | $has_claude_md |
+| hooks/ | $has_hooks |
+
+## Required Action
+Use AskUserQuestion with these options:
+
+Question: "I found an existing ~/.claude directory but it's missing GRIP infrastructure. What would you like to do?"
+
+Options:
+1. "Install full GRIP (Recommended)" - Install all GRIP components
+2. "Select components" - Choose specific components to install
+3. "Keep current setup" - Run claude without GRIP enhancements
+
+If user selects "Select components", use multiSelect:
+Question: "Which GRIP components would you like to install?"
+- Skills (48 protocols for common tasks)
+- Rules (efficiency, bash safety, commit standards)
+- Hooks (session lifecycle, auto-resurrection)
+
+After user answers, copy selected components from $GRIP_SHARE_DIR and proceed.
+WIZARD
+
+    # Ensure we have system prompt
+    ensure_system_prompt
+
+    # Launch claude with wizard context
+    grip_handoff $(_grip_permission_flag)
+}
+
+cmd_onboard() {
+    local system_prompt="$CLAUDE_DIR/skills/authenticating-with-claude/boot/system-prompt.txt"
+
+    if [[ ! -f "$system_prompt" ]]; then
+        ensure_system_prompt
+    fi
+
+    if [[ ! -f "$system_prompt" ]]; then
+        log_error "System prompt not found: $system_prompt"
+        if _is_source_install; then
+            # From-source install (~/.grip / ~/.claude clone): the canonical
+            # source is the tracked skills/_archived/ copy. "brew reinstall" does
+            # not apply here. Onboarding is optional — launch GRIP via plain
+            # claude (the harness auto-loads CLAUDE.md + rules + .mcp.json).
+            log_error "Source install detected — restore it with:"
+            log_error "  git -C \"$CLAUDE_DIR\" checkout -- skills/_archived/authenticating-with-claude/boot/system-prompt.txt"
+            log_error "Or just launch GRIP directly:  claude   (run inside $CLAUDE_DIR)"
+        else
+            log_error "Run: brew reinstall grip"
+        fi
+        exit 1
+    fi
+
+    validate_prompt_path "$system_prompt"
+    grip_handoff $(_grip_permission_flag) --system-prompt "$(cat "$system_prompt")"
+}
+
+cmd_version() {
+    echo "GRIP v$GRIP_VERSION"
+    echo "Location: $CLAUDE_DIR"
+    echo "Share: $GRIP_SHARE_DIR"
+
+    if has_grip_infrastructure; then
+        echo "Status: Installed"
+        if _grip_is_onboarded; then
+            echo "Onboarded: Yes"
+        else
+            echo "Onboarded: No (run 'grip' to complete)"
+        fi
+    else
+        echo "Status: Not installed (run 'grip' to bootstrap)"
+    fi
+}
+
+# ============================================================================
+# COMMANDS
+# ============================================================================
+
+cmd_resume() {
+    local reference="${1:-latest}"
+
+    log_info "Resolving reference: $reference"
+
+    # Resolve reference to session UUID
+    local session_info
+    session_info=$(python3 "$LIB_DIR/session_resolver.py" resolve "$reference" --json 2>/dev/null) || {
+        log_error "Could not resolve reference: $reference"
+        log_error "Try 'grip list' to see available sessions."
+        exit 1
+    }
+
+    local session_uuid
+    session_uuid=$(echo "$session_info" | jq -r '.session_uuid')
+
+    if [[ -z "$session_uuid" ]] || [[ "$session_uuid" == "null" ]]; then
+        log_error "No session UUID found for reference: $reference"
+        exit 1
+    fi
+
+    local instance_id
+    instance_id=$(echo "$session_info" | jq -r '.instance_id' | head -c 8)
+    local generation
+    generation=$(echo "$session_info" | jq -r '.generation')
+    local messages
+    messages=$(echo "$session_info" | jq -r '.message_count')
+
+    log_info "Found: Instance $instance_id... (Gen $generation, $messages msgs)"
+    log_info "Resuming session: $session_uuid"
+
+    # Execute claude --resume; the permission default is this machine's choice
+    # (bin/grip-launch-permissions), see _grip_permission_flag
+    grip_handoff $(_grip_permission_flag) --resume "$session_uuid"
+}
+
+# _has_project_marker — returns 0 (true) if the given directory looks like a
+# real project root, 1 (false) otherwise. Used by cmd_fresh to decide whether
+# to preserve operator CWD or cd to CLAUDE_DIR for CLAUDE.md auto-load.
+# Markers: .git, CLAUDE.md, package.json, pyproject.toml, Cargo.toml, go.mod.
+# See issue #2637 and the comment block above the call site for rationale.
+_has_project_marker() {
+    local dir="${1:-$PWD}"
+    [[ -e "$dir/.git" ]] && return 0
+    [[ -f "$dir/CLAUDE.md" ]] && return 0
+    [[ -f "$dir/package.json" ]] && return 0
+    [[ -f "$dir/pyproject.toml" ]] && return 0
+    [[ -f "$dir/Cargo.toml" ]] && return 0
+    [[ -f "$dir/go.mod" ]] && return 0
+    return 1
+}
+
+cmd_fresh() {
+    # ---- Pre-flight: route -r/--resume <ref> to cmd_resume; reject unknown flags ----
+    # MUST run BEFORE any reference/tokens normalisation or log_info, so:
+    #   (1) An unknown flag exits 2 with NO spurious "Numeric-only detected"
+    #       log_info preceding it. AGORA Speaker C concern bin/grip:717 fixed.
+    #   (2) `-r/--resume <ref>` is detected against the ORIGINAL argv that the
+    #       operator typed — robust to any future change to numeric/reference
+    #       handling below this block. AGORA Speaker C concern bin/grip:703.
+    # cmd_fresh has no native flags; any `-…` arg is an operator error worth
+    # surfacing rather than silently swallowing (the V>>'s 2026-05-26 root cause).
+    local resume_ref=""
+    local _i=1
+    while [[ $_i -le $# ]]; do
+        local _arg="${!_i}"
+        case "$_arg" in
+            -r|--resume)
+                local _j=$((_i + 1))
+                resume_ref="${!_j:-}"
+                if [[ -z "$resume_ref" ]]; then
+                    log_error "$_arg requires a session reference argument"
+                    log_error "Usage: grip resume <ref>  OR  grip fresh [ref] [tokens]"
+                    exit 2
+                fi
+                _i=$((_j + 1))
+                ;;
+            -*)
+                log_error "Unknown flag for 'grip fresh': $_arg"
+                log_error "Usage: grip fresh [ref] [tokens]  (use 'grip resume <ref>' to resume)"
+                exit 2
+                ;;
+            *)
+                _i=$((_i + 1))
+                ;;
+        esac
+    done
+
+    if [[ -n "$resume_ref" ]]; then
+        log_info "Detected -r/--resume; routing to 'grip resume $resume_ref'"
+        cmd_resume "$resume_ref"
+        return $?
+    fi
+
+    # ---- Normal fresh-launch flow (original argv preserved, no flags present) ----
+    local reference="${1:-latest}"
+    local max_tokens="${2:-2000}"
+
+    # Handle numeric-first-arg: `grip fresh 12000` → `grip fresh latest 12000`
+    if [[ "$reference" =~ ^[0-9]+$ ]]; then
+        max_tokens="$reference"
+        reference="latest"
+        log_info "Numeric-only detected, using: reference=latest, tokens=$max_tokens"
+    fi
+
+    # Warm-start: preload KONO context before launch
+    run_kono_preload
+
+    # cd to CLAUDE_DIR only for a GENUINE relay launch ($PWD == $HOME:
+    # Spotlight/$HOME, no project intent). Any other dir the operator chose
+    # — including a brand-new, marker-less one — keeps CWD.
+    #
+    # #2637 (Toopie 2026-05-07) gated the cd behind _has_project_marker, but
+    # a NASCENT project dir has no .git/CLAUDE.md yet, so the create-a-new-
+    # repo workflow was still misclassified as relay and silently abandoned.
+    # Task #1880 (2026-05-17; drafts/converge-grip-commander-cwd-fix-
+    # 2026-05-17.md) tightens the gate to markerless AND $PWD == $HOME.
+    # #2637 behaviour is preserved (every marker'd dir still keeps CWD;
+    # ~/.claude is marker-positive → natural no-op). Full history: commit
+    # message + the #1880 spec (not duplicated here — DRY).
+    #
+    # GRIP_LAUNCH_DIR is exported BEFORE any cd: SessionStart hooks and
+    # post-compaction resume need the true launch dir, and OLDPWD is fragile
+    # (Claude Code's re-exec clobbers it — that hole hid this bug).
+    export GRIP_LAUNCH_DIR="$PWD"
+    if ! _has_project_marker "$PWD" && [[ "$PWD" == "$HOME" ]]; then
+        log_info "Relay-style launch (\$PWD=\$HOME, no project marker); cd -> $CLAUDE_DIR for CLAUDE.md auto-load (launch dir preserved in GRIP_LAUNCH_DIR)"
+        cd "$CLAUDE_DIR" || true
+    fi
+
+    log_info "Resolving reference: $reference"
+
+    # Resolve reference to session UUID
+    local session_info
+    if ! session_info=$(python3 "$LIB_DIR/session_resolver.py" resolve "$reference" --json 2>/dev/null); then
+        if [[ "$reference" == "latest" ]]; then
+            # Graceful fallback for "latest" when no sessions exist
+            log_info "No GRIP sessions found - attempting context mining..."
+
+            local context_dir
+            context_dir=$(ensure_contexts_dir)
+            local context_file="$context_dir/resurrection.md"
+
+            # Try to mine context from raw JSONL files
+            if python3 "$LIB_DIR/context_miner.py" mine --project "$(pwd)" > "$context_file" 2>/dev/null; then
+                log_info "Mined context from existing session files"
+            else
+                log_info "No previous sessions - starting fresh"
+                # Check if onboarding needed (first-run)
+                if type is_first_run &>/dev/null && is_first_run; then
+                    log_info "First run detected - starting onboarding..."
+                    if [[ -x "$LIB_DIR/onboarding-wizard.sh" ]]; then
+                        exec "$LIB_DIR/onboarding-wizard.sh"
+                    fi
+                fi
+                # Create minimal context file
+                echo "# Fresh Session" > "$context_file"
+                echo "No previous GRIP context available." >> "$context_file"
+            fi
+            # Start fresh session (with channel flags if detected)
+            grip_handoff $(_grip_permission_flag) $GRIP_CHANNEL_FLAGS
+        else
+            log_error "Could not resolve reference: $reference"
+            exit 1
+        fi
+    fi
+
+    local session_uuid
+    session_uuid=$(echo "$session_info" | jq -r '.session_uuid')
+
+    if [[ -z "$session_uuid" ]] || [[ "$session_uuid" == "null" ]]; then
+        log_error "No session UUID found for reference: $reference"
+        exit 1
+    fi
+
+    log_info "Generating compressed context (~$max_tokens tokens)..."
+
+    # Generate compressed context
+    local context_dir
+    context_dir=$(ensure_contexts_dir)
+    local context_file="$context_dir/resurrection.md"
+
+    python3 "$LIB_DIR/semantic_compressor.py" compress "$session_uuid" \
+        --tokens "$max_tokens" > "$context_file" 2>/dev/null || {
+        # The compressed context is a warm start, not a precondition. On
+        # Windows the compressor crashed reading the last transcript as cp1252,
+        # and exiting here stopped the first gg++ of every session (2026-10-14).
+        # A 'latest' launch carries on without it and says so. An explicit
+        # reference still fails, because the operator asked for that context.
+        if [[ "$reference" != "latest" ]]; then
+            log_error "Failed to generate compressed context"
+            exit 1
+        fi
+        log_error "Could not build context from the last session; launching without it"
+        echo "# Fresh Session" > "$context_file"
+        echo "The last session's context could not be compressed." >> "$context_file"
+    }
+
+    local token_count
+    token_count=$(wc -c < "$context_file" | awk '{print int($1/4)}')
+
+    log_info "Context generated: ~$token_count tokens"
+    log_info "Starting fresh session with inherited context..."
+
+    # Launch new claude session (hook will inject context)
+    # The permission default is this machine's choice (bin/grip-launch-permissions),
+    # see _grip_permission_flag; channel flags auto-detected from .mcp.json
+    grip_handoff $(_grip_permission_flag) $GRIP_CHANNEL_FLAGS
+}
+
+cmd_list() {
+    local limit="${1:-20}"
+    local show_branches="${2:-}"
+
+    if [[ "$show_branches" == "--branches" ]] || [[ "$show_branches" == "-b" ]]; then
+        # Delegate to branches command
+        cmd_branches
+        return
+    fi
+
+    python3 "$LIB_DIR/session_resolver.py" list --limit "$limit"
+}
+
+cmd_branches() {
+    log_info "Listing branches for current project..."
+
+    python3 "$LIB_DIR/instance_resurrector.py" branches || {
+        log_error "No branches found. Use 'grip list' to see sessions."
+        exit 1
+    }
+}
+
+cmd_status() {
+    log_info "Active sessions for current project..."
+
+    python3 "$LIB_DIR/grip_registry.py" status || {
+        log_error "No active sessions found."
+        exit 1
+    }
+}
+
+cmd_register() {
+    # Internal: Register current session with registry
+    python3 "$LIB_DIR/grip_registry.py" register
+}
+
+cmd_deregister() {
+    # Internal: Deregister current session from registry
+    python3 "$LIB_DIR/grip_registry.py" deregister
+}
+
+cmd_merge() {
+    # Merge multiple branches into one
+    # Usage: grip merge <ref1> <ref2> [--into <branch>] [--dry-run]
+    local refs=()
+    local target_branch="main"
+    local dry_run=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --into)
+                target_branch="${2:-main}"
+                shift 2
+                ;;
+            --dry-run)
+                dry_run=true
+                shift
+                ;;
+            *)
+                refs+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ ${#refs[@]} -lt 2 ]]; then
+        log_error "Merge requires at least 2 branch references"
+        log_info "Usage: grip merge <ref1> <ref2> [--into <branch>]"
+        log_info "Example: grip merge alpha bravo --into main"
+        exit 1
+    fi
+
+    log_info "Merge: ${refs[*]} -> $target_branch"
+
+    if [[ "$dry_run" == "true" ]]; then
+        log_info "DRY RUN - No changes will be made"
+        python3 "$LIB_DIR/grip_merge.py" --lib-dir "$LIB_DIR" --refs "${refs[@]}" --target "$target_branch" --dry-run
+    else
+        python3 "$LIB_DIR/grip_merge.py" --lib-dir "$LIB_DIR" --refs "${refs[@]}" --target "$target_branch"
+    fi
+}
+
+cmd_bounce() {
+    # Cyclical renewal - Big Bounce pattern (Gen 209)
+    local skip_confirm=""
+
+    # Parse arguments
+    for arg in "$@"; do
+        case "$arg" in
+            --yes|-y) skip_confirm="yes" ;;
+        esac
+    done
+
+    log_info "Initiating GRIP bounce (Big Bounce pattern)..."
+    echo ""
+
+    # Safety check: warn about consequences
+    if [[ "$skip_confirm" != "yes" ]]; then
+        echo "⚠️  BOUNCE will:"
+        echo "   • Backup ~/.claude to ~/.claude.pre-bounce"
+        echo "   • Reset to fresh structure"
+        echo "   • Preserve: skills, agents, commands, rules, facts, lib, bin"
+        echo "   • Discard: cache, metrics, old contexts, session logs"
+        echo ""
+        read -p "Proceed with bounce? [y/N] " confirm
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            log_info "Bounce cancelled."
+            return 0
+        fi
+    fi
+
+    # Phase 1: Pre-bounce - Serialize state
+    log_info "Phase 1: Serializing current state..."
+
+    local gen_count=0
+    local session_count=0
+    local skill_count=0
+    local agent_count=0
+
+    # Count current stats (sanitize output for sed compatibility)
+    if [[ -f "$CLAUDE_DIR/metrics.jsonl" ]]; then
+        gen_count=$(grep -c '"gen":' "$CLAUDE_DIR/metrics.jsonl" 2>/dev/null | tr -d '\n\r ' || echo "0")
+    fi
+    session_count=$(find "$CLAUDE_DIR/projects" -name "*.jsonl" 2>/dev/null | wc -l | tr -d '\n\r ')
+    skill_count=$(find "$CLAUDE_DIR/skills" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d '\n\r ')
+    agent_count=$(find "$CLAUDE_DIR/agents" -name "*.md" 2>/dev/null | wc -l | tr -d '\n\r ')
+
+    # Create bounce context from template
+    local bounce_context_dir="$CLAUDE_DIR/contexts"
+    mkdir -p "$bounce_context_dir"
+
+    local template="$CLAUDE_DIR/skills/authenticating-with-claude/contexts/bounce-context.template.md"
+    local bounce_context="$bounce_context_dir/bounce-context.md"
+
+    if [[ -f "$template" ]]; then
+        # Generate bounce context from template
+        # Escape sed metacharacters in variables to prevent injection
+        local safe_gen_count safe_session_count safe_skill_count safe_agent_count
+        safe_gen_count=$(sed_escape "$gen_count")
+        safe_session_count=$(sed_escape "$session_count")
+        safe_skill_count=$(sed_escape "$skill_count")
+        safe_agent_count=$(sed_escape "$agent_count")
+
+        sed -e "s/{{NEW_GEN}}/1/g" \
+            -e "s/{{PREV_GEN}}/${safe_gen_count}/g" \
+            -e "s/{{SESSION_COUNT}}/${safe_session_count}/g" \
+            -e "s/{{SKILL_COUNT}}/${safe_skill_count}/g" \
+            -e "s/{{AGENT_COUNT}}/${safe_agent_count}/g" \
+            -e "s/{{LINEAGE_NAME}}/GRIP/g" \
+            -e "s/{{ACHIEVEMENTS}}/- Accumulated ${safe_session_count} sessions over ${safe_gen_count} generations\\n- Maintained ${safe_skill_count} skills and ${safe_agent_count} agents/g" \
+            -e "s/{{CRUFT_COUNT}}/${safe_session_count}/g" \
+            -e "s/{{CACHE_SIZE}}/varies/g" \
+            -e "s/{{IDENTITY}}/To be determined/g" \
+            -e "s/{{IDENTITY_DETAILS}}/Will be set after identity selection/g" \
+            "$template" > "$bounce_context"
+        log_info "Created bounce context: $bounce_context"
+    fi
+
+    # Phase 2: Backup
+    log_info "Phase 2: Creating backup..."
+    local backup_dir="$HOME/.claude.pre-bounce"
+
+    if [[ -d "$backup_dir" ]]; then
+        log_warn "Previous backup exists at $backup_dir"
+        read -p "Remove previous backup? [y/N] " remove_backup
+        if [[ "$remove_backup" == "y" || "$remove_backup" == "Y" ]]; then
+            rm -rf "$backup_dir"
+        else
+            log_error "Cannot proceed with existing backup. Remove it first."
+            return 1
+        fi
+    fi
+
+    mv "$CLAUDE_DIR" "$backup_dir"
+    log_info "Backed up to $backup_dir"
+
+    # Phase 3: Fresh structure with essentials
+    log_info "Phase 3: Creating fresh structure..."
+    mkdir -p "$CLAUDE_DIR"
+
+    # Copy essential directories
+    local essentials=(
+        "lib"
+        "bin"
+        "skills"
+        "agents"
+        "commands"
+        "docs"
+        "rules"
+        "facts"
+        "scripts"
+        "plugins"
+        "hooks"
+        ".claude"
+    )
+
+    for dir in "${essentials[@]}"; do
+        if [[ -d "$backup_dir/$dir" ]]; then
+            cp -r "$backup_dir/$dir" "$CLAUDE_DIR/$dir"
+            log_info "  Copied: $dir/"
+        fi
+    done
+
+    # Copy essential files
+    local essential_files=(
+        "CLAUDE.md"
+        "settings.json"
+        "settings.local.json"
+        "commands-index.json"
+    )
+
+    for file in "${essential_files[@]}"; do
+        if [[ -f "$backup_dir/$file" ]]; then
+            cp "$backup_dir/$file" "$CLAUDE_DIR/$file"
+            log_info "  Copied: $file"
+        fi
+    done
+
+    # Copy bounce context to new structure
+    if [[ -f "$backup_dir/contexts/bounce-context.md" ]]; then
+        mkdir -p "$CLAUDE_DIR/contexts"
+        cp "$backup_dir/contexts/bounce-context.md" "$CLAUDE_DIR/contexts/"
+    fi
+
+    # Remove .onboarded to trigger virgin flow
+    rm -f "$CLAUDE_DIR/.onboarded"
+
+    # Phase 4: Launch with system prompt
+    log_info "Phase 4: Launching fresh GRIP..."
+    local system_prompt="$CLAUDE_DIR/skills/authenticating-with-claude/boot/system-prompt.txt"
+
+    if [[ ! -f "$system_prompt" ]]; then
+        log_error "System prompt not found: $system_prompt"
+        log_error "Restoring from backup..."
+        rm -rf "$CLAUDE_DIR"
+        mv "$backup_dir" "$CLAUDE_DIR"
+        return 1
+    fi
+
+    echo ""
+    echo "Bounce complete. Launching fresh GRIP instance..."
+    echo ""
+
+    # Launch claude with system prompt
+    validate_prompt_path "$system_prompt"
+    grip_handoff --system-prompt "$(cat "$system_prompt")"
+}
+
+# ============================================================================
+# DOCTOR COMMAND - Diagnose installation health
+# ============================================================================
+
+# Pro-parity triad for `grip doctor` (#2147 D3): make the doctor SPEAK the three
+# things "Pro-account parity" means and was previously blind to — the resolved
+# plan tier (+ its one-line banner), whether the HAL >200K-overflow peer is
+# present, and the channels config choice. Reuses grip_tier.py (single resolver,
+# DRY — never re-implements tier logic). Prints diagnostics to stdout and RETURNS
+# the count of ADVISORY warnings (caller adds to its tally). Advisory only: a
+# missing HAL peer / unresolved tier is a warning, NEVER an error — a Pro user
+# with no HAL is a valid, healthy install.
+_doctor_tier_block() {
+    local w=0
+    local gt_py="${CLAUDE_DIR:-$HOME/.claude}/lib/grip_tier.py"
+
+    echo -n "Checking plan tier... "
+    if [[ -f "$gt_py" ]]; then
+        local tier banner
+        tier="$(python3 "$gt_py" --resolve 2>/dev/null)"
+        banner="$(python3 "$gt_py" --banner 2>/dev/null)"
+        if [[ -n "$tier" ]]; then
+            echo -e "${GREEN}${tier}${NC}"
+            [[ -n "$banner" ]] && echo "  $banner"
+        else
+            echo -e "${YELLOW}UNKNOWN${NC}"; echo "  could not resolve plan tier"; ((w++))
+        fi
+    else
+        echo -e "${YELLOW}N/A${NC}"; echo "  grip_tier.py not found"; ((w++))
+    fi
+
+    echo -n "Checking HAL peer (>200K overflow path)... "
+    if [[ -x "$HOME/.hal/bin/hal" ]]; then
+        echo -e "${GREEN}present${NC} (~/.hal/bin/hal)"
+    else
+        echo -e "${YELLOW}absent${NC}"
+        echo "  HAL not installed — heavy work won't route to a >200K overflow path (optional)."
+        w=$((w + 1))
+    fi
+
+    echo -n "Checking channels config... "
+    local ch_cfg="${CLAUDE_DIR:-$HOME/.claude}/state/grip-channels-config.json"
+    if [[ -f "$ch_cfg" ]]; then
+        local choice
+        choice="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('choice','?'))" "$ch_cfg" 2>/dev/null)"
+        echo -e "${GREEN}${choice:-set}${NC}"
+    else
+        echo -e "${YELLOW}default${NC}"
+        echo "  no channels config yet — defaults apply. Configure with: grip channels"
+    fi
+
+    return $w
+}
+
+cmd_doctor() {
+    local errors=0
+    local warnings=0
+    local verbose="${1:-}"
+
+    echo ""
+    echo "GRIP Doctor - Installation Diagnostics"
+    echo "======================================="
+    echo ""
+
+    # Check 1: ~/.claude exists
+    echo -n "Checking ~/.claude exists... "
+    if [[ -d "$CLAUDE_DIR" ]]; then
+        echo -e "${GREEN}OK${NC}"
+    else
+        echo -e "${RED}MISSING${NC}"
+        echo "  ~/.claude directory not found. Run: grip bootstrap"
+        errors=$((errors + 1))
+        echo ""
+        echo "Diagnosis: GRIP not installed"
+        return 1
+    fi
+
+    # Check 2: Core directories
+    local core_dirs=("lib" "skills" "hooks" "rules" "docs" "agents" "commands" "bin")
+    echo -n "Checking core directories... "
+    local missing_dirs=()
+    for dir in "${core_dirs[@]}"; do
+        if [[ ! -d "$CLAUDE_DIR/$dir" ]] && [[ ! -L "$CLAUDE_DIR/$dir" ]]; then
+            missing_dirs+=("$dir")
+        fi
+    done
+
+    if [[ ${#missing_dirs[@]} -eq 0 ]]; then
+        echo -e "${GREEN}OK${NC} (${#core_dirs[@]} directories)"
+    else
+        echo -e "${RED}MISSING${NC}"
+        for dir in "${missing_dirs[@]}"; do
+            echo "  Missing: $dir/"
+            errors=$((errors + 1))
+        done
+    fi
+
+    # Check 3: Core files
+    local core_files=("CLAUDE.md" "hooks/session-start.sh")
+    echo -n "Checking core files... "
+    local missing_files=()
+    for file in "${core_files[@]}"; do
+        if [[ ! -f "$CLAUDE_DIR/$file" ]] && [[ ! -L "$CLAUDE_DIR/$file" ]]; then
+            missing_files+=("$file")
+        fi
+    done
+
+    if [[ ${#missing_files[@]} -eq 0 ]]; then
+        echo -e "${GREEN}OK${NC}"
+    else
+        echo -e "${RED}MISSING${NC}"
+        for file in "${missing_files[@]}"; do
+            echo "  Missing: $file"
+            errors=$((errors + 1))
+        done
+    fi
+
+    # Check 4: Installation mode
+    echo -n "Checking installation mode... "
+    local install_mode="unknown"
+    local source_dir=""
+
+    if [[ -f "$CLAUDE_DIR/.grip-symlinked" ]]; then
+        install_mode="symlink"
+        source_dir=$(cat "$CLAUDE_DIR/.grip-symlinked" 2>/dev/null)
+        echo -e "${GREEN}symlink${NC} -> $source_dir"
+    elif [[ -f "$CLAUDE_DIR/.grip-copy-source" ]]; then
+        install_mode="copy"
+        source_dir=$(cat "$CLAUDE_DIR/.grip-copy-source" 2>/dev/null)
+        echo -e "${GREEN}copy${NC} from $source_dir"
+    elif [[ -d "$CLAUDE_DIR/.git" ]]; then
+        install_mode="clone"
+        source_dir="$CLAUDE_DIR"
+        echo -e "${GREEN}clone-as-home${NC}"
+    else
+        install_mode="unknown"
+        echo -e "${YELLOW}unknown${NC}"
+        warnings=$((warnings + 1))
+
+        # Search for GRIP repos
+        echo "  Searching for GRIP repositories..."
+        local found_repos=()
+        local search_paths=(
+            "$HOME/Projects/grip"
+            "$HOME/projects/grip"
+            "$HOME/Code/grip"
+            "$HOME/code/grip"
+            "$HOME/Developer/grip"
+            "$HOME/dev/grip"
+            "$HOME/src/grip"
+            "$HOME/grip"
+            "$HOME/Github/grip"
+            "$HOME/github/grip"
+        )
+
+        for path in "${search_paths[@]}"; do
+            if [[ -d "$path" ]] && [[ -f "$path/CLAUDE.md" ]] && grep -q "GRIP" "$path/CLAUDE.md" 2>/dev/null; then
+                found_repos+=("$path")
+            fi
+        done
+
+        if [[ ${#found_repos[@]} -gt 0 ]]; then
+            echo ""
+            echo -e "  ${YELLOW}[DISCONNECTED]${NC} Found GRIP repos not linked to ~/.claude:"
+            for repo in "${found_repos[@]}"; do
+                echo "    - $repo"
+            done
+            echo ""
+            echo "  To repair: grip repair --source ${found_repos[0]}"
+        fi
+    fi
+
+    # Check 5: Source directory validity (for symlink/copy modes)
+    if [[ "$install_mode" != "unknown" ]] && [[ "$install_mode" != "clone" ]]; then
+        echo -n "Checking source directory... "
+        if [[ -d "$source_dir" ]]; then
+            echo -e "${GREEN}OK${NC}"
+
+            # Check if it's a git repo
+            if [[ -d "$source_dir/.git" ]]; then
+                local remote_url
+                remote_url=$(cd "$source_dir" && git remote get-url origin 2>/dev/null || echo "none")
+                echo "  Git repo: $remote_url"
+            fi
+        else
+            echo -e "${RED}MISSING${NC}"
+            echo "  Source directory no longer exists: $source_dir"
+            errors=$((errors + 1))
+        fi
+    fi
+
+    # Check 6: Symlink integrity (for symlink mode)
+    if [[ "$install_mode" == "symlink" ]] && [[ -d "$source_dir" ]]; then
+        echo -n "Checking symlink integrity... "
+        local broken_links=()
+        for dir in "${core_dirs[@]}"; do
+            if [[ -L "$CLAUDE_DIR/$dir" ]]; then
+                if [[ ! -e "$CLAUDE_DIR/$dir" ]]; then
+                    broken_links+=("$dir")
+                fi
+            fi
+        done
+
+        if [[ ${#broken_links[@]} -eq 0 ]]; then
+            echo -e "${GREEN}OK${NC}"
+        else
+            echo -e "${RED}BROKEN${NC}"
+            for link in "${broken_links[@]}"; do
+                echo "  Broken symlink: $link"
+                errors=$((errors + 1))
+            done
+        fi
+    fi
+
+    # Check 7: Copy drift (for copy mode)
+    if [[ "$install_mode" == "copy" ]] && [[ -d "$source_dir" ]]; then
+        echo -n "Checking for copy drift... "
+        local drifted=0
+
+        # Check a few key files
+        for file in "CLAUDE.md" "lib/session_resolver.py"; do
+            if [[ -f "$CLAUDE_DIR/$file" ]] && [[ -f "$source_dir/$file" ]]; then
+                if ! diff -q "$CLAUDE_DIR/$file" "$source_dir/$file" &>/dev/null; then
+                    drifted=$((drifted + 1))
+                fi
+            fi
+        done
+
+        if [[ $drifted -eq 0 ]]; then
+            echo -e "${GREEN}OK${NC}"
+        else
+            echo -e "${YELLOW}DRIFTED${NC}"
+            echo "  $drifted files differ from source. Run: grip repair --sync"
+            warnings=$((warnings + 1))
+        fi
+    fi
+
+    # Check 8: Hook permissions
+    echo -n "Checking hook permissions... "
+    local hook_issues=0
+    if [[ -f "$CLAUDE_DIR/hooks/session-start.sh" ]] && [[ ! -x "$CLAUDE_DIR/hooks/session-start.sh" ]]; then
+        hook_issues=$((hook_issues + 1))
+    fi
+    if [[ -f "$CLAUDE_DIR/hooks/context-gate-hook.py" ]] && [[ ! -r "$CLAUDE_DIR/hooks/context-gate-hook.py" ]]; then
+        hook_issues=$((hook_issues + 1))
+    fi
+
+    if [[ $hook_issues -eq 0 ]]; then
+        echo -e "${GREEN}OK${NC}"
+    else
+        echo -e "${YELLOW}FIXABLE${NC}"
+        echo "  Some hooks have incorrect permissions. Run: grip repair --fix-permissions"
+        warnings=$((warnings + 1))
+    fi
+
+    # Check 9: Windows-specific (only on Windows)
+    if [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "cygwin" ]] || [[ "$OSTYPE" == "win32" ]]; then
+        echo -n "Checking Windows compatibility... "
+        local win_issues=0
+
+        # Check for unexpandable ~ paths in settings.json.
+        #
+        # This parses the JSON and inspects the hook COMMAND VALUES, rather
+        # than grepping the raw file text as it used to. A tilde in a
+        # description or a documentation field is not a path, and neither is
+        # a tilde already wrapped in `bash -c "..."` — which is the correct
+        # Windows form, so flagging it told the operator to "fix" something
+        # that was right. GRIP's own settings.json has exactly one `~/` in
+        # it, in a `_claudeMdExcludes_doc` prose field, so the old grep
+        # warned on every healthy Windows install. Reported by A>>.
+        #
+        # grip-setup.py --check exits 0 clean, 1 with real issues, 2 on a
+        # read/parse error. Only 1 is a warning here: a 2 means the checker
+        # could not answer, which must not be reported as a clean bill.
+        if [[ -f "$CLAUDE_DIR/settings.json" ]]; then
+            local settings_report settings_rc
+            settings_report="$(python3 "$CLAUDE_DIR/scripts/grip-setup.py" \
+                --check --platform windows \
+                --file "$CLAUDE_DIR/settings.json" 2>&1)"
+            settings_rc=$?
+            if [[ $settings_rc -eq 1 ]]; then
+                echo -e "${YELLOW}WARNING${NC}"
+                echo "  settings.json has hook paths that will not expand on Windows"
+                echo "$settings_report" | sed 's/^/  /'
+                echo "  Fix them with: python3 scripts/grip-setup.py --fix"
+                warnings=$((warnings + 1))
+                win_issues=1
+            elif [[ $settings_rc -ne 0 ]]; then
+                echo -e "${YELLOW}WARNING${NC}"
+                echo "  Could not check settings.json hook paths (exit $settings_rc)"
+                echo "$settings_report" | sed 's/^/  /'
+                warnings=$((warnings + 1))
+                win_issues=1
+            fi
+        fi
+
+        if [[ $win_issues -eq 0 ]]; then
+            echo -e "${GREEN}OK${NC}"
+        fi
+    fi
+
+    # Check 10: Pro-parity triad (tier / HAL peer / channels) — #2147 D3.
+    # Advisory: adds to the warnings tally but never to errors. `|| true` guards the
+    # bash arithmetic-zero exit-1 gotcha when the added count is 0.
+    _doctor_tier_block
+    ((warnings += $?)) || true
+
+    # Summary
+    echo ""
+    echo "─────────────────────────────────────"
+    if [[ $errors -eq 0 ]] && [[ $warnings -eq 0 ]]; then
+        echo -e "${GREEN}✓ Installation healthy${NC}"
+        return 0
+    elif [[ $errors -eq 0 ]]; then
+        echo -e "${YELLOW}⚠ $warnings warning(s)${NC}"
+        return 0
+    else
+        echo -e "${RED}✗ $errors error(s), $warnings warning(s)${NC}"
+        echo ""
+        echo "Run 'grip repair' to fix issues"
+        return 1
+    fi
+}
+
+# ============================================================================
+# REPAIR COMMAND - Fix disconnected setups
+# ============================================================================
+
+cmd_repair() {
+    local source_dir=""
+    local mode=""
+    local fix_permissions=false
+    local sync_only=false
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --source)
+                source_dir="$2"
+                shift 2
+                ;;
+            --mode)
+                mode="$2"
+                shift 2
+                ;;
+            --fix-permissions)
+                fix_permissions=true
+                shift
+                ;;
+            --sync)
+                sync_only=true
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    echo ""
+    echo "GRIP Repair"
+    echo "==========="
+    echo ""
+
+    # Handle --fix-permissions only
+    if [[ "$fix_permissions" == "true" ]]; then
+        echo "Fixing hook permissions..."
+        chmod +x "$CLAUDE_DIR/hooks/"*.sh 2>/dev/null || true
+        chmod +r "$CLAUDE_DIR/hooks/"*.py 2>/dev/null || true
+        chmod +x "$CLAUDE_DIR/bin/"* 2>/dev/null || true
+        chmod +x "$CLAUDE_DIR/scripts/"*.sh 2>/dev/null || true
+        echo -e "${GREEN}✓ Permissions fixed${NC}"
+        return 0
+    fi
+
+    # Handle --sync only (for copy mode drift)
+    if [[ "$sync_only" == "true" ]]; then
+        if [[ -f "$CLAUDE_DIR/.grip-copy-source" ]]; then
+            source_dir=$(cat "$CLAUDE_DIR/.grip-copy-source")
+            if [[ -d "$source_dir" ]]; then
+                echo "Syncing from source: $source_dir"
+                # From the SOURCE tree: "$CLAUDE_DIR/lib" is one of the
+                # directories this loop may be about to overwrite.
+                source "$source_dir/lib/replace-guard.sh"
+                if ! grip_link_roots_are_sane "$source_dir" "$CLAUDE_DIR"; then
+                    log_error "Refusing to sync: unsafe source ($source_dir) or target ($CLAUDE_DIR) root"
+                    return 1
+                fi
+
+                # Re-copy core files
+                local core_dirs=("lib" "skills" "hooks" "rules" "docs" "agents" "commands" "bin" "scripts")
+                for dir in "${core_dirs[@]}"; do
+                    if [[ -d "$source_dir/$dir" ]]; then
+                        # Empty-but-existing source satisfies -d; --delete would
+                        # then empty the installed dir in the SHARED tree that
+                        # launchd agents execute from.
+                        if ! grip_source_outweighs_target "$source_dir/$dir" "$CLAUDE_DIR/$dir"; then
+                            echo "  skipped $dir/ (source ${GRIP_REPLACE_SRC_N} file(s) vs ${GRIP_REPLACE_TGT_N} installed - refusing to --delete)" >&2
+                            continue
+                        fi
+                        rsync -av --delete "$source_dir/$dir/" "$CLAUDE_DIR/$dir/" >/dev/null 2>&1 || \
+                            cp -r "$source_dir/$dir/"* "$CLAUDE_DIR/$dir/" 2>/dev/null
+                    fi
+                done
+
+                # Copy core files
+                for file in "CLAUDE.md" "LICENSE" "README.md"; do
+                    if [[ -f "$source_dir/$file" ]]; then
+                        cp "$source_dir/$file" "$CLAUDE_DIR/$file"
+                    fi
+                done
+
+                echo -e "${GREEN}✓ Sync complete${NC}"
+                return 0
+            else
+                log_error "Source directory not found: $source_dir"
+                return 1
+            fi
+        else
+            log_error "Not in copy mode. Use --source to specify a GRIP repo."
+            return 1
+        fi
+    fi
+
+    # Auto-detect source if not provided
+    if [[ -z "$source_dir" ]]; then
+        echo "Searching for GRIP repositories..."
+        local search_paths=(
+            "$HOME/Projects/grip"
+            "$HOME/projects/grip"
+            "$HOME/Code/grip"
+            "$HOME/code/grip"
+            "$HOME/Developer/grip"
+            "$HOME/dev/grip"
+            "$HOME/src/grip"
+            "$HOME/grip"
+            "$HOME/Github/grip"
+            "$HOME/github/grip"
+        )
+
+        local found_repos=()
+        for path in "${search_paths[@]}"; do
+            if [[ -d "$path" ]] && [[ -f "$path/CLAUDE.md" ]] && grep -q "GRIP" "$path/CLAUDE.md" 2>/dev/null; then
+                found_repos+=("$path")
+            fi
+        done
+
+        if [[ ${#found_repos[@]} -eq 0 ]]; then
+            log_error "No GRIP repositories found."
+            echo ""
+            echo "Please specify the source directory:"
+            echo "  grip repair --source /path/to/grip"
+            return 1
+        elif [[ ${#found_repos[@]} -eq 1 ]]; then
+            source_dir="${found_repos[0]}"
+            echo "Found GRIP repo: $source_dir"
+        else
+            echo "Multiple GRIP repos found:"
+            local i=1
+            for repo in "${found_repos[@]}"; do
+                echo "  $i) $repo"
+                i=$((i + 1))
+            done
+            echo ""
+            read -rp "Select repo [1]: " choice
+            choice="${choice:-1}"
+            source_dir="${found_repos[$((choice-1))]}"
+        fi
+    fi
+
+    # Validate source
+    if [[ ! -d "$source_dir" ]]; then
+        log_error "Source directory not found: $source_dir"
+        return 1
+    fi
+
+    if [[ ! -f "$source_dir/CLAUDE.md" ]] || ! grep -q "GRIP" "$source_dir/CLAUDE.md" 2>/dev/null; then
+        log_error "Not a valid GRIP repository: $source_dir"
+        return 1
+    fi
+
+    echo "Source: $source_dir"
+
+    # Sourced from the SOURCE tree, never from "$CLAUDE_DIR": the target's lib/
+    # is one of the directories the loops below may be about to replace, so
+    # reading the check out of it would make the check depend on the very thing
+    # it is checking.
+    source "$source_dir/lib/replace-guard.sh"
+
+    # The loops below build "$source_dir/$dir" -> "$CLAUDE_DIR/$dir". With either
+    # root empty or "/", that names /bin and /lib: `ln -sfn /bin /bin` replaced
+    # the system /bin with a self-loop on 2026-10-10 and every exec hit ELOOP.
+    # Checked before the backup so a refused repair touches nothing.
+    if ! grip_link_roots_are_sane "$source_dir" "$CLAUDE_DIR"; then
+        log_error "Refusing to repair: unsafe source ($source_dir) or target ($CLAUDE_DIR) root"
+        return 1
+    fi
+
+    # Determine mode if not specified
+    if [[ -z "$mode" ]]; then
+        # Check platform for default
+        if [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "cygwin" ]] || [[ "$OSTYPE" == "win32" ]]; then
+            # Test symlink availability on Windows
+            local test_dir="${TMPDIR:-/tmp}/grip_symlink_test_$$"
+            mkdir -p "$test_dir"
+            if ln -s "$test_dir" "${test_dir}_link" 2>/dev/null; then
+                rm -rf "${test_dir}_link"
+                mode="symlink"
+            else
+                mode="copy"
+                echo "Note: Symlinks not available, using copy mode"
+            fi
+            rm -rf "$test_dir"
+        else
+            mode="symlink"
+        fi
+
+        echo "Mode: $mode (use --mode copy|symlink to override)"
+    fi
+
+    # Backup user files
+    echo ""
+    echo "Backing up user files..."
+    local backup_dir="${TMPDIR:-/tmp}/grip-repair-backup-$$"
+    mkdir -p "$backup_dir"
+
+    local user_files=("facts/identity.md" "facts/team.md" "facts/people.md" ".env" ".onboarded")
+    for file in "${user_files[@]}"; do
+        if [[ -f "$CLAUDE_DIR/$file" ]]; then
+            local dir
+            dir=$(dirname "$backup_dir/$file")
+            mkdir -p "$dir"
+            cp "$CLAUDE_DIR/$file" "$backup_dir/$file"
+            echo "  Backed up: $file"
+        fi
+    done
+
+    # Create symlinks or copy files
+    echo ""
+    if [[ "$mode" == "symlink" ]]; then
+        echo "Creating symlinks..."
+
+        local core_dirs=("lib" "skills" "hooks" "rules" "docs" "agents" "commands" "bin" "scripts" "config")
+        for dir in "${core_dirs[@]}"; do
+            if [[ -d "$source_dir/$dir" ]]; then
+                # Remove existing (but not if it's already correct symlink)
+                if [[ -e "$CLAUDE_DIR/$dir" ]] && [[ ! -L "$CLAUDE_DIR/$dir" ]]; then
+                    # A real installed directory is about to be deleted and replaced
+                    # by a link into $source_dir. The `-d "$source_dir/$dir"` test
+                    # above is satisfied by an EMPTY directory, so without this the
+                    # link would point at nothing and the content would be gone.
+                    if ! grip_source_outweighs_target "$source_dir/$dir" "$CLAUDE_DIR/$dir"; then
+                        echo "  Skipped: $dir/ (source has ${GRIP_REPLACE_SRC_N} file(s) vs ${GRIP_REPLACE_TGT_N} installed - refusing to rm -rf)"
+                        continue
+                    fi
+                    rm -rf "$CLAUDE_DIR/$dir"
+                fi
+                ln -sfn "$source_dir/$dir" "$CLAUDE_DIR/$dir"
+                echo "  Linked: $dir/"
+            fi
+        done
+
+        # Symlink core files
+        for file in "CLAUDE.md" "LICENSE" "README.md"; do
+            if [[ -f "$source_dir/$file" ]]; then
+                ln -sf "$source_dir/$file" "$CLAUDE_DIR/$file"
+                echo "  Linked: $file"
+            fi
+        done
+
+        # Create marker
+        echo "$source_dir" > "$CLAUDE_DIR/.grip-symlinked"
+        rm -f "$CLAUDE_DIR/.grip-copy-source"
+
+    else
+        echo "Copying files..."
+
+        local core_dirs=("lib" "skills" "hooks" "rules" "docs" "agents" "commands" "bin" "scripts" "config")
+        for dir in "${core_dirs[@]}"; do
+            if [[ -d "$source_dir/$dir" ]]; then
+                # Worst of the three shapes: the installed directory is destroyed
+                # outright and replaced with whatever little the source held.
+                if ! grip_source_outweighs_target "$source_dir/$dir" "$CLAUDE_DIR/$dir"; then
+                    echo "  Skipped: $dir/ (source has ${GRIP_REPLACE_SRC_N} file(s) vs ${GRIP_REPLACE_TGT_N} installed - refusing to rm -rf)"
+                    continue
+                fi
+                rm -rf "$CLAUDE_DIR/$dir"
+                cp -r "$source_dir/$dir" "$CLAUDE_DIR/$dir"
+                echo "  Copied: $dir/"
+            fi
+        done
+
+        # Copy core files
+        for file in "CLAUDE.md" "LICENSE" "README.md"; do
+            if [[ -f "$source_dir/$file" ]]; then
+                cp "$source_dir/$file" "$CLAUDE_DIR/$file"
+                echo "  Copied: $file"
+            fi
+        done
+
+        # Create marker
+        echo "$source_dir" > "$CLAUDE_DIR/.grip-copy-source"
+        rm -f "$CLAUDE_DIR/.grip-symlinked"
+    fi
+
+    # Restore user files
+    echo ""
+    echo "Restoring user files..."
+    for file in "${user_files[@]}"; do
+        if [[ -f "$backup_dir/$file" ]]; then
+            local dir
+            dir=$(dirname "$CLAUDE_DIR/$file")
+            mkdir -p "$dir"
+            cp "$backup_dir/$file" "$CLAUDE_DIR/$file"
+            echo "  Restored: $file"
+        fi
+    done
+
+    # Ensure runtime directories exist
+    local runtime_dirs=("projects" "plans" "todos" "file-history" "session-env" "cache" "contexts" "debug")
+    for dir in "${runtime_dirs[@]}"; do
+        mkdir -p "$CLAUDE_DIR/$dir"
+    done
+
+    # Fix permissions
+    chmod +x "$CLAUDE_DIR/hooks/"*.sh 2>/dev/null || true
+    chmod +x "$CLAUDE_DIR/bin/"* 2>/dev/null || true
+    chmod +x "$CLAUDE_DIR/scripts/"*.sh 2>/dev/null || true
+
+    # Cleanup
+    rm -rf "$backup_dir"
+
+    echo ""
+    echo -e "${GREEN}✓ Repair complete${NC}"
+    echo ""
+
+    # Verify
+    echo "Verifying installation..."
+    cmd_doctor
+}
+
+cmd_tree() {
+    # Display tree structure of GRIP instances
+    log_info "GRIP tree for current project..."
+
+    python3 -c "
+import sys
+sys.path.insert(0, '$LIB_DIR')
+from grip_complete import load_complete_grip, visualize_tree
+from pathlib import Path
+
+project_path = Path.cwd()
+complete = load_complete_grip(project_path)
+
+if complete.get_instance_count() == 0:
+    print('No GRIP instances found for this project.')
+    sys.exit(0)
+
+print(visualize_tree(complete))
+print('')
+summary = complete.get_summary()
+print(f'Total memories: {summary[\"memory_count\"]}')
+print(f'Total achievements: {len(complete.get_achievements())}')
+"
+}
+
+cmd_auto() {
+    # Universal auto-detection command
+    # The part IS the whole - same interface at any scale
+
+    # 1. Check if first run (needs onboarding)
+    if type is_first_run &>/dev/null && is_first_run; then
+        log_info "First run detected - starting onboarding..."
+        if [[ -x "$LIB_DIR/onboarding-wizard.sh" ]]; then
+            exec "$LIB_DIR/onboarding-wizard.sh"
+        fi
+    fi
+
+    # 2. Start fresh session with context
+    local project_encoded
+    project_encoded=$(encode_project_path)
+    local grip_dir="$HOME/.claude/projects/$project_encoded/grip"
+
+    if [[ -d "$grip_dir" ]] && [[ -f "$grip_dir/index.json" ]]; then
+        local budget="${1:-2000}"
+        log_info "GRIP sessions found - starting fresh session..."
+        cmd_fresh "latest" "$budget"
+    else
+        log_info "No GRIP sessions - mining available context..."
+        local budget="${1:-2000}"
+        cmd_fresh "latest" "$budget"
+    fi
+}
+
+cmd_init() {
+    # Initialize GRIP for current project
+    log_info "Initializing GRIP for current project..."
+
+    # Create project .claude directory
+    mkdir -p .claude
+
+    # Create basic CLAUDE.md if it doesn't exist
+    if [[ ! -f ".claude/CLAUDE.md" ]]; then
+        cat > ".claude/CLAUDE.md" <<'INIT_EOF'
+; Project-specific GRIP configuration
+; Created by grip init
+
+; Identity check on session start
+session.start⟿ identity.check ⫶ load(instance.next_up)
+identity.unclear⟿ AskUserQuestion("Who am I speaking with?")
+identity.options⟿ V>>(Laurie) | A>>(Andre) | K>>(Arnold)
+
+; Add project-specific rules below
+
+INIT_EOF
+        log_info "Created .claude/CLAUDE.md"
+    fi
+
+    # Session state stored in instance JSON next_up field (no flat file needed)
+
+    # Configure hooks
+    if [[ -f "$LIB_DIR/hooks_configurator.py" ]]; then
+        if ! python3 "$LIB_DIR/hooks_configurator.py" configure; then
+            log_error "Canonical hook configuration failed; GRIP was not fully initialized"
+            return 1
+        fi
+    else
+        log_error "Canonical hook configurator missing: $LIB_DIR/hooks_configurator.py"
+        return 1
+    fi
+
+    log_info "GRIP initialized for $(basename "$(pwd)")"
+}
+
+cmd_help() {
+    cat <<'EOF'
+GRIP CLI - Claude Instance Preservation System v4.1 (Universal Command)
+
+USAGE:
+    grip [command] [options]
+    grip                        Start session (auto-detect, warm start)
+    grip --cold [command]       Start without KONO preload (cold start)
+    grip --warm [command]       Explicit warm start (default)
+    grip --flow [options]       Start with flow mode (bypass permissions)
+    grip -F [options]           Short alias for --flow
+
+COMMANDS:
+    (no command)           Auto-detect mode: onboard, resume, or fresh
+    init                   Initialize GRIP for current project
+    resume <ref>           Resume session via claude --resume
+    fresh <ref> [tokens]   Start fresh session with compressed context
+    list [limit]           List available sessions for current project
+    branches               List all branches for current project
+    status                 Show currently active sessions
+    merge <refs...>        Merge branches into one (polymorphic)
+    tree                   View tree structure of all instances
+    bounce                 Cyclical reset (Big Bounce pattern)
+    channels [--probe-only|--accept enabled|disabled|ask]
+                           Configure inbound channel relay (WhatsApp/Slack/
+                           Discord/Web). Wizard-mediated; persists to
+                           state/grip-channels-config.json. Trades HITL tools
+                           (AskUserQuestion / Plan Mode) for inbound relay.
+    flow [--explain|--enable|--disable|--status]  Manage flow mode
+    broly [cmd] [args]     Recursive meta-agent (status/execute/assess)
+    install-aliases [opts] Install GRIP shell aliases (gg++, gg, ggr, etc.)
+                             --dry-run   Preview aliases without writing
+                             --force     Skip confirmation prompt
+    doctor                 Diagnose installation health
+    repair [--source PATH] Fix disconnected installations
+
+REFERENCE TYPES:
+    latest                 Most recent session for current project
+    gen:N                  GRIP generation number (e.g., gen:5)
+    branch:<name>          Specific branch (e.g., branch:alpha)
+    <instance-id>          GRIP instance ID prefix (e.g., 14d5f954)
+    <session-uuid>         Full session UUID
+
+BRANCHING (Parallel Sessions):
+    When multiple Claude sessions run in the same project:
+    - Each session gets its own branch (alpha, bravo, charlie...)
+    - main branch is reserved for single-session workflows
+    - Use 'grip branches' to see all branches
+    - Use 'grip status' to see active sessions
+
+MERGING:
+    Combine multiple branches into one.
+
+    Merge branches: grip merge alpha bravo --into main
+    Preview merge:  grip merge alpha bravo --dry-run
+
+EXAMPLES:
+    grip resume latest             # Resume last session (prefers main branch)
+    grip resume gen:5              # Resume generation 5
+    grip resume branch:alpha       # Resume from alpha branch
+    grip fresh gen:5 2000          # Fresh session with 2k tokens of context
+    grip list 10                   # List last 10 sessions
+    grip branches                  # Show all branches
+    grip status                    # Show active sessions
+    grip merge alpha bravo         # Merge alpha and bravo into main
+    grip tree                      # Show tree structure
+    grip bounce                    # Cyclical reset preserving patterns
+    grip doctor                    # Check installation health
+    grip repair                    # Fix disconnected installation
+
+DOCTOR (Installation Diagnostics):
+    Checks installation health:
+    - Core directories and files present
+    - Installation mode (clone/symlink/copy/unknown)
+    - Source directory validity
+    - Symlink integrity or copy drift
+    - Hook permissions
+    - Windows compatibility
+
+    If mode is "unknown", searches common paths for GRIP repos
+    and suggests repair command.
+
+REPAIR (Fix Disconnected Setups):
+    Fixes disconnected installations where:
+    - GRIP was cloned to ~/Projects/grip but ~/.claude is separate
+    - git pull updates repo but not ~/.claude
+
+    Options:
+    --source PATH      Specify GRIP repo location (auto-detected if omitted)
+    --mode symlink|copy  Force installation mode (auto-detected)
+    --fix-permissions  Fix hook/script permissions only
+    --sync             Sync copy-mode installation with source
+
+BOUNCE (Big Bounce Pattern):
+    Creator's Paradox: Your install accumulates cruft while fresh installs
+    benefit from distilled wisdom. Bounce gives you a fresh install.
+
+    - Preserves: skills, agents, commands, rules, facts, lib, bin
+    - Discards: cache, metrics, old session logs
+    - Backup: ~/.claude.pre-bounce (rollback if needed)
+
+TOKEN BUDGETS:
+    500     Ultra-light (quick context reminder)
+    2000    Standard (balanced, default)
+    5000    Extended (detailed context for complex tasks)
+
+FLOW MODE (Trust-Based Bypass Permissions):
+    Flow mode lets GRIP work without permission prompts. It's earned, not granted.
+
+    Trust flow:
+    1. Complete onboarding (run: grip)
+    2. Understand: grip flow --explain
+    3. Enable: grip flow --enable
+    4. Use: grip --flow or grip -F
+
+    Commands:
+    grip flow --explain     What flow mode does
+    grip flow --enable      Enable flow mode (requires onboarding)
+    grip flow --disable     Disable flow mode
+    grip flow --status      Check flow mode status
+EOF
+}
+
+# ============================================================================
+# ALIAS INSTALLATION
+# ============================================================================
+
+GRIP_ALIAS_MARKER_START="# GRIP Aliases - managed by grip install-aliases"
+GRIP_ALIAS_MARKER_END="# END GRIP Aliases"
+
+cmd_install_aliases() {
+    local dry_run=false
+    local force=false
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run) dry_run=true ;;
+            --force) force=true ;;
+            *) log_error "Unknown option: $1. Usage: grip install-aliases [--dry-run] [--force]"; return 1 ;;
+        esac
+        shift
+    done
+
+    local shell_rc=""
+
+    # Detect shell config file
+    if [[ -n "${ZSH_VERSION:-}" ]] || [[ "$SHELL" == */zsh ]]; then
+        shell_rc="$HOME/.zshrc"
+    elif [[ -n "${BASH_VERSION:-}" ]] || [[ "$SHELL" == */bash ]]; then
+        shell_rc="$HOME/.bashrc"
+    else
+        shell_rc="$HOME/.zshrc"
+    fi
+
+    if [[ ! -f "$shell_rc" ]]; then
+        log_error "Shell config not found: $shell_rc"
+        return 1
+    fi
+
+    # Migration warning: detect deprecated aliases
+    local old_found=false
+    local old_aliases=""
+    for old_alias in "cc=" "cc++=" "ut++=" "ccr=" "ccl=" "ccp=" "ccpo="; do
+        if grep -qE "alias\s+['\"]?${old_alias}" "$shell_rc" 2>/dev/null; then
+            old_found=true
+            old_aliases="${old_aliases}  - ${old_alias%=}\n"
+        fi
+    done
+
+    if $old_found; then
+        echo "[GRIP] Migration notice: Found deprecated aliases in $shell_rc:"
+        printf "%b" "$old_aliases"
+        echo ""
+        echo "Old -> New mapping:"
+        echo "  cc      -> gg       (quick, 2k context)"
+        echo "  cc++    -> gg+      (deep, 8k context)"
+        echo "  ut++    -> gg++     (max, 12k context)"
+        echo "  ccr     -> ggr      (resume)"
+        echo "  ccl     -> ggl      (list)"
+        echo "  ccp     -> ggp      (pair steer)"
+        echo "  ccpo    -> ggpo     (pair observe)"
+        echo ""
+        echo "Remove deprecated aliases manually after installing new ones."
+        echo ""
+    fi
+
+    local timestamp
+    timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    local alias_block
+    alias_block="$GRIP_ALIAS_MARKER_START
+# Installed: $timestamp
+
+# The gg family routes through the gogrip shell FUNCTION, never straight at
+# \`grip\`, so \`gg++ codex\` and \`gg++ --kimi\` work. A bare alias to
+# \`grip fresh latest 12000\` appends the harness name as a fifth argument,
+# where cmd_fresh reads only \$1 and \$2 and silently discards it -- the
+# operator asks for codex and gets Claude Code with no feedback at all.
+# This source line and the gg++ alias below are byte-identical to the ones
+# scripts/install.sh writes; tests/test_alias_emitters_agree.py pins that.
+source \"\$HOME/.claude/lib/shell-functions.sh\"
+
+# gg++ - Start GRIP session (max context, 12k reasoning)
+# The ONE command. Progressive: gg < gg+ < gg++
+alias gg++=\"gogrip\"
+
+# gg - Quick GRIP session (2k context)
+alias gg='gogrip 2000'
+
+# gg+ - Deep GRIP session (8k context)
+alias 'gg+'='gogrip 8000'
+
+# ggr - Resume last session
+alias ggr='grip resume latest'
+
+# ggl - List sessions
+alias ggl='grip list'
+
+$GRIP_ALIAS_MARKER_END"
+
+    # Dry run: preview alias block and exit
+    if $dry_run; then
+        echo "[GRIP] Dry run - alias block that would be written to $shell_rc:"
+        echo ""
+        echo "$alias_block"
+        return 0
+    fi
+
+    # Opt-in prompt (skip with --force)
+    if ! $force; then
+        echo "[GRIP] The following aliases will be added to $shell_rc:"
+        echo ""
+        echo "  gg++    -> grip fresh latest 12000 (max context)"
+        echo "  gg      -> grip fresh latest 2000 (quick)"
+        echo "  gg+     -> grip fresh latest 8000 (deep)"
+        echo "  ggr     -> grip resume latest"
+        echo "  ggl     -> grip list"
+        echo ""
+        read -rp "Install aliases? [y/N] " confirm
+        if [[ "$confirm" != [yY] ]]; then
+            echo "[GRIP] Cancelled. Use --dry-run to preview."
+            return 0
+        fi
+    fi
+
+    # Check if aliases already exist
+    if grep -q "$GRIP_ALIAS_MARKER_START" "$shell_rc" 2>/dev/null; then
+        if $force; then
+            # Remove existing block and replace
+            local tmp_rc="${shell_rc}.grip-tmp"
+            awk "/$GRIP_ALIAS_MARKER_START/{skip=1} /$GRIP_ALIAS_MARKER_END/{skip=0; next} !skip" "$shell_rc" > "$tmp_rc"
+            mv "$tmp_rc" "$shell_rc"
+            echo "" >> "$shell_rc"
+            echo "$alias_block" >> "$shell_rc"
+            echo "[GRIP] Aliases updated in $shell_rc"
+        else
+            echo "[GRIP] Aliases already installed in $shell_rc"
+            echo "       Use --force to update."
+            return 0
+        fi
+    else
+        # Append new block
+        echo "" >> "$shell_rc"
+        echo "$alias_block" >> "$shell_rc"
+        echo "[GRIP] Aliases installed in $shell_rc"
+    fi
+
+    echo ""
+    echo "Available aliases:"
+    echo "  gg++      -> grip fresh latest 12000 (max context)"
+    echo "  gg        -> grip fresh latest 2000 (quick)"
+    echo "  gg+       -> grip fresh latest 8000 (deep)"
+    echo "  ggr       -> grip resume latest"
+    echo "  ggl       -> grip list"
+    echo ""
+    echo "Restart your shell or run: source $shell_rc"
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+main() {
+    # Harness picker fast-path (#2212): extract `--harness <name>` from anywhere
+    # in argv and stash it in GRIP_HARNESS_FLAG, BEFORE $command is derived (so a
+    # leading --harness never becomes the command). The rest of argv is rebuilt
+    # without it, so cmd_fresh's flag-rejection never sees it. A bare trailing
+    # --harness (no value) is left in place for cmd_fresh to reject loudly.
+    local _kept=()
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "--harness" && $# -ge 2 ]]; then
+            GRIP_HARNESS_FLAG="$2"; shift 2
+        else
+            _kept+=("$1"); shift
+        fi
+    done
+    set -- ${_kept[@]+"${_kept[@]}"}
+
+    local command="${1:-auto}"
+
+    # Handle version/help BEFORE bootstrap check
+    case "$command" in
+        --version|-v|version)
+            cmd_version
+            exit 0
+            ;;
+        --cold)
+            GRIP_WARM=0
+            shift
+            command="${1:-auto}"
+            ;;
+        --warm)
+            GRIP_WARM=1
+            shift
+            command="${1:-auto}"
+            ;;
+        help|--help|-h)
+            cmd_help
+            exit 0
+            ;;
+        # Flow mode: trust-based bypass permissions
+        --flow|-F)
+            ensure_claude_code
+            if ! type check_flow_mode &>/dev/null; then
+                log_error "Flow mode not available. Update GRIP: brew upgrade grip"
+                exit 1
+            fi
+            if ! check_flow_mode; then
+                exit 1
+            fi
+            shift
+            _grip_launch_card
+            grip_handoff $(_grip_permission_flag) "$@"
+            ;;
+    esac
+
+    # Ensure Claude Code is installed before proceeding
+    ensure_claude_code
+
+    # Show GRIP splash for session-launching commands
+    case "$command" in
+        auto|""|fresh|f|resume|r|onboard)
+            _grip_launch_card
+            ;;
+    esac
+
+    # Bootstrap check for all other commands
+    cmd_bootstrap_check "$command"
+
+    # Harness picker (#2212): for a bare launch / fresh, resolve which harness to
+    # open. Claude → falls through to the normal flow below; any other installed
+    # harness → execs it here (this process is replaced, never reaching dispatch).
+    # Self-guards to session-launch commands + only-Claude / non-TTY no-prompt.
+    _resolve_harness_launch "$command"
+
+    shift || true
+
+    case "$command" in
+        auto|"")
+            # Universal auto-detection - the default
+            cmd_auto "$@"
+            ;;
+        bootstrap)
+            cmd_bootstrap_full
+            ;;
+        upgrade)
+            cmd_bootstrap_partial
+            ;;
+        onboard)
+            cmd_onboard
+            ;;
+        init|i)
+            cmd_init "$@"
+            ;;
+        resume|r)
+            cmd_resume "$@"
+            ;;
+        fresh|f)
+            cmd_fresh "$@"
+            ;;
+        list|ls|l)
+            cmd_list "$@"
+            ;;
+        branches|br)
+            cmd_branches
+            ;;
+        status|st)
+            cmd_status
+            ;;
+        merge|m)
+            cmd_merge "$@"
+            ;;
+        tree|t)
+            cmd_tree
+            ;;
+        bounce|b)
+            cmd_bounce "$@"
+            ;;
+        doctor|doc|d)
+            cmd_doctor "$@"
+            ;;
+        repair|fix)
+            cmd_repair "$@"
+            ;;
+        install-aliases|aliases)
+            cmd_install_aliases "$@"
+            ;;
+        flow)
+            # Trust-based bypass permissions management
+            if type flow_command &>/dev/null; then
+                flow_command "$@"
+            else
+                log_error "Flow mode not available. Update GRIP: brew upgrade grip"
+                exit 1
+            fi
+            ;;
+        channels)
+            # Channels wizard — always re-runs, regardless of persisted state.
+            local wizard_py
+            wizard_py="$(_grip_channels_wizard_path)" || {
+                log_error "channels wizard not found"
+                exit 1
+            }
+            exec python3 "$wizard_py" "$@"
+            ;;
+        session)
+            # Session-isolation wizard — configure shared-main vs worktree.
+            # Always re-runs (interactive), regardless of persisted state.
+            local session_wizard_py
+            session_wizard_py="$(_grip_session_wizard_path)" || {
+                log_error "session wizard not found"
+                exit 1
+            }
+            exec python3 "$session_wizard_py" "$@"
+            ;;
+        register)
+            # Internal: used by hooks
+            cmd_register
+            ;;
+        deregister)
+            # Internal: used by hooks
+            cmd_deregister
+            ;;
+        broly)
+            # Broly recursive meta-agent
+            local broly_cmd="${1:-status}"
+            shift || true
+            if [[ "$broly_cmd" == "status" ]]; then
+                python3 "$LIB_DIR/broly/orchestrator.py" status
+            elif [[ "$broly_cmd" == "execute" ]]; then
+                python3 "$LIB_DIR/broly/orchestrator.py" execute "$@"
+            elif [[ "$broly_cmd" == "assess" ]]; then
+                python3 "$LIB_DIR/broly/orchestrator.py" assess "$@"
+            else
+                # Treat as power level + task
+                python3 "$LIB_DIR/broly/orchestrator.py" execute "$broly_cmd $*" --level auto
+            fi
+            ;;
+        *)
+            # If first arg is numeric, treat as token count for auto
+            if [[ "$command" =~ ^[0-9]+$ ]]; then
+                cmd_auto "$command" "$@"
+            else
+                log_error "Unknown command: $command"
+                cmd_help
+                exit 1
+            fi
+            ;;
+    esac
+}
+
+# Allow test harnesses to source this file (defining its functions) without
+# executing main(). The sentinel — added with the -r/--resume routing fix —
+# is also the entry point that tests/test_grip_fresh_resume_routing.sh
+# depends on to mock cmd_resume / grip_handoff before invoking cmd_fresh.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

@@ -1,0 +1,149 @@
+name: synthesis
+description: Knowledge synthesis, conceptual bridging, pattern extraction across sources
+version: 1.0.0
+effort: high
+triggers:
+- /mode synthesis
+- synthesize
+- connect ideas
+- pattern extraction
+- conceptual bridging
+- cross-domain
+- thematic analysis
+skills:
+  always:
+  - research-synthesis
+  - reasoning-with-ai
+  optional:
+  - evidence-evaluation
+  - hypothesis-validation
+token_budget: ~3500
+foundation: true
+stacks_with:
+- ut++
+- asking-users
+- creating-wizards
+- hitl
+- context-gate
+prompt_injection: '[MODE: SYNTHESIS]
+
+
+  Knowledge synthesis protocols active. Cross-domain integration enabled.
+
+
+  Synthesis workflow:
+
+  1. INVENTORY - Catalogue all sources, claims, and domains
+
+  2. MAP - Create concept map showing relationships
+
+  3. BRIDGE - Identify connections across domains
+
+  4. PATTERN - Extract recurring themes and structures
+
+  5. INTEGRATE - Build unified framework from parts
+
+
+  Synthesis frameworks:
+
+  - Thematic analysis: Code sources → group themes → define → name → report
+
+  - Dialectical synthesis: Thesis + antithesis → synthesis (Hegelian)
+
+  - Conceptual bridging: Find structural isomorphisms across domains
+
+  - Pattern language: Name recurring solutions as composable patterns
+
+
+  Integration principles:
+
+  - Preserve source nuance (don''t flatten complexity)
+
+  - Name the tensions (contradictions are data, not errors)
+
+  - Build bridges with evidence (every connection needs support)
+
+  - Layer abstraction (concrete → pattern → principle → framework)
+
+
+  MANDATORY AskUserQuestion when:
+
+  - Sources contradict (which interpretation to prioritize?)
+
+  - Multiple valid frameworks could organize the material
+
+  - Bridge between domains requires assumption
+
+  - Synthesis scope could expand or narrow
+
+
+  Output format: Always provide the synthesis AND the reasoning
+
+  chain that produced it. Show your bridging logic.
+
+
+  ## Broly Auto-Activation
+
+
+  Broly is AUTO-ACTIVE in this mode at CLUSTER level.
+
+  No /broly command needed -- UNLESS the operator has set the trigger to manual (check with `mode-loader.sh broly status`), in which case fan out ONLY on an explicit /broly. Assess task complexity and invoke automatically.
+
+
+  Default: CLUSTER (Agent Team swarm, up to 7 agents)
+
+  Team pattern: swarm | Reasoning: graph-of-thought (got)
+
+
+  ### Escalation to PIPELINE
+
+  - Synthesis spans 5+ distinct knowledge domains
+
+  - Source material exceeds 50 pages equivalent
+
+  - Multiple competing frameworks need parallel evaluation
+
+
+  ### De-escalation to THREAD
+
+  - Connecting only 2 sources
+
+  - Simple pattern identification
+
+  - Quick thematic grouping
+
+
+  ### Budget
+
+  CLUSTER uses ~5x tokens. De-escalate to THREAD for simple tasks.
+
+  1M context recommended for large synthesis work.
+
+  AskUserQuestion if scope is unclear.
+
+  '
+wave:
+  category: wave_aligned
+  w_level: 2
+  phase: ascent
+broly:
+  enabled: true
+  default_level: cluster
+  team_pattern: swarm
+  reasoning_hint: got
+  escalation:
+    to: pipeline
+    signals:
+    - synthesis spans 5+ distinct knowledge domains
+    - source material exceeds 50 pages equivalent
+    - multiple competing frameworks need parallel evaluation
+  context:
+    recommended: 1000000
+    auto_extend: true
+context:
+- Cross-domain knowledge integration
+- Literature synthesis
+- Pattern extraction from multiple sources
+- Framework building
+- Conceptual bridging
+welcome_message: Synthesis mode active. Cross-domain integration and pattern extraction ready.

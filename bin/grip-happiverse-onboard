@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# grip-happiverse-onboard — run this ON a machine you want on the HAPPIverse.
+#
+#   bash ~/.claude/bin/grip-happiverse-onboard [--report-only] [--authorise-grip]
+#
+# THIN WRAPPER, deliberately. The real script is apps/happiverse-proof/onboard.sh,
+# which is also the file published at https://your-gateway.example.com/onboard.sh.
+# This used to be a SECOND COPY of it and had already drifted: it still enabled
+# only Tailscale SSH, offered no key route, and emitted the JSON that breaks when
+# a machine runs no mesh agents. Two copies of one script diverge, and the copy
+# that rots is always the one nobody runs.
+set -uo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+real="$here/apps/happiverse-proof/onboard.sh"
+[ -f "$real" ] || { echo "onboard.sh not found at $real" >&2; exit 2; }
+exec bash "$real" "$@"

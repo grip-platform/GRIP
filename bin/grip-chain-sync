@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# grip-chain-sync — keep GRIP's public decision chain current.
+#
+# Appends new origin/main commits to data/idr-public.jsonl (allowlisted to
+# {sha,subject,ts,prev_sha} by the emitter — never bodies/diffs/paths), verifies
+# the prev_sha chain, then mirrors the file to the public grip-decision-chain
+# repo. Idempotent + safe on any cadence (manual, /closeout, or a launchd timer):
+# a commit is never recorded twice and the push happens only when the file changed.
+#
+# Usage:  grip-chain-sync            # append + verify + mirror-if-changed
+#         grip-chain-sync --dry-run  # append + verify only; never touch the public repo
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+LEDGER="$CLAUDE_DIR/data/idr-public.jsonl"
+CLONE="${GRIP_CHAIN_CLONE:-$CLAUDE_DIR/state/grip-decision-chain}"
+REPO="${GRIP_CHAIN_REPO:-https://github.com/CodeTonight-SA/grip-decision-chain.git}"
+WINDOW_START="${GRIP_CHAIN_SINCE:-2026-06-09T19:30:00}"   # public chain genesis (fixed)
+source "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib/venv-utils.sh"
+# chain_push: pushes as the GitHub App when ~/.config/grip/chain-app/app.json
+# exists, and refuses rather than fall back to a personal credential. Without
+# that file it refuses too, unless GRIP_CHAIN_REQUIRE_APP=0 explicitly allows a
+# push with the stored credential.
+source "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib/chain-push.sh"
+# The venv is required (the emitter needs GRIP's deps). resolve_venv_python
+# falls back to system python, so accept its answer only from inside the venv;
+# the pre-flight check below turns an empty result into the exit-3 diagnostic.
+PY="$(resolve_venv_python "$CLAUDE_DIR/venv" || true)"
+[[ "$PY" == "$CLAUDE_DIR/venv/"* ]] || PY=""
+DRY_RUN=0
+[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+
+run_emitter() { PYTHONPATH="$CLAUDE_DIR:$CLAUDE_DIR/lib" "$PY" -m lib.idr_public_emitter "$@"; }
+
+# 0. Pre-flight: fail fast with a single-line diagnostic (exit 3) if a hard
+#    dependency is missing, rather than aborting mid-run on a raw traceback.
+command -v git >/dev/null 2>&1 || { echo "[grip-chain-sync] git not found on PATH" >&2; exit 3; }
+[ -x "$PY" ] || { echo "[grip-chain-sync] python venv not found in $CLAUDE_DIR/venv — looked for Scripts/python.exe, bin/python3, bin/python (run grip setup)" >&2; exit 3; }
+[ -f "$LEDGER" ] || { echo "[grip-chain-sync] ledger missing: $LEDGER" >&2; exit 3; }
+
+# 0b. Serialise concurrent runs (a launchd tick overlapping a manual run). mkdir is
+#     atomic on macOS + Linux — no flock dependency. A second run skips cleanly
+#     (exit 0) so the ledger append + cp + status are never interleaved by another
+#     sync, which is the only way a partial/torn file or false "nothing to publish"
+#     could reach the public clone.
+LOCK="${GRIP_CHAIN_LOCK:-${TMPDIR:-/tmp}/grip-chain-sync.lock}"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  echo "[grip-chain-sync] another sync holds $LOCK — skipping this run" >&2
+  exit 0
+fi
+trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+
+# 1. Append any new origin/main commits (idempotent by sha).
+run_emitter backfill --since "$WINDOW_START" >/dev/null
+
+# 1b. Remediate: re-redact EVERY free-text field with the CURRENT denylist before
+#     any publish. FAIL-CLOSED by construction — the emitter's remediate raises
+#     (non-zero) when the denylist is unusable (git-crypt-locked / ciphertext), so
+#     a dirty ledger can NEVER reach the public repo. This closes the hole behind
+#     the 2026-07-03 recurring public leak: this script `cp`-pushed the ledger with
+#     only the narrow path/key check-leak, so a fail-open shield (locked denylist)
+#     published operator/contact PII every cron tick. Idempotent — a clean ledger
+#     is the shield's fixed point (zero rows changed). Mirrors live_publish.
+if ! run_emitter remediate >/dev/null 2>&1; then
+  echo "[grip-chain-sync] remediation failed — denylist unusable (git-crypt locked?); NOT publishing" >&2
+  exit 2
+fi
+
+# 2. Verify the prev_sha chain before anything is published.
+if ! run_emitter verify >/dev/null; then
+  echo "[grip-chain-sync] chain BROKEN — refusing to publish" >&2
+  exit 1
+fi
+
+# 3. Leak backstop: an absolute path or private-key block in a commit subject must
+#    never reach the public surface (the 4-field allowlist already drops every
+#    other field). The check lives in ONE tested place — the emitter's
+#    subjects_with_leaks — surfaced as `check-leak`, which exits 2 on any hit and
+#    prints the offending subjects to stderr.
+if ! run_emitter check-leak >/dev/null; then
+  echo "[grip-chain-sync] leak marker in a commit subject — NOT publishing (see above)" >&2
+  exit 2
+fi
+
+# 3b. Withheld backstop: a withheld sha that names no row of the ledger (a typo,
+#     a branch commit that never reached main) withholds nothing, so the text it
+#     was meant to hide would publish. `check-withheld` exits 2 and prints the
+#     reason: the sha that names no row, or why the list itself is unusable.
+if ! run_emitter check-withheld >/dev/null; then
+  echo "[grip-chain-sync] withheld-list check failed — NOT publishing (reason above)" >&2
+  exit 2
+fi
+
+ROWS="$(wc -l < "$LEDGER" | tr -d ' ')"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "[grip-chain-sync] dry-run OK — $ROWS entries, chain verified, no publish"
+  exit 0
+fi
+
+# 4. Ensure the public clone exists, then make it a PRISTINE mirror of origin/main
+#    before writing. fetch+reset (no `|| true` masking) surfaces a real network or
+#    auth failure loudly via set -e; reset --hard guarantees no detached, dirty, or
+#    divergent state can carry a stale or conflicted file into the publish.
+if [ ! -d "$CLONE/.git" ]; then
+  git clone -q -- "$REPO" "$CLONE"
+fi
+git -C "$CLONE" fetch -q origin main
+git -C "$CLONE" reset -q --hard origin/main
+
+# 5. Mirror + push only when the file actually changed (now a true diff vs origin).
+cp -- "$LEDGER" "$CLONE/idr-public.jsonl"
+if [ -z "$(git -C "$CLONE" status --porcelain)" ]; then
+  echo "[grip-chain-sync] up to date — $ROWS entries, nothing to publish"
+  exit 0
+fi
+git -C "$CLONE" add idr-public.jsonl
+# The public commit names the publisher, never a person: author and committer
+# are set here, not taken from whatever git identity the machine carries.
+CHAIN_NAME="${GRIP_CHAIN_AUTHOR_NAME:-GRIP Chain Sync}"
+CHAIN_EMAIL="${GRIP_CHAIN_AUTHOR_EMAIL:-development@codetonight.co.za}"
+GIT_AUTHOR_NAME="$CHAIN_NAME" GIT_AUTHOR_EMAIL="$CHAIN_EMAIL" \
+  GIT_COMMITTER_NAME="$CHAIN_NAME" GIT_COMMITTER_EMAIL="$CHAIN_EMAIL" \
+  git -C "$CLONE" commit -q -m "chain: sync to $ROWS entries"
+if ! chain_push "$CLONE" "$PY"; then
+  # chain_push prints its own reason for a refusal, and git prints the remote's.
+  echo "[grip-chain-sync] push refused or failed — nothing published (reason above)" >&2
+  exit 1
+fi
+echo "[grip-chain-sync] published — $ROWS entries → $REPO"

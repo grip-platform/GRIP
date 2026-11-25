@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""grip-continuity-settle — one scheduled settlement pass over EVERY chain.
+
+Congruent Continuity's settlement worker (``lib/continuity_worker.py``) runs
+on demand and reads one chain file. Sessions namespace their chains
+(``state/precog/continuity-<4hex>.jsonl``, ``lib/context_head.py``), and the
+push recorder (``lib/continuity_recorder.py``) appends to whichever chain the
+pushing session owns, so a single-chain pass would leave every other
+session's premises unsettled forever. This wrapper enumerates the chain files
+and runs the deterministic floor over each one (``--no-council``: zero model
+cost, no network beyond the fetch below), then appends one JSON summary line
+to ``logs/continuity-settle.jsonl``.
+
+Before settling it refreshes ``origin/main`` in the probe repo (fail-open:
+an offline machine settles with the refs it has). The recorder's probe pins
+both SHAs at record time, so the refresh only matters for probes that name
+the moving ref; it is kept so the worker never settles against a ref older
+than the record it judges.
+
+Read-only toward the repo: the floor's probes are git READ subcommands under
+the allowlisted environment in ``lib/continuity_settle.py``. Nothing here
+gates, steers or blocks; a settlement pass is the post-hoc half of D3.
+
+    grip-continuity-settle            # settle every chain, floor only
+    grip-continuity-settle --dry-run  # classify and screen, write nothing
+    grip-continuity-settle --council  # also convene the exogenous council leg
+
+Installed by the launchd template ``config/launchd/com.grip.continuity-settle.plist.template``.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+GRIP_HOME = Path(os.environ.get("CLAUDE_DIR", Path.home() / ".claude"))
+if str(GRIP_HOME) not in sys.path:
+    sys.path.insert(0, str(GRIP_HOME))
+
+from lib.continuity_chain import _STATE  # noqa: E402
+from lib.continuity_council import sovereign_council_fn  # noqa: E402
+from lib.continuity_worker import run_pass  # noqa: E402
+
+LOG = GRIP_HOME / "logs" / "continuity-settle.jsonl"
+
+
+def chain_files(state: Path = _STATE) -> list[Path]:
+    """Every chain file, session-namespaced ones included; never a HEAD
+    pointer or a contamination log."""
+    return sorted(p for p in state.glob("continuity*.jsonl") if "contamination" not in p.name)
+
+
+def head_for(chain: Path) -> Path:
+    """``continuity.jsonl`` -> ``continuity-HEAD.txt``;
+    ``continuity-ab12.jsonl`` -> ``continuity-HEAD-ab12.txt``."""
+    suffix = chain.stem[len("continuity"):]  # "" or "-ab12"
+    return chain.with_name(f"continuity-HEAD{suffix}.txt")
+
+
+def contamination_for(chain: Path) -> Path:
+    """The contamination log that belongs to ``chain``, beside it and carrying
+    the same session suffix, so a chain's closures never land in another
+    session's log and a ``--state`` directory keeps every write inside itself."""
+    suffix = chain.stem[len("continuity"):]
+    return chain.with_name(f"continuity-contamination{suffix}.jsonl")
+
+
+def refresh_origin_main(repo: Path) -> str:
+    try:
+        proc = subprocess.run(["git", "-C", str(repo), "fetch", "-q", "origin", "main"],
+                              capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        return "fetched" if proc.returncode == 0 else f"fetch-failed:{proc.returncode}"
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"fetch-error:{type(exc).__name__}"
+
+
+_EMPTY = {"settled": 0, "verdicts": {}, "dry_run": 0, "left_for_council": 0, "unavailable": 0, "contamination": 0}
+
+
+def settle_one(chain: Path, *, repo: Path, council: bool, dry_run: bool, limit: int | None) -> dict:
+    """One chain's pass. A chain that cannot be read or settled (damaged file,
+    missing HEAD, probe environment failure) yields an ``error`` row instead of
+    an exception, so one bad chain never drops the whole daily summary line
+    (AGORA GRIP#5387, deferred concern C).
+
+    ``contamination_log=contamination_for(chain)`` below is REQUIRED, and the
+    failure if it is ever dropped is silent. Omitting it does not raise:
+    ``run_pass`` falls back to ``contamination_log_path(None)`` ->
+    ``_STATE / "continuity-contamination.jsonl"``, the LIVE state directory. A
+    ``--state`` run would then write its contamination rows outside the
+    directory it was handed, mixing one session's closures into another's log —
+    the isolation GRIP#5406 exists to provide. Pinned by
+    ``test_a_state_run_keeps_every_contamination_write_inside_it``."""
+    try:
+        report = run_pass(council_fn=sovereign_council_fn if council else None, path=chain,
+                          head_pointer=head_for(chain), cwd=repo, limit=limit, dry_run=dry_run,
+                          contamination_log=contamination_for(chain))
+    except Exception as exc:  # noqa: BLE001 — the summary must still be written
+        return {"chain": str(chain), "error": f"{type(exc).__name__}: {exc}"[:300], **_EMPTY}
+    verdicts = {}
+    for row in report["settled"]:
+        verdicts[row["verdict"]] = verdicts.get(row["verdict"], 0) + 1
+    return {"chain": str(chain), "settled": len(report["settled"]), "verdicts": verdicts,
+            "dry_run": len(report["dry_run"]), "left_for_council": len(report["left_for_council"]),
+            "unavailable": len(report["unavailable"]), "contamination": len(report["contamination"])}
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="grip-continuity-settle", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--repo", default=str(GRIP_HOME), help="probe working directory (default: the GRIP home)")
+    p.add_argument("--council", action="store_true", help="convene the exogenous council leg after the floor")
+    p.add_argument("--dry-run", action="store_true", help="execute no probe, write nothing")
+    p.add_argument("--limit", type=int, default=None, help="max commitments per chain")
+    p.add_argument("--no-fetch", action="store_true", help="skip the origin/main refresh")
+    p.add_argument("--state", default=None, help="chain directory (default: the live state/precog)")
+    p.add_argument("--log", default=None, help="summary log (default: logs/continuity-settle.jsonl)")
+    args = p.parse_args(argv)
+    repo = Path(args.repo)
+    log = Path(args.log) if args.log else LOG
+    started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    fetch = "skipped" if args.no_fetch or args.dry_run else refresh_origin_main(repo)
+    chains = chain_files(Path(args.state) if args.state else _STATE)
+    per_chain = [settle_one(c, repo=repo, council=args.council, dry_run=args.dry_run, limit=args.limit)
+                 for c in chains]
+    summary = {"ts": started, "fetch": fetch, "chains": len(chains), "dry_run": args.dry_run,
+               "settled": sum(c["settled"] for c in per_chain),
+               "errors": sum(1 for c in per_chain if "error" in c), "per_chain": per_chain}
+    print(json.dumps(summary, sort_keys=True))
+    if not args.dry_run:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(summary, sort_keys=True) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    # This shebang is `/usr/bin/env python3`, which need not be an interpreter
+    # that can dual-sign. Without this the tool still runs and still records --
+    # it just writes a forgeable demo-sealed record when a real seal was one
+    # interpreter away (lib/pq_reexec.py).
+    #
+    # Imported as top-level `pq_reexec` off THIS checkout, never as
+    # `lib.pq_reexec`: by now `lib` may already be bound to another tree's
+    # package, and the import would miss the file or read another branch's copy.
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "lib"))
+    from pq_reexec import reexec_if_incapable as _reexec
+
+    _reexec(_Path(__file__))
+    sys.exit(main())

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# grip-fleet-watch -- are the agent fleets stuck or burning tokens?
+# Thin wrapper: lib/fleet_watch.py measures transcript growth per tick, repeated
+# tool errors and headless harness processes, and never stops anything.
+# Exit 0 quiet, 1 something hot or stuck, 2 no projects root.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec "$here/bin/grip-py" "$here/lib/fleet_watch.py" "$@"

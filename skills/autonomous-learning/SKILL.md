@@ -1,0 +1,177 @@
+---
+name: autonomous-learning
+description: >
+  Dialectical reasoning framework for self-improvement through pattern detection.
+  Use when detecting teaching moments, high novelty scores, or generalisation patterns.
+version: 1.1.0
+status: Active
+priority: PARAMOUNT
+token_budget: 500
+triggers:
+  - teaching moment detected
+  - high novelty score
+  - new term coined
+  - generalisation pattern
+effort: high
+---
+
+# Autonomous Learning Engine
+
+Dialectical reasoning framework for self-improvement through learning detection.
+
+## The Dialectic
+
+```text
+Traditional ML (thesis)     -> Predict next token
+GRIP Learning (antithesis)  -> Recognise patterns, name them, generalise
+Synthesis                   -> Auto-generate skills when novelty detected
+```
+
+## Learning Triggers
+
+The system detects learning events when **2+ triggers** are active:
+
+| Trigger | Detection Method |
+|---------|------------------|
+| High novelty | Embedding score > 0.4 |
+| Teaching moment | "you should have", "obvious enhancement", corrections |
+| New term | "let's call this", "the X principle", "the X pattern" |
+| Generalisation | "in general", "as a rule", "this applies to" |
+
+## Pipeline
+
+```text
+User message
+     |
+     v
+[detect_learning_event]
+     |
+     +---> No learning -> Exit
+     |
+     v
+[evaluate_generalisability]
+     |
+     +---> Project-specific -> Document locally
+     |
+     +---> Infrastructure -> Flag for CLAUDE.md update
+     |
+     v
+[create_skill_candidate]
+     |
+     v
+[save to pending/]
+     |
+     v
+[notify Admin]
+     |
+     +---> Approve -> Generate skill
+     |
+     +---> Reject -> Archive with reason
+```
+
+## Commands
+
+```bash
+# Process message for learning
+./optim.sh learning "This is the YSH principle"
+
+# List pending candidates
+./optim.sh learning-list
+
+# Approve candidate (generates skill)
+./optim.sh learning-approve skill-20251221120000
+
+# Reject with reason
+./optim.sh learning-reject skill-20251221120000 "Too specific"
+```
+
+## Example
+
+### Detected Learning Event
+
+```text
+User: "You should always check git status before committing"
+GRIP: Detected teaching moment with high novelty
+
+[GRIP LEARNING] Detected generalizable pattern: pre-commit-checking
+
+Learning Score: 0.82
+Triggers: teaching_moment, generalisation
+
+Description:
+Always verify git status before commit operations to prevent...
+
+Proposed skill: pre-commit-checking
+```
+
+## Directory Structure
+
+```text
+~/.claude/learning/
+  pending/    # Candidates awaiting Admin approval
+  approved/   # Move here on approval (triggers skill generation)
+  rejected/   # Archive with reason for learning
+```
+
+## Notification Format
+
+When learning detected, outputs:
+
+```text
+[GRIP LEARNING] Detected generalizable pattern: {skill_name}
+
+Learning Score: 0.75
+Triggers: high_novelty, teaching_moment
+
+Description:
+{first 150 chars of learning content}...
+
+Proposed skill: {skill_name}
+```
+
+## CRITICAL: AskUserQuestion Protocol
+
+When Claude sees `[GRIP LEARNING]` in hook output, IMMEDIATELY use AskUserQuestion:
+
+```text
+Question: "Generate skill '{skill_name}'?"
+Options:
+  - "Yes, generate" → run: ./optim.sh learning-approve {id}
+  - "No, reject"    → run: ./optim.sh learning-reject {id}
+```
+
+This is NON-NEGOTIABLE. Never just print the notification - always ask.
+
+## Admin Oversight
+
+This is **not** fully autonomous. Admin maintains oversight:
+
+1. GRIP **auto-detects** learning events
+2. GRIP **proposes** skill with reasoning
+3. Admin **approves/rejects** (maintains control)
+4. Approved learnings become infrastructure
+
+## Integration Points
+
+| Component | Integration |
+|-----------|-------------|
+| `hooks/learning-hook.py` | Runs on every prompt (`UserPromptSubmit`) and passes it to `lib/learning_detector.py`; prints `[GRIP LEARNING]` when it finds a pattern |
+| `hooks/session-start.sh` | Checks for pending candidates |
+| `lib/learning.sh` | Bash wrapper: `list_pending_skills`, `approve_skill` and `reject_skill` for the approval workflow |
+| `lib/learning_detector.py` | Core Python implementation |
+
+## Source
+
+- **Origin**: Instance dbca9c2d, Gen 50, 2025-12-21
+- **Merged from**: Internal session (YSH discovery)
+- **Teaching**: Named what GRIP does: dialectical reasoning
+
+## Learning Integration
+
+User provides teachings and patterns. GRIP should:
+
+- Recognise new patterns
+- Name them (skill generation)
+- Integrate them (infrastructure updates)
+
+This enables continuous learning and improvement.

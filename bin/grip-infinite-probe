@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+"""grip-infinite-probe — which credential does Claude Code actually send?
+
+Hypothesis H-INF-3 asks whether routing Claude Code through GRIP's HAL gateway
+preserves *subscription* billing custody. The gateway's audit log cannot answer
+it: ``anthropic-primary`` forwards the client's credential verbatim (no header
+override, hal/lib/hal/gateway_failover.py:205) and the ``served`` rows record
+no auth field at all. So the instrument has to be built, and this is it.
+
+The probe stands a recording relay in front of the gateway, runs ONE real
+``claude -p`` turn through it, and reports the shape of the credential that
+Claude Code actually put on the wire:
+
+    x-api-key: sk-ant-api...   → per-token API credits   (subscription BYPASSED)
+    authorization: Bearer sk-ant-oat...  → OAuth          (subscription billed)
+
+It records the header NAME and the token's public prefix class only. The secret
+itself is never read past its first characters, never logged and never written
+to disk — the whole point is to classify custody, not to copy a credential.
+
+    grip-infinite-probe                 # through the gateway (end to end)
+    grip-infinite-probe --direct        # bypass the gateway (control arm)
+    grip-infinite-probe --no-api-key    # strip ANTHROPIC_API_KEY (OAuth arm)
+    grip-infinite-probe --json          # machine-readable verdict
+
+``--no-api-key`` exists because an inherited ``ANTHROPIC_API_KEY`` wins over the
+OAuth login: with it set, Claude Code authenticates by API key and the
+subscription is bypassed no matter which account is signed in. Stripping it is
+what tests whether the OAuth path survives the gateway.
+
+The result is appended to ``state/hal-infinite/h-inf-3.jsonl``.
+
+Exit status: 0 CONFIRMED (OAuth custody AND an upstream 2xx for every request
+the relay saw), 1 REFUTED (a long-lived API key went out), 2 INCONCLUSIVE
+(anything else, including no reading at all). Until AGORA #5033 the probe
+exited 0 when it observed any request and 1 when it observed none, so a caller
+that reads 1 as "could not observe" now reads a refutation instead.
+"""
+
+from __future__ import annotations
+
+# This command prints an ellipsis when reporting a credential prefix, and a
+# default Windows console is cp1252, which cannot encode it. Located from
+# __file__, not sys.path[0]: the tests load bin/ commands with SourceFileLoader,
+# which does not put bin/ on the path.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from _grip_console import ensure_utf8_stdio  # noqa: E402
+
+ensure_utf8_stdio()
+
+import http.server
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+for _p in (str(_ROOT), str(_ROOT / "lib")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+from claude_dir import get_claude_dir  # noqa: E402
+from grip_infinite import classify_credential as classify  # noqa: E402
+
+GATEWAY = "http://127.0.0.1:4010"
+ANTHROPIC = "https://api.anthropic.com"
+PROMPT = "Reply with the single word: probe"
+
+class _Recorder(http.server.BaseHTTPRequestHandler):
+    """Forward one request verbatim upstream, noting how it was authenticated."""
+
+    upstream = GATEWAY
+    seen: list = []
+
+    def log_message(self, *_a):  # silence the stdlib access log
+        pass
+
+    def do_POST(self):  # noqa: N802 (stdlib naming)
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        creds = [
+            classify(n, v)
+            for n, v in self.headers.items()
+            if n.lower() in ("x-api-key", "authorization")
+        ]
+        # `reached` starts False and is set only once the relay genuinely got
+        # a response from upstream. A turn that raises before that point still
+        # counts toward the credential classes seen, so without this flag it
+        # would vanish from the status list and silently hand the verdict back
+        # to the exit code (AGORA #5033 round 4).
+        turn = {"path": self.path.split("?", 1)[0], "creds": creds,
+                "upstream_status": None, "upstream_reached": False}
+        type(self).seen.append(turn)
+
+        req = urllib.request.Request(
+            self.upstream + self.path,
+            data=body,
+            method="POST",
+            headers={k: v for k, v in self.headers.items() if k.lower() != "host"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                payload, status, headers = r.read(), r.status, list(r.headers.items())
+            turn["upstream_status"], turn["upstream_reached"] = status, True
+        except urllib.error.HTTPError as e:
+            # A 401 IS a real answer from upstream -- the one that matters here.
+            payload, status, headers = e.read(), e.code, list(e.headers.items())
+            turn["upstream_status"], turn["upstream_reached"] = status, True
+        except OSError as e:
+            # The relay never reached the wire. 502 is what WE will answer the
+            # client with; it is not something Anthropic said, so it must not be
+            # recorded as an upstream observation. Saying otherwise would make
+            # the provenance field itself over-claim, in a tool whose entire
+            # thesis is provenance-accurate verdicts (AGORA #5033 round 4).
+            payload, status, headers = str(e).encode(), 502, [("Content-Type", "text/plain")]
+            # The reason, not just the class: "URLError" alone cannot tell a
+            # refused connection from a DNS failure or a timeout. It names the
+            # transport fault only; no request header is part of it.
+            turn["local_error"] = f"{type(e).__name__}: {e}"[:200]
+
+        self.send_response(status)
+        for k, v in headers:
+            if k.lower() not in ("transfer-encoding", "content-length", "connection"):
+                self.send_header(k, v)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+def derive_verdict(kinds: set, rc: int, statuses=None, turns: int = 0) -> dict:
+    """Split "which credential went out" from "did the turn work".
+
+    Conflating them produced a false CONFIRMED: a truncated token was sent as a
+    well-formed OAuth Bearer -- custody genuinely intact -- and rejected 401,
+    and the probe reported success anyway. A credential-custody instrument that
+    says CONFIRMED on a failed turn is the exact class of false signal it
+    exists to catch, so the two facts are reported separately and CONFIRMED
+    requires both.
+    """
+    if not kinds:
+        custody = "none"
+    elif len(kinds) > 1:
+        custody = "mixed"
+    else:
+        custody = next(iter(kinds))
+    # Authentication is read from the upstream statuses this relay OBSERVED,
+    # not from the CLI's exit code. The exit code was a proxy for the fact, and
+    # an unverified one: if `claude` ever exits 0 after printing an API error --
+    # a common CLI pattern -- the whole CONFIRMED branch would fire on the
+    # exact 401 regression this exists to catch, and no test could see it
+    # because the stand-in's exit status is hand-assigned. The relay sits
+    # between the CLI and Anthropic and watches the real response, so it can
+    # just look (AGORA #5033 round 3).
+    #
+    # rc is kept as an informational field, and as the fallback for the case
+    # where no status was observed at all.
+    # Every turn must have been observed, not merely one of them. If a turn
+    # raised before the relay reached upstream it still contributes a credential
+    # class, so counting only the statuses we happen to have would quietly hand
+    # the verdict back to the discredited exit code with nothing in the JSON to
+    # show it (AGORA #5033 round 4).
+    observed = len(statuses or ())
+    if turns and observed == turns:
+        authenticated, source = all(200 <= st < 300 for st in statuses), "upstream-status"
+    elif turns:
+        # Turns happened but not all of them were observed -- including the case
+        # where NONE were, which is what a transport failure looks like. Falling
+        # back to the exit code here is precisely the discredited proxy
+        # re-activating in silence, and my first attempt at this fix did exactly
+        # that: a stand-in exiting 0 against an unreachable upstream came back
+        # CONFIRMED. Caught by its own test.
+        authenticated, source = False, "partial-observation"
+    else:
+        # No request reached the relay at all, so there is nothing to observe
+        # and the exit code is the only signal there is. custody will be "none",
+        # so this can never reach CONFIRMED regardless.
+        authenticated, source = rc == 0, "exit-code"
+    return {
+        "custody": custody,
+        "authenticated": authenticated,
+        "authenticated_from": source,
+        # C3: ONE rule, stated once. exit_code() and verdict_line() both read
+        # this field rather than each deciding for themselves, so they cannot
+        # drift into disagreeing about what CONFIRMED means.
+        # CONFIRMED requires the WIRE to have been read. Without that, a call
+        # like derive_verdict({"oauth"}, rc=0) -- the defaults, one omitted
+        # argument -- landed in the exit-code branch and returned CONFIRMED:
+        # the precise verdict this change exists to prevent, with a test of
+        # mine asserting it as correct. A comment claimed custody would be
+        # "none" there so CONFIRMED was unreachable; true only through run(),
+        # never for a direct call.
+        #
+        # Four rounds each removed one more path to a false CONFIRMED and each
+        # left the shape intact. An exit code is not an observation, so it can
+        # never carry a positive billing claim, whatever else is true
+        # (AGORA #5033 round 5).
+        "subscription_billed": (custody == "oauth" and authenticated
+                                and source == "upstream-status"),
+    }
+
+
+#: Exit codes, so automation can tell the three outcomes apart.
+#:
+#: This is an INVERSION of the old contract, not an addition to it, and the
+#: earlier comment here got that wrong. Before, the probe returned 0 when any
+#: request was observed and 1 when none was -- so "no answer" was the ONE case
+#: automation could already distinguish, and every real verdict (confirmed or
+#: refuted alike) shared code 0.
+#:
+#: Now 1 means REFUTED and "no answer" moves to 2. Any existing caller keying
+#: on `== 1` as "could not observe" will silently read a confident refutation
+#: instead. There are no in-tree callers today (`rg 'grip-infinite-probe'`
+#: finds only this file, its tests and docs), which is why the renumbering is
+#: safe to make now rather than never.
+EXIT_CONFIRMED = 0
+EXIT_REFUTED = 1
+EXIT_INCONCLUSIVE = 2
+
+
+#: Classes an affirmative REFUTED may rest on: a clean observation of a
+#: credential that is demonstrably not the subscription.
+#:
+#: This is deliberately independent of whether the turn SUCCEEDED, which makes
+#: it asymmetric with the OAuth side, so the reasoning is worth stating. Custody
+#: is an observation of which credential went out on the wire; a long-lived key
+#: leaving the machine means the subscription was not used for that attempt
+#: whether Anthropic accepted it or not. A failed OAuth turn is different: the
+#: credential was right, and only the outcome is unknown, so nothing is refuted.
+#: Both a successful and a failed wrong-bucket turn therefore refute, and both
+#: are pinned by tests (AGORA #5033 round 3).
+_REFUTABLE = frozenset({"api-key"})
+
+#: Sources whose `authenticated: False` is an actual reading of failure: an
+#: upstream non-2xx, or a client that exited non-zero with nothing observed.
+#: "partial-observation" is absent on purpose. Its False is the safe default
+#: when a request never reached the upstream, not an observed rejection.
+_FAILURE_READINGS = frozenset({"upstream-status", "exit-code"})
+
+
+def _is_confirmed(result: dict) -> bool:
+    """CONFIRMED requires BOTH facts to be present in the data, not merely the
+    summary flag.
+
+    verdict_line() and exit_code() used to trust `subscription_billed` on its
+    own, so a dict carrying {"custody": "api-key", "subscription_billed": True}
+    exited 0 while printing "OAuth custody intact" -- a sentence its own data
+    contradicts. That is unreachable today only because derive_verdict is the
+    sole producer and keeps the fields consistent; nothing enforced the
+    coupling, so a later refactor of run()'s dict could produce it silently
+    (AGORA #5033 round 3).
+    """
+    return (bool(result.get("subscription_billed"))
+            and result.get("custody") == "oauth"
+            and result.get("authenticated") is True)
+
+
+def verdict_line(result: dict) -> str:
+    """The human-readable verdict, saying only what the observation supports.
+
+    Three outcomes, and the boundary between them matters. An earlier version
+    printed REFUTED whenever custody was not cleanly "oauth" -- including when
+    the probe observed NO request at all, or a mixed set. "Subscription NOT in
+    use" drawn from an empty observation is the same over-claim as the
+    CONFIRMED it replaced, merely pointing the other way (AGORA #5033).
+
+    It also asserted "the credential is wrong, not the routing". The probe
+    cannot know that: a failed turn with intact custody is equally consistent
+    with a bad token, an unreachable upstream, or a timeout. Resolving the
+    routing-versus-credential question is what this instrument exists to TEST,
+    so it must not answer it by assertion.
+    """
+    custody = result.get("custody")
+    if _is_confirmed(result):
+        return "CONFIRMED — OAuth custody intact AND the turn authenticated"
+    if custody == "oauth":
+        # Say the turn did not authenticate only when the result holds a
+        # reading that says so. Unconditionally, this sentence contradicted a
+        # dict whose own `authenticated` was True (exit-code path, rc=0), and a
+        # partial observation whose upstream_statuses held a 200 (AGORA #5033).
+        if (result.get("authenticated") is False
+                and result.get("authenticated_from") in _FAILURE_READINGS):
+            return ("INCONCLUSIVE — OAuth custody is intact but the turn did not "
+                    "authenticate; this cannot distinguish a bad credential from a "
+                    "bad route")
+        return ("INCONCLUSIVE — OAuth custody is intact, but the upstream's "
+                "answer was not seen for every request, so whether the turn "
+                "authenticated is unknown")
+    if custody == "none":
+        # "none" means no credential was CLASSIFIED. That covers both "no
+        # request reached the relay" and "a request arrived carrying no
+        # credential header at all", so the wording must not assert the first.
+        return ("INCONCLUSIVE — no credential was observed, so nothing can be "
+                "concluded about billing")
+    if custody == "mixed":
+        return ("INCONCLUSIVE — more than one credential class was observed; "
+                "no clean reading")
+    if custody in _REFUTABLE:
+        return (f"REFUTED — credential class {custody!r}; subscription NOT in "
+                "use on this path")
+    # Missing, or a class this build does not recognise. A refutation has to
+    # rest on an affirmative observation of the WRONG bucket; anything else is
+    # an absence of reading, and calling it REFUTED is the same over-claim in
+    # miniature (AGORA #5033 round 2).
+    return (f"INCONCLUSIVE — unrecognised credential class {custody!r}; "
+            "no reading this build can interpret")
+
+
+def exit_code(result: dict) -> int:
+    """Make the verdict machine-readable, not merely printable."""
+    if _is_confirmed(result):
+        return EXIT_CONFIRMED
+    if result.get("custody") in _REFUTABLE:
+        return EXIT_REFUTED
+    # Everything else -- oauth-but-failed, none, mixed, missing, or a class this
+    # build does not know -- is an absence of reading, never a refutation.
+    return EXIT_INCONCLUSIVE
+
+
+def run(upstream: str, timeout: int = 150, *, strip_api_key: bool = False) -> dict:
+    _Recorder.upstream = upstream
+    _Recorder.seen = []
+    with socket.socket() as probe_sock:
+        probe_sock.bind(("127.0.0.1", 0))
+        port = probe_sock.getsockname()[1]
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), _Recorder)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    env = dict(os.environ, ANTHROPIC_BASE_URL=f"http://127.0.0.1:{port}")
+    stripped = []
+    if strip_api_key:
+        for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+            if env.pop(var, None) is not None:
+                stripped.append(var)
+    started = datetime.now(timezone.utc)
+    try:
+        proc = subprocess.run(
+            ["claude", "-p", PROMPT],
+            env=env, capture_output=True, text=True, timeout=timeout,
+        )
+        reply, rc, err = proc.stdout.strip(), proc.returncode, proc.stderr.strip()
+    except subprocess.TimeoutExpired:
+        reply, rc, err = "", 124, f"claude -p exceeded {timeout}s"
+    except FileNotFoundError:
+        reply, rc, err = "", 127, "claude is not on PATH"
+    finally:
+        srv.shutdown()
+
+    creds = [c for turn in _Recorder.seen for c in turn["creds"]]
+    kinds = {c["kind"] for c in creds}
+    statuses = [t["upstream_status"] for t in _Recorder.seen if t.get("upstream_reached")]
+    verdict = derive_verdict(kinds, rc, statuses, turns=len(_Recorder.seen))
+    return {
+        # Kept alongside the new keys, not replaced by them: dropping it would
+        # KeyError any consumer already reading the JSON (AGORA #5033 round 2).
+        "kinds": sorted(kinds),
+        "upstream_statuses": statuses,
+        "ts": started.isoformat(timespec="seconds"),
+        "hypothesis": "H-INF-3",
+        "upstream": upstream,
+        "through_gateway": upstream == GATEWAY,
+        "stripped_env": stripped,
+        "turns_observed": len(_Recorder.seen),
+        # Why a turn has no upstream status: the relay's own transport fault.
+        # Without it a partial-observation verdict could not say what went
+        # unobserved, and the field was written for no reader (AGORA #5033).
+        "local_errors": [t["local_error"] for t in _Recorder.seen if "local_error" in t],
+        "credentials": creds,
+        **verdict,
+        "claude_rc": rc,
+        "reply": reply[:200],
+        "stderr": err[:400],
+    }
+
+
+def record(result: dict) -> Path:
+    out = get_claude_dir() / "state" / "hal-infinite" / "h-inf-3.jsonl"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("a") as fh:
+        fh.write(json.dumps(result) + "\n")
+    return out
+
+
+#: The only arguments the probe reads. Anything else used to be ignored, so
+#: `--help` -- or a misspelt arm such as `--no-apikey` -- ran the default arm and
+#: spent a real model turn (2026-10-17, while a session asked only for the usage).
+KNOWN_FLAGS = ("--direct", "--no-api-key", "--json")
+USAGE = ("usage: grip-infinite-probe [--direct] [--no-api-key] [--json]\n"
+         "  (none)        one real claude -p turn through the gateway\n"
+         "  --direct      straight to Anthropic, not through the gateway (control arm)\n"
+         "  --no-api-key  start claude with no API key in its environment (OAuth arm)\n"
+         "  --json        machine-readable verdict\n"
+         "Every run spends one model turn and appends to state/hal-infinite/h-inf-3.jsonl.")
+
+
+def main(argv: list) -> int:
+    if any(a in ("-h", "--help") for a in argv):
+        print(USAGE)
+        return 0
+    unknown = [a for a in argv if a not in KNOWN_FLAGS]
+    if unknown:
+        # Exit 2 is the probe's "no reading at all", which is exactly what this is.
+        print(f"grip-infinite-probe: unknown argument(s): {' '.join(unknown)}; nothing was run\n{USAGE}",
+              file=sys.stderr)
+        return 2
+    upstream = ANTHROPIC if "--direct" in argv else GATEWAY
+    result = run(upstream, strip_api_key="--no-api-key" in argv)
+    path = record(result)
+
+    if "--json" in argv:
+        print(json.dumps(result, indent=2))
+        return exit_code(result)
+
+    print(f"H-INF-3 probe — {'through the gateway' if result['through_gateway'] else 'direct to Anthropic'}")
+    print(f"  upstream   : {upstream}")
+    if result["stripped_env"]:
+        print(f"  stripped   : {', '.join(result['stripped_env'])} (forcing the OAuth path)")
+    print(f"  turns seen : {result['turns_observed']}")
+    if not result["turns_observed"]:
+        print(f"  VERDICT    : {verdict_line(result)} (rc={result['claude_rc']})")
+        if result["stderr"]:
+            print(f"  stderr     : {result['stderr'].splitlines()[0][:160]}")
+        print(f"  recorded   : {path}")
+        return exit_code(result)   # "no request seen" is INCONCLUSIVE, not a refutation
+    for c in result["credentials"]:
+        print(f"  credential : {c['header']}: {c['prefix']}… → {c['bills']}")
+    for err in result["local_errors"]:
+        print(f"  local error: {err} (never reached the upstream)")
+    print(f"  reply      : {result['reply'][:60]!r} (rc={result['claude_rc']})")
+    print(f"  VERDICT    : {verdict_line(result)}")
+    print(f"  recorded   : {path}")
+    return exit_code(result)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

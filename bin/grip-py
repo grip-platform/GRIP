@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# grip-py - run GRIP Python code under the GRIP venv, never system python3.
+#
+# WHY THIS EXISTS. `python3 lib/grip_save.py` looks correct and is not. On this
+# machine `python3` resolves to Homebrew's interpreter, which carries no
+# `cryptography` -- so anything that signs a decision record does not fail, it
+# writes a DEMO-SEALED record under a shared secret that is world-readable and
+# committed. Honestly labelled `custody: demo-shared-key`, and forgeable.
+#
+# `lib/pq_reexec.py` recovers that case at runtime for tools wired to it. This
+# shim removes the case instead: the short, natural thing to type is the safe
+# one, and system python stays reachable as plain `python3` for anything that
+# genuinely wants it.
+#
+# TWO DIFFERENT CHECKS, WITH DELIBERATELY DIFFERENT TEETH.
+#
+# 1. REFUSE a system interpreter. `resolve_venv_python` falls back to any system
+#    python that answers, which is right for callers that need *a* Python and
+#    precisely wrong here -- accepting that fallback silently is the exact bug
+#    this shim closes. So the interpreter is taken only from inside the venv, and
+#    the failure names the path searched. Same discipline as `bin/anamnesis`.
+#
+# 2. WARN when that venv cannot dual-sign. A venv can exist and still lack
+#    `cryptography>=48`, in which case the path check above passes and the seal
+#    still degrades -- raised by Codex on GRIP#5640, and true: check 1 was a
+#    path test wearing a capability's name.
+#
+#    THE FLOOR IS 48, NOT 47, and the earlier `>=47` was wrong in the unsafe
+#    direction: it is satisfiable by a version that cannot sign. Per the
+#    vendor's own CHANGELOG, 47.0.0 (2026-04-24) added the `mldsa` module
+#    "with AWS-LC and BoringSSL" and notes post-quantum support "requires
+#    AWS-LC or BoringSSL"; 48.0.0 (2026-05-04) added OpenSSL 3.5.0 support and
+#    states post-quantum algorithms are "now available to users of our
+#    wheels". `pip install` delivers those wheels, so a resolver landing on
+#    47.0.0 satisfies `>=47` and still writes a demo seal.
+#
+#    This one WARNS rather than refusing, for two reasons. `grip-py -c
+#    'print(1)'` has nothing to do with signing and must not be blocked. And
+#    refusing would block `grip-py -m pip install cryptography` -- the remedy --
+#    which is exactly the deadlock `rules/gate-resolution-escape-hatch.md`
+#    Invariant 1 forbids: a check must never block its own resolution.
+#
+# THE RECOVERY COMMAND NAMES `cryptography` EXPLICITLY, because
+# `requirements.txt` does not carry it (verified 2026-09-14: zero matches in any
+# manifest in the tree, while the live venv has 49.0.0). Telling an operator to
+# install from requirements alone would hand them a venv this shim accepts and
+# which still cannot sign -- the same defect, one level up.
+#
+# Usage:
+#   grip-py lib/grip_save.py "achievement"   # run a GRIP module
+#   grip-py -c 'import cryptography'         # any python3 argv, passed through
+#   grip-py -m pytest tests/                 # including -m
+set -euo pipefail
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+source "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib/venv-utils.sh"
+
+PY="$(resolve_venv_python "$CLAUDE_DIR/venv" || true)"
+if [[ "$PY" != "$CLAUDE_DIR/venv/"* ]]; then
+    echo "[grip-py] no GRIP venv Python at $CLAUDE_DIR/venv (looked for Scripts/python.exe, bin/python3, bin/python)" >&2
+    # The second step runs pip through this shim, which finds the new venv's
+    # interpreter in either platform's layout; the capability check below only
+    # warns, so it cannot block that install.
+    # requirements-core.txt ships in every build (the public build has no
+    # requirements.txt, GRIP#9399). cryptography>=48 is named as well, so an
+    # edit to the manifest cannot quietly drop signing from this recovery path
+    # (rules/never-system-python-for-grip.md, mandate 1).
+    echo "[grip-py] create it with: python3 -m venv \"$CLAUDE_DIR/venv\" && CLAUDE_DIR=\"$CLAUDE_DIR\" \"$0\" -m pip install --prefer-binary -r \"$CLAUDE_DIR/requirements-core.txt\" 'cryptography>=48'" >&2
+    exit 1
+fi
+
+# Both limbs of the dual seal, asked of the interpreter itself. A probe cannot be
+# wrong about this; inferring it from a path can. Mirrors `lib/pq_reexec.py`'s
+# _PROBE -- if that changes, this must too.
+if ! "$PY" -c 'from cryptography.hazmat.primitives.asymmetric import mldsa
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey' 2>/dev/null; then
+    echo "[grip-py] WARNING: $PY cannot dual-sign -- 'cryptography>=48' (ML-DSA-65) is missing or too old." >&2
+    echo "[grip-py] A record that needs the dual seal is REFUSED under this interpreter (since 2026-10-18); GRIP_IDR_ALLOW_DEMO_WITHOUT_CRYPTO=1 writes it with the forgeable demo seal instead." >&2
+    echo "[grip-py] Fix: \"$PY\" -m pip install --prefer-binary 'cryptography>=48'" >&2
+    echo "[grip-py] Continuing anyway: refusing here would block the command that repairs it." >&2
+fi
+
+exec "$PY" "$@"

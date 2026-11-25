@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Memory metabolism — launchd agent TEMPLATE.
+
+  Install (substitute __GRIP_HOME__ with $HOME/.claude):
+      sed "s|__GRIP_HOME__|$HOME/.claude|g" \
+        config/com.grip.memory-metabolism.plist.template \
+        > ~/Library/LaunchAgents/com.grip.memory-metabolism.plist
+      launchctl load ~/Library/LaunchAgents/com.grip.memory-metabolism.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.grip.memory-metabolism</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__GRIP_HOME__/venv/bin/python3</string>
+        <string>__GRIP_HOME__/lib/memory_metabolism.py</string>
+        <string>--json</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>21600</integer>
+    <key>StandardOutPath</key>
+    <string>__GRIP_HOME__/logs/memory-metabolism.log</string>
+    <key>StandardErrorPath</key>
+    <string>__GRIP_HOME__/logs/memory-metabolism.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CLAUDE_DIR</key>
+        <string>__GRIP_HOME__</string>
+        <key>PYTHONPATH</key>
+        <string>__GRIP_HOME__/lib</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

@@ -1,0 +1,112 @@
+name: rsi
+description: Recursive Self-Improvement — detect patterns, create skills, run improvement loops with safety guardrails
+version: 1.0.0
+effort: high
+triggers:
+- /mode rsi
+- /learn
+- '[GRIP LEARNING]'
+- self-improve
+- recursive improvement
+- run rsi
+- detect patterns
+auto_trigger:
+  enabled: true
+  signals:
+  - '[GRIP LEARNING]'
+  - pattern_novelty_threshold: 0.7
+  periodic_check:
+    enabled: true
+    scanner: lib/periodic_scanner.py
+    state_file: .operation-state.json
+    thresholds:
+      pattern_scan: 15
+skills:
+  always:
+  - recursive-learning
+  - self-improvement-engine
+  - skill-creation-best-practices
+  - autonomous-learning
+  optional:
+  - creating-skills
+  - meta-improvement-switch
+  - agent-auto-creator
+token_budget: ~5500
+foundation: true
+stacks_with:
+- ut++
+- asking-users
+- creating-wizards
+- hitl
+- context-gate
+prompt_injection: |
+  [MODE: RSI]
+
+  Recursive Self-Improvement mode active. Pattern detection + skill creation + safety guardrails.
+
+  ## RSI Loop
+
+  detect → score → apply → verify → commit
+
+  1. DETECT: Scan for repeated patterns (3x = YSH threshold)
+  2. SCORE: Novelty >= 0.7 → propose skill | < 0.7 → log
+  3. APPLY: Create or update skill via skill-creation-best-practices
+  4. VERIFY: Quality gate >= 70%, run tests if applicable
+  5. COMMIT: Deliverable per phase (commit/PR/issue/documented decision)
+
+  ## Skill Creation Quality Gates (PARAMOUNT)
+
+  - Gate A: Proposal — AskUserQuestion MANDATORY
+  - Gate B: Auto-generation — quality score >= 70%
+  - Gate C: Autonomous discovery — quality >= 70% + review
+
+  ## Safety Guardrails
+
+  - Dual-condition exits (completion + explicit signal)
+  - Circuit breakers: stagnation after 3 iterations, error threshold, output decline
+  - Rate limiting: 100 API/hr, 50 file ops/min
+  - Rollback points: checkpoint before each apply phase
+  - Max 3 fix iterations per PR before merging or escalating
+  - Human oversight: AskUserQuestion at each phase gate
+
+  NEVER auto-exit loops. NEVER unbounded autonomy.
+
+  ## Periodic Self-Check (Every 15-20 ops)
+
+  Scan for:
+  - Repeated patterns (3x threshold → YSH → abstract NOW)
+  - Novel approaches worth capturing
+  - Workarounds that should be permanent
+  - User corrections indicating missing skills
+
+  When pattern detected: emit "[PATTERN DETECTED: {description}]", assess novelty, propose if >= 0.7.
+
+  ## Broly Auto-Activation
+
+  Broly is AUTO-ACTIVE at FORK level with ReAct reasoning -- UNLESS the operator
+  has set the trigger to manual (check with `mode-loader.sh broly status`), in
+  which case fan out ONLY on an explicit /broly.
+  Escalate to CLUSTER when running multi-phase RSI cycles in parallel.
+
+  Default: FORK | Team: none | Reasoning: ReAct (react)
+
+wave:
+  category: meta_loop
+broly:
+  enabled: true
+  default_level: fork
+  team_pattern: null
+  reasoning_hint: react
+  escalation:
+    to: cluster
+    signals:
+    - multi-phase RSI cycle with parallel streams
+    - pattern detection across multiple repositories
+    - skill generation batch with parallel validation
+context:
+- Detecting and capturing recurring patterns
+- Creating skills from session learnings
+- Running improvement loops on GRIP infrastructure
+- Autonomous skill generation with quality gates
+- Reducing repeated manual interventions
+welcome_message: "RSI mode active. detect \u2192 score \u2192 apply \u2192 verify. Safety guardrails enforced."

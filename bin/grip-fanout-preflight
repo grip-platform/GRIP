@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""Announce a fan-out's cost BEFORE launching it, and refuse a silent spend.
+
+Run this before any Workflow/converge-fleet launch:
+
+    grip-fanout-preflight --lanes 6 --rounds 2 --verify 26
+    grip-fanout-preflight --agents 38 --accept-spend
+
+Exit 0 = safe to launch. Exit 2 = refused, with the reason on stderr.
+
+Origin: 2026-09-17, $303.96 of usage credits spent by a 38-agent run that
+announced nothing. See lib/fanout_preflight.py for why this is a separate
+command rather than a check inside the workflow script.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+import fanout_preflight as fp  # noqa: E402
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--agents", type=int, help="total agents, if known directly")
+    ap.add_argument("--lanes", type=int, default=0, help="parallel lanes")
+    ap.add_argument("--rounds", type=int, default=1, help="rounds per lane")
+    ap.add_argument("--verify", type=int, default=0, help="verification agents")
+    ap.add_argument("--tokens-per-agent", type=int, default=fp.DEFAULT_TOKENS_PER_AGENT)
+    ap.add_argument("--threshold", type=int, default=None,
+                    help="token line; default: by declared plan tier (pro "
+                         f"{fp.PRO_THRESHOLD_TOKENS:,}, max/api or undeclared "
+                         f"{fp.DEFAULT_THRESHOLD_TOKENS:,})")
+    ap.add_argument("--accept-spend", action="store_true",
+                    help="proceed even though overflow may bill to usage credits")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args(argv)
+
+    agents = args.agents if args.agents is not None else fp.agents_for(
+        lanes=args.lanes, rounds=args.rounds, verify_per_finding=args.verify
+    )
+
+    report = fp.preflight(
+        agents,
+        tokens_per_agent=args.tokens_per_agent,
+        threshold=args.threshold,
+        accepted=args.accept_spend,
+    )
+
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        flag = {True: "ON (overflow BILLS)", False: "off (overflow fails)",
+                None: "UNREADABLE"}[report["extra_usage_enabled"]]
+        headroom = {True: "yes -- at least one account has it",
+                    False: "NO -- every observed account is past half its "
+                           "5-hour or weekly window",
+                    None: "UNREADABLE (falling back to the estimate-only rule)"
+                    }[report["live_headroom_available"]]
+        print(f"[fanout-preflight] agents      : {report['agents']}")
+        print(f"[fanout-preflight] est. tokens : {report['estimated_tokens']:,}")
+        tier = report["tier"] or "not declared"
+        print(f"[fanout-preflight] threshold   : {report['threshold']:,} (plan tier: {tier})")
+        print(f"[fanout-preflight] usage credits: {flag}")
+        if report["live_usage_lines"]:
+            for line in report["live_usage_lines"]:
+                print(f"[fanout-preflight] live usage   : {line}")
+        else:
+            print("[fanout-preflight] live usage   : UNREADABLE (no HAL "
+                  "account ledger could be read)")
+        print(f"[fanout-preflight] 5h headroom : {headroom}")
+        stream = sys.stdout if report["may_launch"] else sys.stderr
+        print(f"[fanout-preflight] {report['reason']}", file=stream)
+
+    return 0 if report["may_launch"] else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

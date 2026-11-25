@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""
+kono-purge-markers — safe, idempotent purge of operational-marker rows
+from the local KONO embeddings DB.
+
+V>>-directed reclamation 2026-05-21 of PR #3120 "out of scope" item.
+
+The local SQLite DB at ~/.claude/embeddings.db is NOT a git tree and is
+gitignored — sync-mirror-safety.md does not apply. The real concerns are
+data preservation (pre-deletion backup), false-positive avoidance (use
+the canonical is_operational_content regex by IMPORT, not copy), and
+auditability (per-row JSONL log).
+
+Default mode = --dry-run. --commit requires either a recent dry-run
+sentinel (mtime within last hour) OR the CI escape KONO_PURGE_CI=1.
+
+Per Auto-Clarity Override (canonical-output-style §rails): irreversible
+actions require full prose confirmation. --commit without --yes prompts.
+
+See `drafts/marker-purge-mesh-2026-05-21.md` for the grounded MESH
+deliberation that drove this design. H-PURGE-1 deadline 2026-06-04.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import sqlite3
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR", str(Path.home() / ".claude")))
+DEFAULT_DB = CLAUDE_DIR / "embeddings.db"
+STAMP_PATH = CLAUDE_DIR / "state" / "marker-purge-dry-run.stamp"
+LOG_DIR = CLAUDE_DIR / "logs"
+STAMP_TTL_SEC = int(os.environ.get("GRIP_PURGE_STAMP_TTL_SEC", "3600"))
+
+
+def _utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _load_canonical_gate():
+    """Lazy import to keep startup fast and avoid circular imports."""
+    sys.path.insert(0, str(CLAUDE_DIR / "lib"))
+    from kono_counters import is_operational_content  # noqa: WPS433
+    return is_operational_content
+
+
+def _resolve_db_path() -> Path:
+    return Path(os.environ.get("GRIP_EMBEDDINGS_DB", str(DEFAULT_DB)))
+
+
+def _select_marker_rows(conn: sqlite3.Connection, gate) -> list[tuple[int, str, str]]:
+    """Return [(id, content, namespace)] for rows matching the canonical gate."""
+    rows = conn.execute(
+        "SELECT id, content, COALESCE(namespace, '') FROM embeddings WHERE content IS NOT NULL"
+    ).fetchall()
+    return [(rid, content, ns) for rid, content, ns in rows if gate(content)]
+
+
+def _write_stamp() -> None:
+    STAMP_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STAMP_PATH.write_text(_utc_stamp() + "\n", encoding="utf-8")
+
+
+def _stamp_fresh() -> bool:
+    if os.environ.get("KONO_PURGE_CI") == "1":
+        return True
+    if not STAMP_PATH.exists():
+        return False
+    age = time.time() - STAMP_PATH.stat().st_mtime
+    return age <= STAMP_TTL_SEC
+
+
+def _backup_db(db_path: Path) -> Path:
+    backup = db_path.with_name(f"{db_path.name}.pre-marker-purge-{_utc_stamp()}")
+    shutil.copy2(db_path, backup)
+    return backup
+
+
+def _audit_path() -> Path:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    return LOG_DIR / f"marker-purge-{_utc_stamp()}.jsonl"
+
+
+def _content_hash(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _audit_row(rid: int, content: str, namespace: str) -> dict:
+    return {
+        "ts": _utc_stamp(),
+        "id": rid,
+        "content_hash": _content_hash(content),
+        "namespace": namespace,
+        "content_first_60_chars": content[:60],
+        "action": "deleted",
+    }
+
+
+def _delete_rows(conn: sqlite3.Connection, ids: list[int]) -> None:
+    """Delete by id and prune orphan vec rows. FTS5 triggers handle themselves."""
+    placeholders = ",".join("?" * len(ids))
+    conn.execute(f"DELETE FROM embeddings WHERE id IN ({placeholders})", ids)
+    try:
+        conn.execute(
+            "DELETE FROM vec_embeddings WHERE rowid NOT IN (SELECT id FROM embeddings)"
+        )
+    except sqlite3.OperationalError:
+        pass  # vec_embeddings absent in some test fixtures
+
+
+def _print_dry_run(rows: list[tuple[int, str, str]]) -> None:
+    print(f"[dry-run] DB: {_resolve_db_path()}")
+    print(f"[dry-run] Would delete {len(rows)} row(s) matching canonical gate.")
+    print(f"[dry-run] SQL: DELETE FROM embeddings WHERE id IN (...);")
+    print(f"[dry-run] Plus orphan vec_embeddings prune.")
+    if rows:
+        print("[dry-run] Sample (first 5):")
+        for rid, content, ns in rows[:5]:
+            print(f"  id={rid} ns={ns or '(none)'}: {content[:80]!r}")
+    print(f"[dry-run] Stamp written: {STAMP_PATH}")
+    print(f"[dry-run] Re-run with --commit within {STAMP_TTL_SEC}s to delete.")
+
+
+def _confirm_commit(count: int, yes: bool) -> bool:
+    if yes:
+        return True
+    print(f"About to delete {count} row(s) from {_resolve_db_path()}.")
+    print("This is irreversible (backup will be created first).")
+    answer = input("Proceed? [yes/NO] ").strip()
+    return answer == "yes"
+
+
+def _run_dry_run(db_path: Path, gate) -> int:
+    with sqlite3.connect(db_path) as conn:
+        rows = _select_marker_rows(conn, gate)
+    _print_dry_run(rows)
+    _write_stamp()
+    return 0
+
+
+def _run_commit(db_path: Path, gate, yes: bool) -> int:
+    if not _stamp_fresh():
+        print(
+            f"error: no fresh --dry-run stamp at {STAMP_PATH} "
+            f"(TTL={STAMP_TTL_SEC}s). Run --dry-run first, or set KONO_PURGE_CI=1.",
+            file=sys.stderr,
+        )
+        return 2
+    with sqlite3.connect(db_path) as conn:
+        rows = _select_marker_rows(conn, gate)
+        if not rows:
+            print("[commit] 0 matching rows — no-op (idempotent).")
+            return 0
+        if not _confirm_commit(len(rows), yes):
+            print("[commit] aborted by operator (answer was not 'yes').")
+            return 3
+        backup = _backup_db(db_path)
+        print(f"[commit] Backup: {backup}")
+        audit = _audit_path()
+        with audit.open("w", encoding="utf-8") as fh:
+            for rid, content, ns in rows:
+                fh.write(json.dumps(_audit_row(rid, content, ns)) + "\n")
+        _delete_rows(conn, [rid for rid, _, _ in rows])
+        conn.commit()
+        print(f"[commit] Deleted {len(rows)} row(s). Audit: {audit}")
+        return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Purge operational marker rows from KONO embeddings.db.",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="Default mode: count + sample, no delete.")
+    mode.add_argument("--commit", action="store_true", help="Delete matching rows after confirmation.")
+    parser.add_argument("--yes", action="store_true", help="Skip interactive confirmation (CI).")
+    args = parser.parse_args(argv)
+
+    db_path = _resolve_db_path()
+    if not db_path.exists():
+        print(f"error: DB not found at {db_path}", file=sys.stderr)
+        return 1
+
+    gate = _load_canonical_gate()
+    if args.commit:
+        return _run_commit(db_path, gate, args.yes)
+    return _run_dry_run(db_path, gate)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

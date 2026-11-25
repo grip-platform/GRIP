@@ -1,0 +1,6 @@
+# Repos the security-healer scans for open Dependabot alerts.
+# One owner/repo per line. Lines starting with # are ignored.
+# HAPPI's attack surface lives in GRIP + HAL (happi-api is HAL-hosted; the
+# HAPPI.md spec itself has no dependency manifest), so these two cover it.
+grip-platform/GRIP
+grip-platform/HAL

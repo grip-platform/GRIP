@@ -1,0 +1,69 @@
+name: auto
+description: Infers optimal modes from prompt context using semantic matching. Default mode that replaces manual mode selection with best-effort inference.
+version: 1.0.0
+effort: high
+triggers:
+- /mode auto
+- auto mode
+- best mode
+- optimal mode
+skills:
+  always: []
+  optional: []
+token_budget: 1000
+foundation: true
+stacks_with:
+- ut++
+- asking-users
+- creating-wizards
+- hitl
+- context-gate
+prompt_injection: '[MODE: AUTO — LLM-Inferred Mode Selection]
+
+
+  You are in AUTO mode. Before executing the user''s task, use the
+  auto_mode_selector to infer optimal modes via external LLM call.
+
+
+  ## Protocol
+
+
+  1. Run: python3 lib/auto_mode_selector.py "<user prompt>"
+  2. The selector calls Gemini Flash (free, ~2s) with all 30 mode definitions
+  3. It returns: modes to activate, skills to preload, commands to run
+  4. Activate the returned modes via mode-loader.sh
+  5. Proceed with the task using the loaded context
+
+
+  ## Why LLM Not Keywords
+
+
+  Keywords match surface patterns. LLM inference understands intent.
+  "review the PR, analyse the architecture, and write up findings"
+  returns: review + architect + analysis + writing (4 modes, ~14k budget).
+  No keyword map could infer this from a natural language prompt.
+
+
+  ## Budget Management
+
+
+  Dynamic ceiling: 50k (configurable via GRIP_MAX_MODE_BUDGET).
+  The selector deduplicates overlapping skills across modes.
+  Prefer fewer high-value modes over many low-value ones.
+
+
+  '
+wave:
+  category: orthogonal
+  w_level: 0
+  phase: neutral
+broly:
+  enabled: true
+  default_level: fork
+  team_pattern: null
+  reasoning_hint: cot
+context:
+- Any task where mode selection is unclear
+- Multi-domain work spanning several areas
+- First-time use before user knows available modes
+welcome_message: Auto mode active. Modes will be inferred from your prompt.

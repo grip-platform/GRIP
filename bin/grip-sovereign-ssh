@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""grip-sovereign-ssh — operator CLI for the InnerspeakerGo sovereign syscall.
+
+AI is a syscall. Ask a council of non-Anthropic models a question and get back a
+tamper-evident, sha256-sealed, exogenously-judged verdict — locally or headless
+on the VPS over ssh. Thin surface over lib/sovereign_ssh_syscall.sovereign_call;
+reimplements nothing.
+
+  grip-sovereign-ssh "should we ship X?"                     # local council, sealed
+  grip-sovereign-ssh --vps "should we ship X?"               # council on the VPS via ssh
+  grip-sovereign-ssh --speakers deepseek,gemini,groq --judge gemini-pro "..."
+  grip-sovereign-ssh --fresh "..."                           # bypass the idempotence cache
+  grip-sovereign-ssh --verify <sha>                          # re-verify a sealed record
+"""
+from __future__ import annotations
+
+# Windows consoles default to cp1252, which cannot encode the glyphs below.
+# Located from __file__, not sys.path[0]: the tests load these commands with
+# SourceFileLoader, which does not put bin/ on the path.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from _grip_console import ensure_utf8_stdio  # noqa: E402
+
+ensure_utf8_stdio()
+
+import pathlib
+import subprocess
+import sys
+
+_ROOT = pathlib.Path(__file__).resolve().parent.parent
+for _p in (str(_ROOT), str(_ROOT / "lib")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from sovereign_ssh_syscall import SovereignSyscallError, sovereign_call  # noqa: E402
+
+
+def _parse(argv: list[str]) -> dict:
+    opts: dict = {
+        "backend": None, "speakers": None, "judge": None,
+        "fresh": False, "verify": None, "prompt": None,
+    }
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--vps":
+            opts["backend"] = "vps"
+        elif a == "--local":
+            opts["backend"] = "local"
+        elif a == "--fresh":
+            opts["fresh"] = True
+        elif a == "--speakers" and i + 1 < len(argv):
+            i += 1
+            opts["speakers"] = [s.strip() for s in argv[i].split(",") if s.strip()]
+        elif a == "--judge" and i + 1 < len(argv):
+            i += 1
+            opts["judge"] = argv[i]
+        elif a == "--verify" and i + 1 < len(argv):
+            i += 1
+            opts["verify"] = argv[i]
+        else:
+            opts["prompt"] = a
+        i += 1
+    return opts
+
+
+def _delegate_verify(sha: str) -> int:
+    """--verify delegates to the council bin (single source of verification truth)."""
+    return subprocess.run(
+        [sys.executable, str(_ROOT / "bin" / "grip-sovereign-council"), "--verify", sha]
+    ).returncode
+
+
+def _print_verdict(v) -> None:
+    tag = "CACHED (fixed point, ℱ∘ℱ=ℱ — no re-spawn)" if v.cached else "FRESH council run"
+    print(f"backend   : {v.backend}")
+    print(f"result    : {tag}")
+    print(f"sha256    : {v.sha256}")
+    print(f"anthropic : {v.anthropic_calls}   (sovereign — zero Anthropic)")
+    if v.synthesis:
+        print(f"synthesis : {v.synthesis[:400]}")
+    print(f"re-verify : {v.verify_hint()}")
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    opts = _parse(argv)
+    if opts["verify"]:
+        return _delegate_verify(opts["verify"])
+    if not opts["prompt"]:
+        print('error: no prompt. Try: grip-sovereign-ssh "your question"', file=sys.stderr)
+        return 2
+    try:
+        v = sovereign_call(
+            opts["prompt"], backend=opts["backend"],
+            speakers=opts["speakers"], judge=opts["judge"], fresh=opts["fresh"],
+        )
+    except SovereignSyscallError as exc:
+        print(f"sovereign syscall failed: {exc}", file=sys.stderr)
+        return 1
+    _print_verdict(v)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

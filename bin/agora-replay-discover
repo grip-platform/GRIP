@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Agora/HAL council replay discovery — Rule 21 mechanical pre-flight.
+
+Scans canonical filesystem locations for council artefacts and emits a
+structured JSON inventory. Discovery only — no analysis, no LLM, no network.
+
+Usage:
+    agora-replay-discover [--topic X] [--kind K] [--root R]+ [--pattern P]
+
+Exit 0 if >=1 artefact found, 1 otherwise. Stderr carries progress; stdout
+is JSON only (grep/jq pipe-compatible).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+from paramount_backups import ParamountBackupError, backups_root  # noqa: E402
+
+
+def _default_roots() -> tuple:
+    """Search roots, with the backup folder resolved per machine.
+
+    It is only a discovery root here, so an unusable one is skipped rather than
+    fatal -- a misconfigured backup path should not stop a replay scan of drafts/
+    and plans/ (rules/paramount-backups.md).
+    """
+    roots = ["drafts", "plans"]
+    try:
+        roots.append(str(backups_root()))
+    except ParamountBackupError:
+        pass
+    return tuple(roots)
+
+
+DEFAULT_ROOTS = _default_roots()
+DEFAULT_PATTERN = r"council|whitepaper|synthesis|verdict|mesh|broly|possibilities|deliberation|agora"
+EXTENSIONS = {".md", ".html", ".pdf", ".txt"}
+FRONTMATTER_LINES = 30
+DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+KIND_KEYWORDS = (
+    ("broly", "broly"), ("mesh", "mesh"), ("agora", "agora"),
+    ("whitepaper", "whitepaper"), ("possibilities", "whitepaper"),
+    ("synthesis", "synthesis"), ("deliberation", "deliberation"),
+    ("council", "council"), ("verdict", "council"),
+)
+VERDICT_STATES = ("verdict", "synthesis", "deliberation", "mesh")
+FRONTMATTER_PATTERNS = (
+    ("verdict_date", re.compile(r"^\*?\*?Date\*?\*?:\s*(\S+)", re.MULTILINE)),
+    ("council_size", re.compile(r"Council reach:\s*(\d+)/(\d+)")),
+    ("wall_clock", re.compile(r"Total wall-clock:\s*(\S+)")),
+    ("hypothesis_id", re.compile(r"Hypothesis:\s*(H\d+)")),
+)
+
+
+def parse_filename(stem: str) -> tuple[str, str, str]:
+    """Return (council_kind, verdict_state, scope_topic) — all derived from name."""
+    low = stem.lower()
+    kind = next((v for k, v in KIND_KEYWORDS if k in low), "ad-hoc")
+    state = next((s for s in VERDICT_STATES if s in low), "deliberation")
+    cleaned = re.sub(r"-{2,}", "-", DATE_RE.sub("", stem)).strip("-")
+    keywords = {kw for kw, _ in KIND_KEYWORDS}
+    parts = [p for p in cleaned.split("-") if p and p.lower() not in keywords]
+    return kind, state, ("-".join(parts) or "?")
+
+
+def read_frontmatter(path: Path) -> str:
+    if path.suffix not in {".md", ".txt"}:
+        return ""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            return "".join(line for _, line in zip(range(FRONTMATTER_LINES), fh))
+    except OSError:
+        return ""
+
+
+def parse_frontmatter(text: str) -> dict:
+    out: dict = {"grounded": "Grounding:" in text or "Grounding " in text}
+    for field, pattern in FRONTMATTER_PATTERNS:
+        match = pattern.search(text)
+        if not match:
+            out[field] = None
+            continue
+        if field == "council_size":
+            out["council_size"] = int(match.group(2))
+            out["providers_responded"] = int(match.group(1))
+        else:
+            out[field] = match.group(1)
+    return out
+
+
+def derive_date(stem: str, fm_date: str | None, path: Path) -> str:
+    if fm_date and DATE_RE.match(fm_date):
+        return fm_date[:10]
+    name_match = DATE_RE.search(stem)
+    if name_match:
+        return name_match.group(1)
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d")
+    except OSError:
+        return "?"
+
+
+def build_record(path: Path, root_label: str) -> dict:
+    kind, state, topic = parse_filename(path.stem)
+    fm_text = read_frontmatter(path)
+    fm = parse_frontmatter(fm_text)
+    return {
+        "artefact_path": str(path),
+        "artefact_kind": path.suffix.lstrip("."),
+        "council_kind": kind,
+        "scope_topic": topic,
+        "council_size": fm.get("council_size"),
+        "providers_responded": fm.get("providers_responded"),
+        "verdict_date": derive_date(path.stem, fm.get("verdict_date"), path),
+        "verdict_state": state,
+        "grounded": fm.get("grounded", False),
+        "hypothesis_id": fm.get("hypothesis_id"),
+        "extracted_from": "filename+frontmatter" if fm_text else "filename",
+        "root": root_label,
+    }
+
+
+def matches(record: dict, topic: str | None, kind: str | None) -> bool:
+    if topic and topic.lower() not in record["scope_topic"].lower():
+        return False
+    if kind and kind.lower() != record["council_kind"].lower():
+        return False
+    return True
+
+
+def scan_root(root: Path, pattern: re.Pattern, label: str) -> list[dict]:
+    if not root.exists():
+        print(f"[discover] root missing, skipping: {root}", file=sys.stderr)
+        return []
+    records = []
+    for entry in sorted(root.rglob("*")):
+        if entry.is_file() and entry.suffix in EXTENSIONS and pattern.search(entry.stem.lower()):
+            records.append(build_record(entry, label))
+    print(f"[discover] {label}: {len(records)} artefact(s)", file=sys.stderr)
+    return records
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Mechanical council artefact discovery (Rule 21).")
+    parser.add_argument("--root", action="append", default=None, help="Override roots (repeatable).")
+    parser.add_argument("--topic", default=None, help="Filter by scope_topic substring.")
+    parser.add_argument("--kind", default=None, help="Filter by council_kind exact.")
+    parser.add_argument("--pattern", default=DEFAULT_PATTERN, help="Filename keyword regex.")
+    args = parser.parse_args(argv)
+    roots = [Path(os.path.expanduser(r)) for r in (args.root or DEFAULT_ROOTS)]
+    pattern = re.compile(args.pattern, re.IGNORECASE)
+    records: list[dict] = []
+    for root in roots:
+        records.extend(scan_root(root, pattern, root.name or str(root)))
+    filtered = [r for r in records if matches(r, args.topic, args.kind)]
+    json.dump(filtered, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+    print(f"[discover] total: {len(filtered)} (filtered from {len(records)})", file=sys.stderr)
+    return 0 if filtered else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

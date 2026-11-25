@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# gg++-vscode — VSCode-safe GRIP wrapper for the Claude Code extension.
+#
+# The VSCode "Claude Process Wrapper" setting replaces the claude binary
+# VSCode spawns. It passes CLI args (IPC flags, stdio, --print, etc.) that
+# MUST reach the real claude process or the extension silently breaks
+# (no completions, no file edits, no MCP).
+#
+# Unlike gg++ (interactive shell), this wrapper:
+#   1. Warms GRIP session context in the background (best-effort, non-blocking)
+#   2. Exec's the real `claude` binary with ALL of VSCode's args intact
+#
+# Install path (VSCode setting):
+#   /Users/<you>/.claude/bin/gg++-vscode
+#
+# Usage: invoked by VSCode Claude Code extension automatically.
+
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+
+# Best-effort GRIP warm — never block, never fail loudly
+if [[ -x "$CLAUDE_DIR/bin/grip" ]]; then
+    ( "$CLAUDE_DIR/bin/grip" preload --silent >/dev/null 2>&1 & ) || true
+fi
+
+# Resolve the real claude binary (skip ourselves if we're shadowing it)
+CLAUDE_BIN=""
+for candidate in \
+    "$HOME/.claude/local/claude" \
+    "$HOME/.local/bin/claude" \
+    "/opt/homebrew/bin/claude" \
+    "/usr/local/bin/claude"; do
+    if [[ -x "$candidate" ]]; then
+        CLAUDE_BIN="$candidate"
+        break
+    fi
+done
+
+# Fallback: PATH lookup, excluding this wrapper's directory
+if [[ -z "$CLAUDE_BIN" ]]; then
+    CLAUDE_BIN="$(PATH="${PATH//$CLAUDE_DIR\/bin:/}" command -v claude || true)"
+fi
+
+if [[ -z "$CLAUDE_BIN" ]]; then
+    echo "gg++-vscode: could not locate real 'claude' binary" >&2
+    echo "Install: https://docs.claude.com/claude-code or run 'npm i -g @anthropic-ai/claude-code'" >&2
+    exit 127
+fi
+
+
+if [[ "${GRIP_USE_GEMINI:-false}" == "true" ]]; then
+    exec "$CLAUDE_DIR/bin/grip-gemini" -- gg++ "$@"
+else
+    exec "$CLAUDE_BIN" "$@"
+fi
+

@@ -1,0 +1,115 @@
+name: decision
+description: Structured decision frameworks, options analysis, criteria weighting
+version: 1.0.0
+effort: high
+triggers:
+- /mode decision
+- decide
+- decision
+- options analysis
+- trade-offs
+- pros and cons
+- criteria weighting
+skills:
+  always:
+  - decision-mode
+  - decision-locking
+  - reasoning-with-ai
+  - hitl
+  - asking-users
+  - creating-wizards
+  - hitl-decision-matrix
+  optional:
+  - pre-mortem-facilitation
+  - red-teaming-strategic-decisions
+  - hypothesis-validation
+token_budget: ~3000
+foundation: true
+stacks_with:
+- ut++
+- asking-users
+- creating-wizards
+- hitl
+- hitl-decision-matrix
+- context-gate
+prompt_injection: '[MODE: DECISION]
+
+
+  Structured decision protocols active. Bias-aware analysis enabled.
+
+
+  Decision workflow:
+
+  1. FRAME - Define the decision clearly (what, why, constraints, timeline)
+
+  2. CRITERIA - Establish weighted evaluation criteria
+
+  3. OPTIONS - Generate and describe all viable options
+
+  4. ANALYSE - Score options against criteria with evidence
+
+  5. STRESS - Pre-mortem, red team, reversibility check
+
+  6. DECIDE - Make recommendation with confidence level
+
+  7. LOCK - Document decision rationale for future reference
+
+
+  Complexity tiers:
+
+  - SIMPLE (2-3 options, clear criteria): Skip to ANALYSE
+
+  - MODERATE (3-5 options, competing criteria): Full workflow
+
+  - COMPLEX (5+ options, uncertainty, high stakes): Full workflow + stress testing
+
+
+  Cognitive bias checks (apply at ANALYSE phase):
+
+  - Anchoring: Am I overweighting the first option considered?
+
+  - Sunk cost: Am I factoring in irrecoverable past investment?
+
+  - Status quo: Am I favoring "do nothing" without justification?
+
+  - Confirmation: Am I seeking evidence that supports my preference?
+
+
+  Decision quality signals:
+
+  - Can you explain the decision to a skeptic?
+
+  - Would you make the same choice with 10x the stakes?
+
+  - What would have to be true for the opposite choice to be right?
+
+
+  MANDATORY AskUserQuestion when:
+
+  - Criteria weights need user input
+
+  - Options are close (within 10% of each other)
+
+  - Decision is irreversible or high-stakes
+
+  - New information changes the framing
+
+  - User hasn''t stated their risk tolerance
+
+
+  Always document: Decision + Rationale + Alternatives considered + Risks accepted.
+
+  '
+wave:
+  category: wave_aligned
+  w_level: 2
+  phase: ascent
+broly:
+  enabled: false
+context:
+- Technology selection
+- Architecture decisions
+- Strategic choices
+- Resource allocation
+- Risk assessment
+welcome_message: Decision mode active. Bias-aware analysis with cognitive checks enabled.

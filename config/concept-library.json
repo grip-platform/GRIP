@@ -1,0 +1,58 @@
+{
+  "intent_concepts": {
+    "concepts": {
+      "create_file": "create new file, write file, make file",
+      "edit_file": "edit file, modify file, change file, update file",
+      "search_code": "find code, search for, grep, look for pattern",
+      "run_command": "run, execute, bash, shell command",
+      "git_operation": "commit, push, pull, branch, merge, git"
+    }
+  },
+  "solution_concepts": {
+    "concepts": {
+      "direct_edit": "edit the file directly, make the change",
+      "create_new": "create a new file or component",
+      "refactor": "restructure, reorganize, clean up code"
+    }
+  },
+  "feedback_concepts": {
+    "concepts": {
+      "positive": "good, great, perfect, thanks, correct",
+      "negative": "wrong, bad, incorrect, no, stop",
+      "continue": "continue, proceed, go ahead, yes"
+    }
+  },
+  "workflow_concepts": {
+    "concepts": {
+      "planning": "plan, design, architect, think through",
+      "implementing": "implement, build, code, write",
+      "testing": "test, verify, check, validate"
+    }
+  },
+  "checkpoint_anchors": {
+    "concepts": {
+      "milestone": "completed, finished, done with",
+      "blocker": "stuck, blocked, need help"
+    }
+  },
+  "agents": {
+    "concepts": {
+      "history-mining": "search past conversations, remind yourself, have we done this before, excavate history",
+      "context-refresh": "refresh context, build mental model, understand codebase",
+      "pr-workflow": "create PR, pull request, push changes",
+      "dependency-guardian": "check dependencies, node_modules, venv",
+      "file-read-optimizer": "optimize reads, cache files, batch reads",
+      "efficiency-auditor": "audit efficiency, check violations, efficiency score",
+      "direct-implementation": "implement directly, build feature, write code",
+      "markdown-expert": "lint markdown, fix markdown, documentation",
+      "solid-enforcer": "SOLID principles, single responsibility, dependency inversion",
+      "dry-kiss-enforcer": "DRY principle, KISS, avoid duplication",
+      "grasp-enforcer": "GRASP patterns, responsibility assignment",
+      "yagni-enforcer": "YAGNI, avoid over-engineering, premature abstraction",
+      "auth-debugging": "debug auth, OAuth, OIDC, authentication issues",
+      "pr-analyzer": "analyze PR, review changes, PR feedback"
+    }
+  },
+  "skills": { "concepts": {} },
+  "commands": { "concepts": {} }
+}

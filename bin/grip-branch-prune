@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# grip-branch-prune — safely delete local branches merged into origin/main.
+#
+# Sessions create a feature branch per piece of work, merge it via PR, and leave
+# the local branch behind. Over time ~/.grip accumulates hundreds of dead local
+# branches (measured: ~100 pruned in one pass). This prunes them SAFELY: only
+# branches whose commits are reachable from origin/main, via `git branch -d`,
+# which refuses anything unmerged or checked out in another worktree.
+#
+# This is a LOCAL operation — CI cannot do it (runners are ephemeral, fresh
+# clones). It is scheduled by launchd on macOS (com.grip.branch-prune) and
+# systemd --user on the VPS (config/branch-prune.timer).
+#
+# Usage:
+#   grip-branch-prune                 # prune ~/.grip
+#   grip-branch-prune /path/to/repo   # prune another GRIP checkout
+#   grip-branch-prune --dry-run       # list what WOULD be deleted, change nothing
+set -euo pipefail
+
+DRY=0
+if [ "${1:-}" = "--dry-run" ]; then DRY=1; shift; fi
+REPO="${1:-$HOME/.grip}"
+
+git -C "$REPO" fetch -q origin main 2>/dev/null \
+  || { echo "grip-branch-prune: fetch failed; leaving branches alone" >&2; exit 0; }
+
+branches=$(git -C "$REPO" branch --merged origin/main --format='%(refname:short)' \
+  | grep -vE '^(main|master)$' || true)
+
+if [ -z "$branches" ]; then
+  echo "grip-branch-prune: no merged local branches to prune in $REPO"
+  exit 0
+fi
+
+count=0
+for b in $branches; do
+  if [ "$DRY" = 1 ]; then
+    echo "would delete $b"
+    count=$((count + 1))
+    continue
+  fi
+  if git -C "$REPO" branch -d "$b" >/dev/null 2>&1; then
+    echo "deleted $b"
+    count=$((count + 1))
+  fi
+done
+
+verb=$([ "$DRY" = 1 ] && echo "would delete" || echo "deleted")
+echo "grip-branch-prune: $verb $count branch(es)"

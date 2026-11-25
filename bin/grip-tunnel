@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# grip-tunnel -- the GRIP MCP tunnel kit: scaffold/certs/doctor/nonce/up/down/
+# status/stop/weather/cert-status/cert-renew/vendor-check.
+# Thin wrapper: lib/mcp_tunnel.py does the work; see docs/mcp-tunnel-first-contact.md.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec "$here/bin/grip-py" "$here/lib/mcp_tunnel.py" "$@"

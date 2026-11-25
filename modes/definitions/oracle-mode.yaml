@@ -1,0 +1,72 @@
+name: oracle
+description: Token-scarce operation. Single-shot queries, genome lookup, no iteration. Uses Sonnet for cost efficiency.
+version: 1.1.0
+effort: medium
+triggers:
+- /mode oracle
+- token scarce
+- carrington event
+- offline mode
+skills:
+  always: []
+  optional: []
+token_budget: ~500
+foundation: true
+model_policy:
+  default: sonnet
+  reason: "Oracle mode prioritises token efficiency — Sonnet is faster and cheaper per token while maintaining quality for single-shot answers. Opus reserved for Code/RSI where reasoning depth matters."
+stacks_with:
+- asking-users
+- creating-wizards
+- hitl
+prompt_injection: '[MODE: ORACLE — Sonnet preferred]
+
+
+  Token-scarce operation active. Every token counts. Use Sonnet model for all operations.
+
+
+  Behaviour:
+
+  1. NO convergence loops — single-shot answers only
+
+  2. NO Broly agents — direct response
+
+  3. Genome in LOOKUP mode — consult top-K genes by fitness, do not evolve
+
+  4. Memory recall limited to genome pulse only
+
+  5. Pre-validate all queries before sending
+
+  6. Use Sonnet model — Opus is overkill for single-shot genome lookups
+
+
+  When answering:
+
+  - Consult genome.oracle_recommend() for relevant skills
+
+  - Use compressed skill content from top genes
+
+  - Prefer shortest correct answer
+
+  - Skip preamble, postamble, and educational asides
+
+  - No file reads unless absolutely necessary
+
+
+  The genome carries the accumulated judgement from the age of abundance.
+
+  In oracle mode, you are the inference engine. The genome is the trained weights.
+
+  '
+broly:
+  enabled: false
+  default_level: thread
+  team_pattern: null
+  reasoning_hint: cot
+  escalation: null
+context:
+- Token-limited environments
+- Local LLM operation
+- Budget conservation
+- Offline or degraded connectivity
+welcome_message: Oracle mode active. Single-shot, genome lookup, no iteration. Every token counts.

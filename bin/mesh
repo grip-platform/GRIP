@@ -1,0 +1,395 @@
+#!/usr/bin/env bash
+# mesh — KISS CLI for grip-session-mesh cross-session context transfer.
+#
+# Topology recipes:
+#   1-to-many   (publish state):   mesh push       # then others: mesh pull <my-id>
+#   many-to-1   (gather state):    mesh collect    # digest of every LIVE.md
+#   many-to-many (gossip):         mesh sync       # push + collect in one call
+#
+# Hypothesis: H-MESH-CLI-1 (deadline 2026-07-01) — eight subcommands, each <=3
+# args, total <=200 LOC, live round-trip across all three topologies.
+
+set -euo pipefail
+
+DB="${CLAUDE_MESH_DB_PATH:-$HOME/.grip-session-mesh/presence.db}"
+SYNC="${CLAUDE_MESH_SYNC_DIR:-$HOME/.claude/sync}"
+HOOKS="${CLAUDE_MESH_HOOKS_DIR:-$HOME/.claude/hooks}"
+
+# Stable session identity: prefer the harness UUID (CLAUDE_CODE_SESSION_ID =
+# transcript stem <uuid>.jsonl, the owner/lane join key — task #517), then the
+# legacy/manual CLAUDE_SESSION_ID, then the unstable bash-PPID last resort
+# (the id churns per shell). Keying on the UUID makes cc-<uuid> join directly
+# to the transcript AND the task owner field.
+if [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
+    SELF_ID="cc-${CLAUDE_CODE_SESSION_ID}"
+elif [[ -n "${CLAUDE_SESSION_ID:-}" ]]; then
+    SELF_ID="cc-${CLAUDE_SESSION_ID}"
+else
+    SELF_ID="cc-pid-${PPID}"
+fi
+export MESH_SELF_ID="$SELF_ID"
+
+mesh_push() {
+    # Force the dump hook to resolve the SAME id the CLI did: pass the resolved
+    # id in BOTH vars the hook consults (it prefers CLAUDE_CODE_SESSION_ID now),
+    # so a PPID-fallback CLI and a UUID-preferring hook can never disagree.
+    local sid="${SELF_ID#cc-}"
+    CLAUDE_CODE_SESSION_ID="$sid" CLAUDE_SESSION_ID="$sid" GRIP_MESH_DUMP_INTERVAL_S=1 \
+        python3 "$HOOKS/mesh-live-dump-hook.py" 2>/dev/null || true
+    local f="$SYNC/${SELF_ID}-LIVE.md"
+    if [[ -f "$f" ]]; then echo "pushed: $f ($(wc -c <"$f" | tr -d ' ') bytes)"
+    else echo "push failed: dump hook did not produce $f" >&2; return 1; fi
+}
+
+mesh_pull() {
+    local target="${1:-$SELF_ID}"
+    if [[ "$target" == "all" ]]; then
+        local found=0
+        for f in "$SYNC"/cc-*-LIVE.md; do
+            [[ -f "$f" ]] || continue
+            found=1
+            printf '\n===== %s =====\n' "$(basename "$f")"
+            cat "$f"
+        done
+        [[ $found -eq 0 ]] && echo "no live dumps found in $SYNC" >&2
+    else
+        local f="$SYNC/${target}-LIVE.md"
+        if [[ -f "$f" ]]; then cat "$f"
+        else echo "no live dump for $target — try: mesh list" >&2; return 1; fi
+    fi
+}
+
+mesh_collect() {
+    printf '# Mesh Collect Digest — %s\n\n' "$(date -u +%FT%TZ)"
+
+    # Live-session set (datetime-coerced via the canonical helper) so each digest
+    # row can be MARKED live vs stale — the digest still lists every dump (the
+    # documented contract + parity with `pull all`), but never frames a stale
+    # snapshot as live. Tombstones are labelled, not silently hidden.
+    local _collect_data live_set
+    _collect_data=$(CLAUDE_MESH_DB_PATH="$DB" CLAUDE_MESH_SYNC_DIR="$SYNC" \
+        python3 "$MESH_GC_PY" state-data 2>/dev/null || true)
+    # Same guard as mesh_state: state-data ALWAYS emits a `live_sessions=...` first
+    # line; if it doesn't, mesh_gc failed — warn instead of silently marking every
+    # dump stale (line 1 = counts, lines 2+ = live LIVE.md paths → live_set).
+    if [[ "$(printf '%s\n' "$_collect_data" | head -1)" != live_sessions=* ]]; then
+        echo "[mesh] warning: live/stale marking unavailable (mesh_gc state-data produced no parseable output); all dumps shown stale" >&2
+    fi
+    live_set=$(printf '%s\n' "$_collect_data" | tail -n +2)
+
+    local found=0
+    for f in "$SYNC"/cc-*-LIVE.md; do
+        [[ -f "$f" ]] || continue
+        found=1
+        local id branch head dirty drift ts marker
+        id=$(basename "$f" -LIVE.md)
+        # awk sub() strips the leading `key: ` once so ISO 8601 timestamps
+        # (with their own colons) survive intact.
+        branch=$(awk '/^branch:/{sub(/^branch: */, ""); print; exit}' "$f")
+        head=$(awk '/^head_sha:/{sub(/^head_sha: */, ""); print; exit}' "$f")
+        dirty=$(awk '/^dirty:/{sub(/^dirty: */, ""); print; exit}' "$f")
+        drift=$(awk '/^drift:/{sub(/^drift: */, ""); print; exit}' "$f")
+        [[ -n "$drift" ]] || drift="unknown"
+        ts=$(awk '/^timestamp:/{sub(/^timestamp: */, ""); print; exit}' "$f")
+        if printf '%s\n' "$live_set" | grep -qxF "$f"; then marker="live"; else marker="stale"; fi
+        printf -- '- **%s** [%s] | branch=%s | head=%s | dirty=%s | drift=%s | as-of=%s\n' "$id" "$marker" "$branch" "$head" "$dirty" "$drift" "$ts"
+    done
+    if [[ $found -eq 0 ]]; then
+        echo "(no live dumps yet — run \`mesh push\` in any session)"
+    else
+        mesh_state
+    fi
+}
+
+# Plain-English holistic state of GRIP across all known sessions. Reads the
+# same LIVE.md files as the digest but speaks human (no jargon, no metric
+# codes) so anyone — not just GRIP operators — can read it. Always printed
+# after a non-empty digest; also available standalone as `mesh state`.
+# lib/mesh_gc.py is the single source of truth for liveness (datetime-coerced —
+# fixes the string-comparison bug) AND for the live-vs-tombstone count split, so
+# mesh_state can never again frame stale tombstones as current work.
+# Resolve mesh_gc.py relative to THIS script — bin/mesh and lib/mesh_gc.py ship
+# together, so a worktree or non-default checkout finds its OWN copy, never a
+# stale $HOME/.claude one (the CLAUDE_DIR/$HOME path silently mis-resolves when
+# bin/mesh runs from a git worktree). CLAUDE_MESH_GC_PY still overrides (injection/tests).
+_MESH_REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
+MESH_GC_PY="${CLAUDE_MESH_GC_PY:-$_MESH_REPO_DIR/lib/mesh_gc.py}"
+
+mesh_state() {
+    # Opportunistic, throttled GC (>=1h since last run; atomically single-winner
+    # under concurrent sessions) so the backlog drains without a separate cron.
+    # Best-effort, fail-closed, never blocks state output.
+    CLAUDE_MESH_DB_PATH="$DB" CLAUDE_MESH_SYNC_DIR="$SYNC" \
+        python3 "$MESH_GC_PY" reap --throttled >/dev/null 2>&1 || true
+
+    # ONE python call: line 1 = counts (k=v), remaining lines = live LIVE.md paths
+    # (only files whose backing session is alive NOW — never the raw 47-file glob).
+    local data
+    data=$(CLAUDE_MESH_DB_PATH="$DB" CLAUDE_MESH_SYNC_DIR="$SYNC" \
+        python3 "$MESH_GC_PY" state-data 2>/dev/null || true)
+
+    local live_sessions live_waiting tombstone_waiting counts_line
+    counts_line=$(printf '%s\n' "$data" | head -1)
+    # mesh_gc state-data ALWAYS emits a `live_sessions=...` first line (even for an
+    # empty DB). A line that does NOT match means state-data failed (missing module,
+    # DB error, or a traceback swallowed by 2>/dev/null) — warn LOUDLY instead of
+    # letting the sed below silently default all three counts to 0 and under-report.
+    if [[ "$counts_line" != live_sessions=* ]]; then
+        echo "[mesh] warning: live counts unavailable (mesh_gc state-data produced no parseable output); counts shown as 0" >&2
+    fi
+    live_sessions=$(printf '%s' "$counts_line" | sed -n 's/.*live_sessions=\([0-9]*\).*/\1/p')
+    confirmed_sessions=$(printf '%s' "$counts_line" | sed -n 's/.*confirmed_sessions=\([0-9]*\).*/\1/p')
+    live_waiting=$(printf '%s' "$counts_line" | sed -n 's/.*live_waiting=\([0-9]*\).*/\1/p')
+    tombstone_waiting=$(printf '%s' "$counts_line" | sed -n 's/.*tombstone_waiting=\([0-9]*\).*/\1/p')
+    : "${live_sessions:=0}" "${live_waiting:=0}" "${tombstone_waiting:=0}"
+    # An OLDER mesh_gc emits no confirmed_sessions= key — fall back to
+    # live_sessions so the roster still renders (over-reporting as before)
+    # rather than collapsing to a false 0.
+    : "${confirmed_sessions:=$live_sessions}"
+    local unconfirmed=$((live_sessions - confirmed_sessions))
+    (( unconfirmed < 0 )) && unconfirmed=0
+
+    # The branch/head/dirty narrative is derived ONLY from live snapshot files.
+    local -a branches heads dirts drifts timestamps
+    local count=0 f
+    while IFS= read -r f; do
+        [[ -n "$f" && -f "$f" ]] || continue
+        count=$((count + 1))
+        branches+=( "$(awk '/^branch:/{sub(/^branch: */, ""); print; exit}' "$f")" )
+        heads+=( "$(awk '/^head_sha:/{sub(/^head_sha: */, ""); print; exit}' "$f")" )
+        dirts+=( "$(awk '/^dirty:/{sub(/^dirty: */, ""); print; exit}' "$f")" )
+        drifts+=( "$(awk '/^drift:/{sub(/^drift: */, ""); print; exit}' "$f")" )
+        timestamps+=( "$(awk '/^timestamp:/{sub(/^timestamp: */, ""); print; exit}' "$f")" )
+    done < <(printf '%s\n' "$data" | tail -n +2)
+
+    if [[ "$live_sessions" -eq 0 && $count -eq 0 ]]; then
+        echo "No live sessions to summarise yet."
+        return 0
+    fi
+
+    local uniq_branches uniq_heads dirty_n newest
+    uniq_branches=$(printf '%s\n' "${branches[@]}" | sort -u | wc -l | tr -d ' ')
+    uniq_heads=$(printf '%s\n' "${heads[@]}" | sort -u | wc -l | tr -d ' ')
+    dirty_n=$(printf '%s\n' "${dirts[@]}" | grep -c '^true$' || true)
+    newest=$(printf '%s\n' "${timestamps[@]}" | sort -r | head -1)
+
+    printf '\n## In plain English\n\n'
+    # CONFIRMED sessions only — a row that registered and never beat is a
+    # short-lived spawned process, not a peer. Counting those over-reported
+    # reachable peers by 45% on 2026-09-10 (11 rows, 6 real).
+    if [[ "$confirmed_sessions" -eq 1 ]]; then echo "- 1 Claude session is running on this machine."
+    else echo "- $confirmed_sessions Claude sessions are running on this machine."; fi
+    if [[ "$unconfirmed" -gt 0 ]]; then
+        echo "- ($unconfirmed registered but never sent a heartbeat — short-lived spawned processes, not reachable peers.)"
+    fi
+
+    if [[ $count -gt 0 ]]; then
+        if [[ $uniq_branches -eq 1 ]]; then echo "- They are all working on the \`${branches[0]}\` branch."
+        else echo "- They are on $uniq_branches different branches."; fi
+
+        if [[ $uniq_heads -eq 1 ]]; then echo "- Everyone is on the same commit (${heads[0]}) — fully in sync."
+        else echo "- $uniq_heads different commits are in play; some sessions have not refreshed their snapshot in the last 5 minutes."; fi
+
+        if [[ $dirty_n -gt 0 ]]; then echo "- The shared workspace has uncommitted changes (sessions on the same machine share one working tree)."
+        else echo "- The working tree is clean."; fi
+
+        local behind_n stale_n
+        behind_n=$(printf '%s\n' "${drifts[@]}" | grep -c 'behind>=' || true)
+        stale_n=$(printf '%s\n' "${drifts[@]}" | grep -c 'ref .*h old' || true)
+        if [[ $behind_n -gt 0 ]]; then
+            echo "- $behind_n session(s) are behind origin/main. Run \`bin/grip-tree-sync\` before any big action — a stale tree reports code as missing when it merged minutes ago."
+        elif [[ $stale_n -gt 0 ]]; then
+            echo "- Every session reads as level, but $stale_n has not fetched in over an hour, so \"level\" is a lower bound rather than a fact. Run \`git fetch\` before trusting it."
+        else
+            echo "- Every session is level with origin/main."
+        fi
+    fi
+
+    if [[ "$live_waiting" -gt 0 ]]; then echo "- $live_waiting message(s) are waiting in live session inboxes — they will surface on the receiving session's next tool call."
+    else echo "- No messages are waiting between live sessions."; fi
+
+    # Tombstones are a SEPARATE, clearly-labelled diagnostic — NEVER current work.
+    if [[ "$tombstone_waiting" -gt 0 ]]; then
+        echo "- ($tombstone_waiting undelivered message(s) are addressed to sessions that are no longer running — pending cleanup, not current work.)"
+    fi
+
+    [[ -n "$newest" ]] && echo "- Most recent live session snapshot: $newest."
+}
+
+mesh_broadcast() {
+    local body="$*"
+    [[ -z "$body" ]] && { echo "usage: mesh broadcast <message>" >&2; return 1; }
+    MESH_BODY="$body" MESH_LIB_DIR="$_MESH_REPO_DIR/lib" python3 - <<'PY'
+import sqlite3, os, sys, uuid, time
+sys.path.insert(0, os.environ["MESH_LIB_DIR"])
+from mesh_liveness import classify_rows
+db = os.environ.get("CLAUDE_MESH_DB_PATH", os.path.expanduser("~/.grip-session-mesh/presence.db"))
+self_id = os.environ["MESH_SELF_ID"]
+body = os.environ["MESH_BODY"]
+conn = sqlite3.connect(db, timeout=2)
+now = time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
+# Every session not known to have gone (lib/mesh_liveness.py). A session that
+# cannot be confirmed either way is queued anyway (V>>, 2026-10-02): a missed
+# message is the failure this exists to prevent, so when unsure, queue.
+groups = classify_rows(conn.execute(
+    "SELECT id, last_heartbeat FROM sessions WHERE id != ?", (self_id,)
+).fetchall())
+for rid in groups["running"] + groups["unconfirmed"]:
+    conn.execute(
+        "INSERT INTO inbox(id, recipient_id, from_name, body, kind, created_at, delivered) VALUES(?,?,?,?,?,?,0)",
+        (str(uuid.uuid4()), rid, self_id, body, "broadcast", now)
+    )
+conn.commit()
+print(f"broadcast to {len(groups['running'])} running, "
+      f"{len(groups['unconfirmed'])} couldn't confirm (queued anyway), {len(groups['gone'])} gone")
+PY
+}
+
+mesh_room() {
+    # The ROOM is the shared transcript: unlike `inbox`, reading advances a
+    # per-reader cursor instead of deleting the row, so history survives and
+    # peers can see what OTHER peers said. `broadcast` stays the doorbell.
+    #
+    # argv-passthrough to a .py backend rather than an inline heredoc
+    # (CLAUDE.md R0 pattern): this command carries free operator text, and
+    # interpolating that into `python3 - <<PY` is a shell->python injection seam.
+    # SELF-LOCATE the backend. $CLAUDE_DIR answers STATE, never CODE: resolving
+    # a sibling module through it makes this script load a DIFFERENT checkout's
+    # code than the one it ships in -- the defect that put eleven hooks in the
+    # wrong tree. Order is explicit override -> this checkout -> the install.
+    local self="${BASH_SOURCE[0]}"
+    [[ "$self" == */* ]] || self="./$self"
+    local here="${self%/*}"
+    local lib="${GRIP_MESH_ROOM_BACKEND:-}"
+    [[ -n "$lib" ]] || { [[ -f "$here/../lib/mesh_room.py" ]] && lib="$here/../lib/mesh_room.py"; }
+    [[ -n "$lib" ]] || lib="${CLAUDE_DIR:-$HOME/.claude}/lib/mesh_room.py"
+    # The interpreter, in the same order: this checkout's venv, then the
+    # install's, in either platform's layout (resolve_venv_python; a candidate
+    # counts only inside its own venv), then plain python3. The helper
+    # self-locates like the backend; with no helper, plain python3 runs.
+    local utils="$here/../scripts/lib/venv-utils.sh" py="python3" venv cand
+    [[ -f "$utils" ]] || utils="${CLAUDE_DIR:-$HOME/.claude}/scripts/lib/venv-utils.sh"
+    if [[ -f "$utils" ]]; then
+        # shellcheck source=../scripts/lib/venv-utils.sh
+        source "$utils"
+        for venv in "$here/../venv" "${CLAUDE_DIR:-$HOME/.claude}/venv"; do
+            cand="$(resolve_venv_python "$venv" || true)"
+            [[ "$cand" == "$venv/"* ]] && { py="$cand"; break; }
+        done
+    fi
+    [[ -f "$lib" ]] || { echo "mesh room: backend missing at $lib" >&2; return 1; }
+    exec env MESH_SELF_ID="$SELF_ID" "$py" "$lib" "$@"
+}
+
+mesh_inbox() {
+    python3 - <<'PY'
+import sqlite3, os
+db = os.environ.get("CLAUDE_MESH_DB_PATH", os.path.expanduser("~/.grip-session-mesh/presence.db"))
+self_id = os.environ["MESH_SELF_ID"]
+conn = sqlite3.connect(db, timeout=2)
+rows = conn.execute(
+    "SELECT from_name, kind, body, created_at FROM inbox WHERE recipient_id=? AND delivered=0 ORDER BY created_at",
+    (self_id,)
+).fetchall()
+if not rows:
+    print("inbox empty")
+else:
+    for fn, kind, body, ts in rows:
+        print(f"[{ts}] from={fn} kind={kind}\n  {body}\n")
+PY
+}
+
+mesh_sync() { mesh_push; echo; mesh_collect; }
+
+mesh_reap() {
+    # Explicit one-shot GC (also the migration that drains the existing backlog).
+    # Unconditional (not throttled) so an operator can force a clean now.
+    local out
+    out=$(CLAUDE_MESH_DB_PATH="$DB" CLAUDE_MESH_SYNC_DIR="$SYNC" \
+        python3 "$MESH_GC_PY" reap 2>/dev/null || echo '{}')
+    echo "reaped: $out"
+}
+
+mesh_list() {
+    MESH_LIB_DIR="$_MESH_REPO_DIR/lib" python3 - <<'PY'
+import sqlite3, os, sys
+sys.path.insert(0, os.environ["MESH_LIB_DIR"])
+from mesh_liveness import classify_rows
+db = os.environ.get("CLAUDE_MESH_DB_PATH", os.path.expanduser("~/.grip-session-mesh/presence.db"))
+self_id = os.environ["MESH_SELF_ID"]
+conn = sqlite3.connect(db, timeout=2)
+rows = conn.execute(
+    "SELECT id, name, role, last_heartbeat FROM sessions ORDER BY last_heartbeat DESC"
+).fetchall()
+# The same rule as broadcast: list shows exactly the sessions a broadcast
+# queues for, with their state, and counts the gone ones it skips.
+groups = classify_rows((row[0], row[3]) for row in rows)
+label = {rid: "running" for rid in groups["running"]}
+label.update({rid: "couldn't confirm" for rid in groups["unconfirmed"]})
+shown = [row for row in rows if row[0] in label]
+if not shown:
+    print("no sessions in mesh that a broadcast would reach")
+else:
+    print(f"{'ID':36} {'NAME':18} {'ROLE':8} {'STATE':16} HEARTBEAT")
+    for sid, name, role, ts in shown:
+        marker = "  (you)" if sid == self_id else ""
+        print(f"{sid:36} {(name or ''):18} {(role or ''):8} {label[sid]:16} {ts}{marker}")
+if groups["gone"]:
+    print(f"({len(groups['gone'])} gone: their Claude Code process has exited)")
+PY
+}
+
+mesh_help() {
+    cat <<EOF
+mesh — KISS CLI for grip-session-mesh cross-session context transfer
+
+USAGE
+  mesh push                  Force this session to publish LIVE.md NOW (bypass rate limit)
+  mesh pull <id> | all       Print another session's LIVE.md (or every session)
+  mesh collect               Digest + plain-English holistic state of every session
+  mesh state                 Just the plain-English holistic state (no digest table)
+  mesh broadcast <message>   Queue a message for every other session not known to
+                             have gone; sessions it cannot confirm are queued anyway
+  mesh room say <message>    Post to the shared transcript every peer can read
+  mesh room read             What you have not seen yet (advances your cursor)
+  mesh room tail [N]         Recent history — survives being read, unlike inbox
+  mesh room who              Who has spoken here, and as what kind
+  mesh room veto <seq> <why> Record an advisory veto of one message
+                             Options come FIRST: --as session|human|agent
+                             --name NAME  --room NAME  --kind  --parent  --reply-to
+  mesh inbox                 Read this session's pending inbox messages
+  mesh sync                  Push self + collect everyone (many-to-many gossip)
+  mesh list                  Show the sessions a broadcast reaches, each running
+                             or couldn't confirm, and count the gone ones
+  mesh reap                  Garbage-collect dead-recipient inbox tombstones,
+                             dead session rows, and stale LIVE.md (fail-closed,
+                             >24h floor). Runs automatically (throttled) on \`state\`.
+  mesh help                  This message
+
+TOPOLOGY RECIPES
+  1-to-many  (publish state):   mesh push           # others: mesh pull <my-id>
+  many-to-1  (gather state):    mesh collect        # one-shot digest
+  many-to-many (gossip):        mesh sync           # push + collect together
+
+ENV
+  CLAUDE_CODE_SESSION_ID       Harness session UUID (transcript stem) — preferred
+  CLAUDE_SESSION_ID            Legacy/manual override (else falls back to PPID)
+  CLAUDE_MESH_DB_PATH          Override presence DB (default: ~/.grip-session-mesh/presence.db)
+  CLAUDE_MESH_SYNC_DIR         Override sync dir (default: ~/.claude/sync)
+EOF
+}
+
+case "${1:-help}" in
+    push)            shift; mesh_push "$@" ;;
+    pull)            shift; mesh_pull "$@" ;;
+    collect)         shift; mesh_collect "$@" ;;
+    state)           shift; mesh_state "$@" ;;
+    broadcast)       shift; mesh_broadcast "$@" ;;
+    room)            shift; mesh_room "$@" ;;
+    inbox)           shift; mesh_inbox "$@" ;;
+    sync)            shift; mesh_sync "$@" ;;
+    list)            shift; mesh_list "$@" ;;
+    reap)            shift; mesh_reap "$@" ;;
+    help|-h|--help)  mesh_help ;;
+    *)               echo "unknown subcommand: $1" >&2; mesh_help; exit 1 ;;
+esac

@@ -1,0 +1,83 @@
+name: git-ops
+description: Git workflow automation with pre-flight checks and self-recovery
+version: 1.0.0
+effort: high
+triggers:
+- /mode git-ops
+- git operations
+- branch cleanup
+- ship it
+skills:
+  always:
+  - gitops
+  - pr-automation
+  - branch-cleanup
+  - bash-command-safety
+  - concise-communication
+  optional:
+  - code-agentic
+token_budget: ~3500
+foundation: true
+stacks_with:
+- asking-users
+- creating-wizards
+- hitl
+- context-gate
+prompt_injection: '[MODE: GIT-OPS]
+
+
+  Pre-flight checks before every git operation:
+
+  1. Check for .git/index.lock (stale locks > 5min: warn user with PID)
+
+  2. Check git status for uncommitted changes before branch operations
+
+  3. Verify current branch before push (never push to main without approval)
+
+  4. Check for concurrent GRIP sessions on same repo via grip_registry
+
+
+  Self-recovery patterns:
+
+  - Push blocked by gate: immediately AskUserQuestion with clear context
+
+  - Merge conflict: present conflict summary, ask user for resolution strategy
+
+  - Diverged branch: show commit comparison, propose rebase or merge
+
+  - Lock file found: check if process alive, warn user
+
+
+  Branch safety:
+
+  - All branch names lowercase (cross-platform)
+
+  - Protected: main, master, develop, release, production
+
+  - Feature branch push: auto-allowed by tiered gate
+
+  - Force push: always requires explicit approval
+
+
+  Batch workflow sequences (execute without intermediate confirmations):
+
+  - commit-push: stage specified files, commit, push to current branch
+
+  - pr-create: commit, push, create PR with summary
+
+  - branch-cleanup: delete merged local+remote branches, prune
+
+
+  When hooks block: halt and AskUserQuestion immediately.
+
+  Never print manual commands. Never retry blocked commands.
+
+  '
+wave:
+  category: orthogonal
+context:
+- Git workflow automation
+- Branch management
+- PR operations
+- Repository maintenance
+welcome_message: Git-ops mode active. Trunk-based development, branch strategy, release management.

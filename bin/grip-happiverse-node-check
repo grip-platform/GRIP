@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""grip-happiverse-node-check — is this machine on the HAPPIverse? Measured.
+
+    grip-happiverse-node-check "Blackbook" --hostname blackbook --repo ~/.claude \
+        --health 'bin/grip-happiverse' [--ssh user@host] [--json]
+
+Four legs, per the criterion locked 2026-09-22: a mesh heartbeat under 60s, a
+checkout level with origin/main, a health probe that answers, and a star reading
+"live" on the DEPLOYED public map. A leg that could not be measured is UNKNOWN,
+and one UNKNOWN makes the whole verdict UNKNOWN — never PASS. Exit code is 0 for
+PASS, 1 for FAIL, 2 for UNKNOWN, so a caller cannot read silence as success.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR") or (Path.home() / ".claude"))
+# Find our OWN library first. CLAUDE_DIR defaults to $HOME/.claude — the SHARED
+# tree — so resolving imports through it means a copy of this script running from
+# a worktree imports a DIFFERENT checkout's modules, or fails outright when the
+# shared tree does not carry them yet. The script's own parent always holds the
+# lib/ it was written against; CLAUDE_DIR stays as a fallback so an installed
+# layout that separates bin/ from lib/ still resolves.
+#
+# The fallback is inserted FIRST, because each insert(0) lands in front of the
+# last one. The order was the other way round, which put CLAUDE_DIR in front and
+# did exactly what this comment warns against: measured 2026-09-24, a worktree
+# copy of grip-happiverse-keep-level imported the shared tree's older module and
+# died on an ImportError.
+for _root in (CLAUDE_DIR, Path(__file__).resolve().parent.parent):
+    if (_root / "lib").is_dir() and str(_root) not in sys.path:
+        sys.path.insert(0, str(_root))
+
+from lib.happiverse_node_check import (  # noqa: E402
+    DEFAULT_MAP_URL, FAIL, PASS, UNKNOWN, NodeSpec, Runner, canonical_main, check_node,
+)
+
+# main is read from the repository this script belongs to, on THIS machine —
+# never from the machine being measured, whose copy of main may be frozen.
+_OWN_REPO = Path(__file__).resolve().parent.parent
+
+_EXIT = {PASS: 0, FAIL: 1, UNKNOWN: 2}
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="grip-happiverse-node-check", description=__doc__.split("\n")[0])
+    ap.add_argument("nickname", help="the machine's star nickname, e.g. \"the second Mac\"")
+    ap.add_argument("--hostname", action="append", default=[],
+                    help="a hostname this machine registers with in the mesh (repeatable)")
+    ap.add_argument("--repo", default="", help="the GRIP checkout on that machine")
+    ap.add_argument("--ssh", default="", help="user@host to measure a REMOTE machine")
+    ap.add_argument("--health", default="", help="health probe command; unset means UNKNOWN, never PASS")
+    ap.add_argument("--map-url", default=DEFAULT_MAP_URL, help="the deployed public registry")
+    ap.add_argument("--presence-db", default=str(Path.home() / ".grip-session-mesh" / "presence.db"))
+    ap.add_argument("--main-repo", default=str(_OWN_REPO),
+                    help="repository whose freshly fetched origin/main is the definition of level")
+    ap.add_argument("--json", action="store_true", help="emit the record as JSON")
+    ns = ap.parse_args(argv)
+
+    record = check_node(
+        NodeSpec(nickname=ns.nickname, hostnames=tuple(ns.hostname), repo_dir=ns.repo,
+                 ssh=ns.ssh, health_command=ns.health),
+        presence_db=ns.presence_db, map_url=ns.map_url, runner=Runner(ssh=ns.ssh),
+        canonical=canonical_main(ns.main_repo),
+    )
+    if ns.json:
+        print(json.dumps(record, indent=2))
+    else:
+        print(f"{record['nickname']}: {record['overall']}")
+        for leg in record["legs"]:
+            print(f"  [{leg['verdict']:<7}] {leg['leg']:<9} {leg['evidence']}")
+    return _EXIT[record["overall"]]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""Install, inspect, or remove HAL's per-user services."""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+from grip_hal_services import main  # noqa: E402
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

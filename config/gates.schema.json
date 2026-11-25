@@ -1,0 +1,129 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GRIP Safety Gates Configuration",
+  "description": "User-customizable safety gates that provide deterministic HALT conditions",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "Schema version",
+      "const": "2.0"
+    },
+    "defaults": {
+      "type": "object",
+      "description": "Default settings for all gates",
+      "properties": {
+        "enabled": { "type": "boolean", "default": true },
+        "action": { "type": "string", "enum": ["deny", "warn", "log"], "default": "deny" },
+        "audit": { "type": "boolean", "default": true }
+      }
+    },
+    "gates": {
+      "type": "array",
+      "description": "List of safety gates",
+      "items": {
+        "type": "object",
+        "required": ["id", "condition"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique gate identifier",
+            "pattern": "^[a-z][a-z0-9-]*$"
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-readable name"
+          },
+          "description": {
+            "type": "string",
+            "description": "What this gate protects against"
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether gate is active",
+            "default": true
+          },
+          "priority": {
+            "type": "integer",
+            "description": "Evaluation order (lower = earlier)",
+            "default": 100
+          },
+          "condition": {
+            "type": "object",
+            "description": "Condition that triggers the gate",
+            "required": ["type"],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "tool_match",
+                  "path_contains",
+                  "command_pattern",
+                  "context_threshold",
+                  "confidence_threshold",
+                  "content_pattern",
+                  "custom"
+                ]
+              },
+              "tools": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Tools this gate applies to"
+              },
+              "patterns": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Regex patterns to match"
+              },
+              "paths": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Path components to block"
+              },
+              "threshold": {
+                "type": "number",
+                "description": "Numeric threshold (0-1 for percentages)",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "expression": {
+                "type": "string",
+                "description": "Custom Python expression for 'custom' type"
+              }
+            }
+          },
+          "action": {
+            "type": "string",
+            "enum": ["deny", "warn", "log", "ask"],
+            "description": "What to do when gate triggers",
+            "default": "deny"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Message shown when gate triggers"
+          },
+          "recovery": {
+            "type": "string",
+            "description": "How to proceed after trigger (e.g., 'ask_user', 'halt', 'retry_with_approval')"
+          },
+          "tests": {
+            "type": "object",
+            "description": "Test cases for verification",
+            "properties": {
+              "must_block": {
+                "type": "array",
+                "items": { "type": "object" },
+                "description": "Inputs that MUST be blocked"
+              },
+              "must_allow": {
+                "type": "array",
+                "items": { "type": "object" },
+                "description": "Inputs that MUST be allowed"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

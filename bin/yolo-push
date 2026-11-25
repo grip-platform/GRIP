@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# yolo-push — single-shot direct-to-main push with GRIP branch-protection bypass.
+#
+# Sets GRIP_BRANCH_PROTECTION_BYPASS=1 for the child `git push` process only,
+# which the GRIP push gate (lib/gates/git_gates.py) honours as an opt-in
+# escape hatch for the non-force protected-branch push case. Each invocation
+# appends one line to ~/.claude/logs/branch-protection-bypass.log.
+#
+# SAFETY INVARIANT: this bypass NEVER covers force push. If you try
+#   yolo-push --force origin main
+# the gate still blocks you. Force push needs the heavier GRIP_AUTONOMOUS L2
+# path or manual approval.
+#
+# Usage
+#   yolo-push                        # push current branch to origin
+#   yolo-push origin main            # push main to origin explicitly
+#   yolo-push upstream release       # push release to upstream
+#
+# Requires: the running Claude Code session must be inside a harness that
+# enforces the GRIP push gate. Outside GRIP this script is a pass-through to
+# `git push` because the env var has no meaning — no harm done.
+
+set -euo pipefail
+
+if [[ "${1:-}" == "--force" || "${1:-}" == "-f" ]]; then
+    echo "yolo-push: refusing --force; use GRIP_AUTONOMOUS L2 or manual approval for force push." >&2
+    exit 1
+fi
+
+if [[ $# -eq 0 ]]; then
+    if ! branch="$(git symbolic-ref --short HEAD 2>/dev/null)"; then
+        echo "yolo-push: not on a branch (detached HEAD?). Pass remote + ref explicitly." >&2
+        exit 1
+    fi
+    echo "yolo-push: pushing current branch '$branch' to origin (audit-logged)" >&2
+    exec env GRIP_BRANCH_PROTECTION_BYPASS=1 git push origin "$branch"
+fi
+
+exec env GRIP_BRANCH_PROTECTION_BYPASS=1 git push "$@"

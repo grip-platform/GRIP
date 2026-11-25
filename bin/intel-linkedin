@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# intel-linkedin — one-command LinkedIn feed intel run.
+# KISS orchestrator: brave-cdp status probe → linkedin-feed-scout, or
+# guide V>> to `--auth` if CDP isn't live. Manual publish gate preserved.
+#
+# Usage:
+#   intel-linkedin              # status → scout top-5 if CDP up; else HITL
+#   intel-linkedin --auth       # launch Brave-CDP background + login prompt
+#   intel-linkedin --dry        # extraction + L1 only
+#   intel-linkedin --top N      # override top-K (default 5)
+#   intel-linkedin --status     # brave-cdp --status only
+#
+# Skill: skills/intel-linkedin/SKILL.md
+# Underlying: bin/brave-cdp + bin/linkedin-feed-scout (PR #3162)
+
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+BRAVE_CDP="${CLAUDE_DIR}/bin/brave-cdp"
+SCOUT="${CLAUDE_DIR}/bin/linkedin-feed-scout"
+
+# Parse flags (small surface — keep CC low per gate)
+MODE="run"; TOP="5"; DRY=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --auth)    MODE="auth";    shift ;;
+    --status)  MODE="status";  shift ;;
+    --dry)     DRY="--dry-run"; shift ;;
+    --top)     TOP="${2:?--top needs N}"; shift 2 ;;
+    -h|--help) MODE="help";    shift ;;
+    *)         echo "[intel-linkedin] unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+[[ -x "${BRAVE_CDP}" ]] || { echo "[intel-linkedin] FATAL: ${BRAVE_CDP} missing/not-exec" >&2; exit 1; }
+[[ -x "${SCOUT}"     ]] || { echo "[intel-linkedin] FATAL: ${SCOUT} missing/not-exec" >&2; exit 1; }
+
+case "${MODE}" in
+  help)
+    sed -n '2,17p' "$0"; exit 0 ;;
+  status)
+    exec "${BRAVE_CDP}" --status ;;
+  auth)
+    "${BRAVE_CDP}" --background || { echo "[intel-linkedin] brave-cdp launch failed" >&2; exit 1; }
+    echo "[intel-linkedin] Brave launched. Log into LinkedIn in the spawned window, then re-run /intel-linkedin."
+    exit 0 ;;
+  run)
+    if ! "${BRAVE_CDP}" --status >/dev/null 2>&1; then
+      echo "[intel-linkedin] CDP not live — Brave isn't running with --remote-debugging-port=9222." >&2
+      echo "[intel-linkedin] Fix: run \`bin/intel-linkedin --auth\` (or \`bin/brave-cdp --background\`)," >&2
+      echo "[intel-linkedin]      log into LinkedIn manually, then re-run /intel-linkedin." >&2
+      exit 1
+    fi
+    exec "${SCOUT}" scout --top "${TOP}" ${DRY} ;;
+esac

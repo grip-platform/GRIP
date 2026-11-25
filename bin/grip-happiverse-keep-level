@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""grip-happiverse-keep-level — push main to every HAPPIverse machine and move it forward.
+
+    grip-happiverse-keep-level [--dry-run] [--fleet FILE] [--main-repo DIR]
+
+One line per machine: ALREADY, UPDATED, BLOCKED (left untouched), MISSING-TIP,
+UNREACHABLE or PUSH-FAILED. Exit 0 when every machine ends level, 1 when any
+does not, 2 when main could not be read here. The logic and its reasons live in
+lib/happiverse_keep_level.py; the part that runs on each machine is
+scripts/happiverse-advance.sh.
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR") or (Path.home() / ".claude"))
+# Our OWN library first, for the reason spelled out in grip-happiverse-node-check:
+# resolving through CLAUDE_DIR would import a different checkout's modules. The
+# fallback goes in FIRST because each insert(0) lands in front of the last one.
+for _root in (CLAUDE_DIR, Path(__file__).resolve().parent.parent):
+    if (_root / "lib").is_dir() and str(_root) not in sys.path:
+        sys.path.insert(0, str(_root))
+
+from lib.happiverse_keep_level import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main())

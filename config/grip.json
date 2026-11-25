@@ -1,0 +1,25 @@
+{
+  "version": "9.0.0",
+  "extended_thinking": true,
+  "paramount_skills": {
+    "ultrathink": true,
+    "asking_users": true,
+    "creating_wizards": true,
+    "efficiency_rules": true
+  },
+  "heartbeat": {
+    "enabled": true,
+    "cooldown_seconds": 7200,
+    "pipeline": [
+      "evo",
+      "consolidate",
+      "generate-rules",
+      "insights-learn",
+      "converge-check"
+    ]
+  },
+  "_comment": "GRIP feature configuration. Edit directly or use /heartbeat pause|resume.",
+  "idr": {
+    "tenant_id": "grip-production"
+  }
+}

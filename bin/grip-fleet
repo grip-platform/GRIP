@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# grip-fleet -- land every running session's work, then inspect it in one page.
+# Thin wrapper: lib/fleet_inspection.py does the work; skills/fleet-inspection/SKILL.md
+# is the procedure. Subcommands: prompt, wait, check-summary, inspect.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec "$here/bin/grip-py" "$here/lib/fleet_inspection.py" "$@"

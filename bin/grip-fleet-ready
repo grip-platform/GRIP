@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""grip-fleet-ready — a quitting session reports that it has saved.
+
+Run by a session that received a [FLEET-QUIT] request, AFTER its close ritual.
+It writes state/fleet-quit/<session-id>.ready carrying this session's own pid
+and, where it can PROVE which Otty pane is its own, that pane id.
+
+Both facts are volunteered here because neither is derivable from outside: the
+presence DB has no pid column, `lsof` on a session transcript yields no holder,
+and a pane list carries only a process TITLE. The initiator therefore never
+guesses a target — a session that does not run this is reported, never killed.
+
+This exists as a script rather than as a one-liner injected by
+hooks/mesh-inbox-poll-hook.py because the inline version needed a try/except
+around the optional Otty import, and a multi-line block does not survive being
+embedded in a `python -c` string. An instruction that cannot run is worse than
+no instruction.
+
+    grip-fleet-ready                 # uses $CLAUDE_SESSION_ID
+    grip-fleet-ready --session <id>  # explicit
+    grip-fleet-ready --note "..."    # free-text note stored in the marker
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+import fleet_quit as fq  # noqa: E402
+
+
+def resolve_pane() -> tuple[str, str]:
+    """This session's Otty pane id, and why it is empty when it is.
+
+    Every failure path returns "" — no Otty, IPC down, no unique match. Empty
+    is the SAFE answer: lib/otty_transport.py::_require_pane records that an
+    empty pane id makes Otty act on the FOCUSED pane, which on a shared
+    terminal belongs to someone else.
+    """
+    try:
+        import otty_transport as ot
+    except Exception as exc:
+        return "", f"otty transport unavailable ({exc})"
+    try:
+        if not ot.is_available():
+            return "", "otty binary not found"
+        panes = ot.pane_list()
+    except Exception as exc:
+        return "", f"otty pane list failed ({exc})"
+    pane = fq.resolve_own_pane(panes, fq._ancestor_pids(os.getpid()))
+    if not pane:
+        return "", f"no unique pane matched this process among {len(panes)} pane(s)"
+    return pane, "resolved by unique pid match"
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="grip-fleet-ready", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--session", default="")
+    ap.add_argument("--note", default="fleet-quit")
+    args = ap.parse_args(argv)
+
+    sid = args.session or os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+    if not sid.strip():
+        print("grip-fleet-ready: no session id (pass --session <id> or set "
+              "CLAUDE_SESSION_ID) — refusing to write a marker that names nobody",
+              file=sys.stderr)
+        return 2
+
+    pane, why = resolve_pane()
+    # The SESSION's pid, never this helper's — see fleet_quit.resolve_session_pid.
+    # None is safe: --force degrades on a target with no volunteered pid.
+    spid = fq.resolve_session_pid()
+    p = fq.write_ready(fq.get_dir(), sid, pid=spid, pane=pane, note=args.note)
+    print(f"grip-fleet-ready: marked ready -> {p}")
+    print(f"  session {fq.normalise_session_id(sid)}  session pid {spid if spid else '(unresolved)'}")
+    if spid is None:
+        print("  NOTE: could not prove this session's harness pid, so --force will "
+              "NOT signal it. That is deliberate — signalling a pid nobody proved "
+              "risks killing an unrelated process.")
+    print(f"  pane    {pane or '(none)'} — {why}")
+    if not pane:
+        print("  NOTE: with no pane, this session cannot be sent /exit. It will be "
+              "reported DEGRADED and stay running until you exit it yourself.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

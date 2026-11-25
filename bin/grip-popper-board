@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""grip-popper-board -- the towers that fell and the towers still standing, from the hypothesis ledger.
+
+A falsification machine that never falsifies anything is not working. So this
+board reads a high self-falsification rate as health and a low one as a warning.
+It also says how many claims never got a real test, because a claim that ended
+inconclusive taught nothing. The thresholds are a rule of thumb, stated on the
+board, and a refutation only counts if the test behind it was real.
+
+It reads the ledger and prints. The one write is --record-fight, which appends a
+row to logs/knife-fight.jsonl for /knife-fight.
+
+Usage:
+    grip-popper-board                      # the board
+    grip-popper-board --recent 10          # and the last ten tombstones
+    grip-popper-board --json               # the same numbers for a machine
+    grip-popper-board --record-fight KIND WINNER SEAL
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from collections import Counter
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+from claude_dir import get_claude_dir  # noqa: E402
+
+FELL = frozenset({"refuted", "falsified"})
+STANDING = frozenset({"confirmed"})
+FOG = frozenset({"inconclusive", "partial"})
+# Chosen by eye on 2026-11-01 for this board's wording. No measurement sets either number.
+HEALTHY_FROM = 0.3
+SUSPICIOUS_BELOW = 0.1
+WINNERS = ("occam", "why-not-just", "neither")
+
+
+def _rows(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
+def latest_by_id(rows: list[dict]) -> dict[str, dict]:
+    """The ledger is append-only, so the last row for an id is the record."""
+    return {str(r.get("id")): r for r in rows if r.get("id")}
+
+
+def reading(rate: float | None) -> str:
+    if rate is None:
+        return "No settled claims yet."
+    if rate >= HEALTHY_FROM:
+        return "Healthy: GRIP kills its own claims."
+    if rate >= SUSPICIOUS_BELOW:
+        return "Thin: few claims die. Check that the tests can bite."
+    return "Suspicious: almost nothing dies. Tests that cannot fail look exactly like this."
+
+
+def board(records: dict[str, dict]) -> dict:
+    statuses = Counter(str(r.get("status", "")).lower() for r in records.values())
+    fell = sum(statuses[s] for s in FELL)
+    standing = sum(statuses[s] for s in STANDING)
+    fog = sum(statuses[s] for s in FOG)
+    rate = fell / (fell + standing) if fell + standing else None
+    return {"fell": fell, "standing": standing, "fog": fog, "pending": statuses["pending"],
+            "records": len(records), "self_falsification_rate": rate, "reading": reading(rate)}
+
+
+def tombstones(records: dict[str, dict], limit: int) -> list[str]:
+    dead = [r for r in records.values() if str(r.get("status", "")).lower() in FELL]
+    dead.sort(key=lambda r: str(r.get("verification_date") or ""), reverse=True)
+    return [f"{r.get('id')}  {str(r.get('claim', ''))[:90]}" for r in dead[:limit]]
+
+
+def fights(rows: list[dict]) -> dict[str, dict[str, int]]:
+    table: dict[str, Counter] = {}
+    for row in rows:
+        table.setdefault(str(row.get("kind")), Counter())[str(row.get("winner"))] += 1
+    return {kind: dict(counts) for kind, counts in sorted(table.items())}
+
+
+def render(data: dict, recent: list[str], scoreboard: dict[str, dict[str, int]]) -> str:
+    rate = data["self_falsification_rate"]
+    shown = "n/a" if rate is None else f"{rate:.0%}"
+    lines = [
+        "THE POPPER BOARD", "",
+        f"  Towers that fell:      {data['fell']}",
+        f"  Towers still standing: {data['standing']}  (corroborated, never proven)",
+        f"  Lost in the fog:       {data['fog']}  (inconclusive: no test ever bit)",
+        f"  Still being tested:    {data['pending']}", "",
+        f"  Self-falsification rate: {shown}, of the claims that settled",
+        f"  {data['reading']}", "",
+        f"  Rule of thumb: healthy from {HEALTHY_FROM:.0%}, suspicious below {SUSPICIOUS_BELOW:.0%}.",
+        "  A refutation counts only if the test behind it was real.",
+    ]
+    if recent:
+        lines += ["", "TOMBSTONES", *[f"  {line}" for line in recent]]
+    if scoreboard:
+        lines += ["", "KNIFE FIGHTS, BY KIND OF PROBLEM"]
+        lines += [f"  {kind}: " + ", ".join(f"{w} {n}" for w, n in sorted(wins.items()))
+                  for kind, wins in scoreboard.items()]
+    return "\n".join(lines)
+
+
+def record_fight(path: Path, kind: str, winner: str, seal: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "kind": kind, "winner": winner, "seal": seal}
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row) + "\n")
+
+
+def main(argv: list[str] | None = None) -> int:
+    claude_dir = get_claude_dir()
+    parser = argparse.ArgumentParser(description="The towers that fell and the towers still standing.")
+    parser.add_argument("--ledger", type=Path, default=claude_dir / "learning" / "hypotheses.jsonl")
+    parser.add_argument("--knife-log", type=Path, default=claude_dir / "logs" / "knife-fight.jsonl")
+    parser.add_argument("--recent", type=int, default=0, help="also list this many recent tombstones")
+    parser.add_argument("--json", action="store_true", help="print the numbers as JSON")
+    parser.add_argument("--record-fight", nargs=3, metavar=("KIND", "WINNER", "SEAL"),
+                        help="append one /knife-fight result and exit")
+    args = parser.parse_args(argv)
+
+    if args.record_fight:
+        kind, winner, seal = args.record_fight
+        if winner not in WINNERS:
+            parser.error(f"WINNER must be one of {', '.join(WINNERS)}")
+        record_fight(args.knife_log, kind, winner, seal)
+        print(f"recorded: {kind}, {winner}")
+        return 0
+    if not args.ledger.exists():
+        print(f"grip-popper-board: no ledger at {args.ledger}", file=sys.stderr)
+        return 1
+
+    records = latest_by_id(_rows(args.ledger))
+    data = board(records)
+    scoreboard = fights(_rows(args.knife_log))
+    if args.json:
+        print(json.dumps({**data, "knife_fights": scoreboard, "ledger": str(args.ledger)}, sort_keys=True))
+        return 0
+    print(render(data, tombstones(records, args.recent), scoreboard))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

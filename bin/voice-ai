@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# voice-ai — launch the GRIP Voice AI: Open-LLM-VTuber speaking to Claude
+# through the local HAL Gateway (127.0.0.1:4010, launchd com.grip.hal-gateway).
+#
+# Usage:
+#   voice-ai            # start (idempotent) — checks gateway, syncs key, runs server, opens browser
+#   voice-ai status     # report gateway / server / config state, change nothing
+#   voice-ai stop       # stop the voice server (never touches the HAL gateway)
+#
+# Morning quickstart: run `voice-ai`, wait for the browser tab, click the
+# microphone button, grant mic permission once, speak.
+set -euo pipefail
+
+APP_DIR="${VOICE_AI_DIR:-$HOME/CodeTonight/Open-LLM-VTuber}"
+GATEWAY_URL="http://127.0.0.1:4010"
+UI_URL="http://localhost:12393"
+UI_PORT=12393
+GATEWAY_LABEL="com.grip.hal-gateway"
+KEYCHAIN_SERVICE="grip-anthropic-external"
+
+say() { printf '[voice-ai] %s\n' "$*"; }
+die() { printf '[voice-ai] ERROR: %s\n' "$*" >&2; exit 1; }
+
+gateway_state() {
+  # Purely local check. The gateway is a verbatim reverse proxy, so any HTTP
+  # probe to it round-trips to api.anthropic.com and can blow a short timeout
+  # on a slow upstream, false-reporting "down". A LISTEN socket on the port is
+  # instant and upstream-independent; the e2e voice turn proves the relay.
+  lsof -nP -iTCP:4010 -sTCP:LISTEN -t >/dev/null 2>&1 && echo "up" || echo "down"
+}
+
+server_pid() { lsof -nP -iTCP:$UI_PORT -sTCP:LISTEN -t 2>/dev/null | head -1; }
+
+sync_key() {
+  # Pipe the credential from the keychain straight into the keysync helper:
+  # stdin only — never argv (ps-visible), never a named env var (inherited
+  # by child processes), never echoed. The helper chmods conf.yaml to 600.
+  [ -f "$APP_DIR/conf.yaml" ] || die "conf.yaml not found in $APP_DIR"
+  security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null \
+    | python3 "$HOME/.claude/lib/voice_ai_keysync.py" "$APP_DIR/conf.yaml" \
+    || die "key sync failed — is keychain entry '$KEYCHAIN_SERVICE' readable?"
+  say "API key synced from keychain into conf.yaml (chmod 600)"
+}
+
+cmd_status() {
+  say "gateway  : $(gateway_state)  [$GATEWAY_URL, launchd $GATEWAY_LABEL]"
+  local pid; pid=$(server_pid || true)
+  if [ -n "${pid:-}" ]; then
+    say "server   : up (pid $pid)  [$UI_URL]"
+  else
+    say "server   : down  [$UI_URL]"
+  fi
+  [ -d "$APP_DIR" ] && say "app dir  : $APP_DIR" || say "app dir  : MISSING ($APP_DIR)"
+  if [ -f "$APP_DIR/conf.yaml" ]; then
+    local perms; perms=$(stat -f '%Lp' "$APP_DIR/conf.yaml")
+    say "conf.yaml: present (perms $perms)"
+  else
+    say "conf.yaml: MISSING"
+  fi
+}
+
+cmd_stop() {
+  local pid; pid=$(server_pid || true)
+  [ -n "${pid:-}" ] || { say "server already stopped"; return 0; }
+  kill "$pid" && say "sent SIGTERM to server pid $pid"
+}
+
+cmd_start() {
+  [ -d "$APP_DIR" ] || die "app dir missing: $APP_DIR — clone with:
+  git clone https://github.com/Open-LLM-VTuber/Open-LLM-VTuber --recursive $APP_DIR && cd $APP_DIR && uv sync"
+  command -v uv >/dev/null || die "uv not installed (brew install uv)"
+
+  if [ "$(gateway_state)" = "down" ]; then
+    say "HAL gateway down — kickstarting launchd job $GATEWAY_LABEL"
+    launchctl kickstart -k "gui/$(id -u)/$GATEWAY_LABEL" 2>/dev/null || true
+    sleep 2
+    [ "$(gateway_state)" = "down" ] && die "HAL gateway unreachable on $GATEWAY_URL. Start it from ~/.hal: python3 -m lib.hal.gateway"
+  fi
+  say "gateway  : $(gateway_state)"
+
+  sync_key
+
+  if pid=$(server_pid) && [ -n "$pid" ]; then
+    say "server already running (pid $pid) — opening browser"
+    open "$UI_URL"
+    return 0
+  fi
+
+  # Open the browser once the UI answers, without blocking the foreground server.
+  ( until curl -sf -o /dev/null --max-time 2 "$UI_URL"; do sleep 1; done
+    say "UI ready — opening browser"
+    open "$UI_URL" ) &
+
+  say "starting Open-LLM-VTuber (foreground, Ctrl-C to stop) ..."
+  cd "$APP_DIR"
+  exec uv run run_server.py
+}
+
+case "${1:-start}" in
+  start)  cmd_start ;;
+  status) cmd_status ;;
+  stop)   cmd_stop ;;
+  *) die "unknown command '${1}' (use: start | status | stop)" ;;
+esac

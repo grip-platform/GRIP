@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# grip-inception-wake — run the divergent overnight idea descent (Inception).
+#
+# The convergent overnight loop (bin/grip-overnight-wave) drives bounded
+# `claude -p` waves at real work. This is the DIVERGENT counterpart: it dreams
+# candidate ideas nobody asked for over cheap Pool-B (non-Anthropic, $0), sweeps
+# almost all of them away, writes the survivors to state/inception/wake-latest.json
+# (which the launch card's "dreamt overnight" band reads), and records the rest
+# into the limbo ledger. Cost is bounded by the generator's hard call budget.
+#
+#   grip-inception-wake                  # levels 2, budget 3 (defaults)
+#   grip-inception-wake --levels 3 --dry-run
+#
+# Scheduled by launchd/com.grip.inception-wake.plist.template (03:00 daily).
+set -euo pipefail
+
+source "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib/venv-utils.sh"
+if ! PY="$(resolve_venv_python "$HOME/.claude/venv")"; then
+  echo "[grip-inception-wake] no Python interpreter found (searched $HOME/.claude/venv, then PATH)" >&2
+  exit 1
+fi
+exec "$PY" "$HOME/.claude/lib/inception_wake.py" "$@"

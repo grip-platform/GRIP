@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  /eod — scheduled end-of-day team digest launchd agent TEMPLATE.
+
+  Posts a PII-shielded, deduped digest of the day's work to #daily-chat
+  (C0EXAMPLE01) once daily at 18:07 local (off-minute, per the avoid-:00/:30
+  scheduling discipline). Double-gated OFF by default:
+    - GRIP_EOD_POST defaults to "0" — no real post fires until you change it to "1";
+    - the fingerprint dedup skips ticks where nothing new has landed.
+
+  NOT auto-installed (a fresh GRIP install stays byte-identical). To enable:
+      sed "s|__GRIP_HOME__|$HOME/.claude|g" \
+        config/com.grip.eod.plist.template \
+        > ~/Library/LaunchAgents/com.grip.eod.plist
+      # Edit the plist: set GRIP_EOD_POST to 1
+      launchctl load ~/Library/LaunchAgents/com.grip.eod.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.grip.eod</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__GRIP_HOME__/venv/bin/python3</string>
+        <string>__GRIP_HOME__/scripts/eod_tick.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__GRIP_HOME__</string>
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>18</integer>
+            <key>Minute</key>
+            <integer>7</integer>
+        </dict>
+    </array>
+    <key>StandardOutPath</key>
+    <string>__GRIP_HOME__/logs/eod.log</string>
+    <key>StandardErrorPath</key>
+    <string>__GRIP_HOME__/logs/eod.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CLAUDE_DIR</key>
+        <string>__GRIP_HOME__</string>
+        <key>PYTHONPATH</key>
+        <string>__GRIP_HOME__</string>
+        <key>GRIP_EOD_POST</key>
+        <string>0</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>TimeOut</key>
+    <integer>300</integer>
+</dict>
+</plist>

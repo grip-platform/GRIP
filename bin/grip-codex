@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# grip-codex — non-interactive Pool-C entrypoint (OpenAI Codex CLI).
+#
+# WHY THIS EXISTS. lib/harness/cli.py has had a CodexHarness since it was written,
+# documented as "a spend pool separate from both Pool A (Anthropic harness) and Pool B
+# (HAL providers)" — Pool C. But its EXECUTABLE was the bare `codex` binary, while its
+# sibling OpenCodeHarness points at `bin/grip-opencode`, a shim that reads the keychain
+# and exports HAL_GATEWAY_KEY. That asymmetry is the whole bug: ~/.codex/config.toml
+# declares `env_key = "HAL_GATEWAY_KEY"` for its hal-gateway provider, so a bare `codex`
+# exits non-zero with "Missing environment variable: HAL_GATEWAY_KEY" before it reaches
+# a model. Pool B worked programmatically and Pool C did not, for want of a shim.
+#
+# Measured 2026-08-31: with the key exported, `codex exec` returns rc=0 in ~9s on
+# provider hal-gateway, model gpt-5.6-sol. Without it, rc=1 in 3s having never called out.
+#
+# The key is a DOORSTOP, not a credential. The HAL gateway resolves real upstream keys
+# itself; this bearer only has to be non-empty for Codex's config loader to proceed. That
+# is why a missing keychain entry falls back to a literal placeholder rather than aborting
+# — refusing to launch over a value nothing authenticates against would be a worse failure
+# than launching with it. Verified by controlled test, not assumed.
+#
+# Mirrors bin/grip-opencode deliberately, including its cross-platform keychain reader, so
+# the two non-interactive pool entrypoints stay the same shape on every OS.
+set -euo pipefail
+
+_kv_get() {
+  case "$(uname -s)" in
+    Darwin)
+      security find-generic-password -s "$1" -w 2>/dev/null
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      GK_N="$1" powershell -NoProfile -Command '
+        $v=[Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime]::new();
+        try { $c=$v.Retrieve($env:GK_N,"grip"); $c.RetrievePassword(); [Console]::Out.Write($c.Password) } catch { exit 1 }' 2>/dev/null
+      ;;
+    Linux)
+      secret-tool lookup service "$1" 2>/dev/null
+      ;;
+  esac
+}
+
+# WHICH POOL THE CALLER ASKED FOR — validated before anything else runs. `c` (or
+# unset) is the ChatGPT subscription via the ladder; `b` is the HAL gateway. Anything
+# else is refused HERE rather than falling into the ladder branch below and silently
+# billing Pool C, which is exactly what GRIP_CODEX_POOL=d (Kimi Code, Pool D) once did.
+# Pool D is never reached through codex at all: its harness is the Kimi Code CLI, and it
+# stays unarmed until the keychain entry grip-kimi-coding exists
+# (rules/pool-a-offload-routing.md). Exit 2 is the usage-error code, checked before the
+# codex-on-PATH probe because a bad pool is the caller's error on every machine.
+case "${GRIP_CODEX_POOL:-c}" in
+  b|c) ;;
+  *)
+    echo "[grip-codex] GRIP_CODEX_POOL='${GRIP_CODEX_POOL:-}' is not a pool this shim can bill. Use 'c' (or leave it unset) for the ChatGPT subscription via the ladder, or 'b' for the HAL gateway. Pool D (the Kimi Code subscription) is never reached through codex — see rules/pool-a-offload-routing.md." >&2
+    exit 2
+    ;;
+esac
+
+if ! command -v codex >/dev/null 2>&1; then
+  echo "[grip-codex] codex is not on PATH — Pool C unavailable on this machine." >&2
+  exit 127
+fi
+
+HAL_KEY=""
+if HAL_KEY=$(_kv_get grip-claude-oauth) && [ -n "$HAL_KEY" ]; then
+  :  # subscription token (sk-ant-oat) preferred; survives the gateway since the OAuth guard
+elif HAL_KEY=$(_kv_get grip-anthropic-external) && [ -n "$HAL_KEY" ]; then
+  export HAL_GATEWAY_KEY="$HAL_KEY"
+else
+  # Placeholder, not a silent skip. See the doorstop note above.
+  export HAL_GATEWAY_KEY="grip-local-doorstop"
+  echo "[grip-codex] keychain 'grip-anthropic-external' unavailable; using placeholder bearer (gateway resolves upstream keys itself)." >&2
+fi
+export HAL_GATEWAY_MULTIPROVIDER=1
+
+# WHICH POOL THIS ACTUALLY BILLS — corrected 2026-08-31 after a converge-fleet caught it.
+#
+# The first version of this shim exported HAL_GATEWAY_KEY and ran `codex` directly. That
+# made codex work, and I reported Pool C as wired. It was not. ~/.codex/config.toml:10 pins
+# model_provider = "hal-gateway", so a direct run bills the HAL gateway — Pool B, and on a
+# metered OpenAI id at that. The probe output said `provider: hal-gateway` in plain sight and
+# I read it as success without asking which pool that names.
+#
+# Pool C is the operator's ChatGPT SUBSCRIPTION, and the only path to it is
+# bin/grip-codex-ladder rung 1, which overrides `-c model_provider=openai
+# -c forced_login_method=chatgpt` against a per-account CODEX_HOME. Verified 2026-08-31:
+# rc=0 with "[ladder] rung 1 [CODETONIGHT ☾] — ChatGPT subscription", and `--status` shows
+# all three subscription accounts ready.
+#
+# So the DEFAULT now delegates to the ladder, which is also the operator's stated billing
+# preference (subscription before API key — bin/grip:766-771). The ladder degrades on its
+# own: rung 1 subscription, rung 2 OpenAI key, rung 3 HAL gateway. Set GRIP_CODEX_POOL=b to
+# force the old direct-to-gateway behaviour.
+#
+# CONTRACT: this shim is a DROP-IN for `codex`. It takes the same argv and only adds
+# environment plus one flag, so lib/harness/cli.py::CodexHarness can point EXECUTABLE at it
+# without changing as_argv and without double-passing --sandbox.
+#
+# --skip-git-repo-check is injected only when the caller has not already passed it: a
+# programmatic caller (a fleet lane, a background job) has no say in its cwd, and Codex
+# otherwise refuses to run outside a trusted directory. The safety that matters is the
+# sandbox, which the caller sets and this shim never weakens.
+# Pool C by default: the ladder tries the subscription first and falls back on its own.
+# Build the argv ONCE, then dispatch. The flag injection has to happen BEFORE the ladder
+# branch, not after it: an earlier revision delegated raw "$@" to the ladder and added
+# --skip-git-repo-check only on the fall-through path, so every Pool-C run from an
+# untrusted directory exited 3 with "Not inside a trusted directory". Testing missed it
+# because the direct ladder probe passed the flag by hand — the shim's own callers do not.
+ARGS=("$@")
+HAS_SKIP=0
+for a in "$@"; do
+  if [ "$a" = "--skip-git-repo-check" ]; then HAS_SKIP=1; fi
+done
+if [ "$HAS_SKIP" -eq 0 ] && [ $# -gt 0 ]; then
+  # After the subcommand, so codex parses it as a subcommand flag rather than a global.
+  SUB="$1"; shift
+  ARGS=("$SUB" --skip-git-repo-check "$@")
+fi
+
+LADDER="$(cd "$(dirname "$0")" && pwd)/grip-codex-ladder"
+# Only b or c reach here (validated at the top): c goes to the ladder, b to codex on the
+# gateway. Anything else already exited 2.
+if [ "${GRIP_CODEX_POOL:-c}" != "b" ] && [ -x "$LADDER" ]; then
+  exec "$LADDER" -- "${ARGS[@]}"
+fi
+# The ladder's close_idle_stdin test, for the run that skips the ladder (GRIP#9181):
+# with a prompt argument, codex exec also reads a stdin that is not a terminal and
+# waits for it to end, and a socket (a Claude Code tool shell's stdin) never ends.
+[[ -p /dev/stdin || -f /dev/stdin || -t 0 || /dev/stdin -ef /dev/null ]] || {
+  echo "[grip-codex] stdin is a socket or a device that may never end; codex gets an empty input instead (GRIP#9181)" >&2
+  exec 0</dev/null
+}
+exec codex "${ARGS[@]}"

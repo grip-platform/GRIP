@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# grip-test — run pytest using the correct per-repo venv.
+#
+# Why this exists: system python3 (Homebrew /opt/homebrew/opt/python@3.14) is a
+# bare interpreter without pytest, google-auth, or the rest of GRIP's deps.
+# Each GRIP-aware repo (~/.claude, ~/.hal) ships its own venv/ directory.
+# `python3 -m pytest` from the system python fails reproducibly with
+# "No module named pytest" — V>>'s recurring frustration, 2026-05-06.
+#
+# This wrapper auto-routes to the right venv:
+#   - First positional arg is a path? Find venv by walking up from that path.
+#   - Else use cwd, walking up to find a venv/.
+#   - Else fall back to ~/.claude/venv (canonical default).
+#
+# Usage:
+#   grip-test                                    # all tests in cwd's repo
+#   grip-test tests/test_grip_speak.py           # one test file
+#   grip-test tests/test_grip_speak.py -v        # with pytest args
+#   grip-test ~/.hal/tests/test_voice_ladder.py  # absolute path → HAL venv
+#   grip-test -v -k 'directive'                  # bare flags use cwd's venv
+#
+# Output: one line on stderr identifies the chosen venv (silent on stdout for
+# pipe-friendly use).
+
+set -euo pipefail
+
+source "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib/venv-utils.sh"
+
+# Strip the optional `--` separator pytest convention if present at position 1
+[[ "${1:-}" == "--" ]] && shift
+
+# Determine the directory to walk up from (the repo containing the target test).
+target_dir() {
+    local first="${1:-}"
+    # No args, or first arg is a flag — use cwd
+    if [[ -z "$first" || "$first" == -* ]]; then
+        echo "$PWD"
+        return
+    fi
+    # Path-like positional arg
+    if [[ "$first" == /* ]]; then
+        # Absolute path
+        echo "$(dirname -- "$first")"
+    else
+        # Relative path, anchor on cwd
+        echo "$PWD/$(dirname -- "$first")"
+    fi
+}
+
+# Walk up looking for a ./venv/; echo its python on hit, return 1 on miss.
+# resolve_venv_python knows both layouts (Windows Scripts/python.exe, POSIX
+# bin/python3) but falls back to the SYSTEM python when a directory has no venv
+# — which would match the very first ancestor and end the walk. So a candidate
+# counts only when it actually lives inside that ancestor's venv/.
+find_venv_python() {
+    local d cand
+    d="$1"
+    while [[ "$d" != "/" && -n "$d" ]]; do
+        cand="$(resolve_venv_python "$d/venv" 2>/dev/null || true)"
+        if [[ "$cand" == "$d/venv/"* ]]; then
+            echo "$cand"
+            return 0
+        fi
+        d="$(dirname -- "$d")"
+    done
+    return 1
+}
+
+START_DIR="$(target_dir "${1:-}")"
+VENV_PY=""
+if ! VENV_PY="$(find_venv_python "$START_DIR" 2>/dev/null)"; then
+    # Canonical default per memory feedback_grip_venv_default.md
+    VENV_PY="$(resolve_venv_python "$HOME/.claude/venv" 2>/dev/null || true)"
+    # Same containment rule as the walk: a system python is not this venv.
+    [[ "$VENV_PY" == "$HOME/.claude/venv/"* ]] || VENV_PY=""
+fi
+
+if [[ ! -x "$VENV_PY" ]]; then
+    echo "grip-test: no venv python found." >&2
+    echo "  walked up from: $START_DIR" >&2
+    echo "  fallback tried: $HOME/.claude/venv (Scripts/python.exe, bin/python3, bin/python)" >&2
+    # pip runs through the sibling grip-py, pinned to the same venv, because it
+    # finds the new interpreter in either platform's layout.
+    echo "  fix: python3 -m venv ~/.claude/venv && CLAUDE_DIR=~/.claude \"$(dirname "${BASH_SOURCE[0]}")/grip-py\" -m pip install pytest" >&2
+    exit 2
+fi
+
+echo "[grip-test] $VENV_PY" >&2
+exec "$VENV_PY" -m pytest "$@"

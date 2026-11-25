@@ -1,0 +1,130 @@
+name: automation
+description: Workflow orchestration with safety guardrails for autonomous operation
+version: 1.0.0
+effort: high
+triggers:
+- /mode automation
+- automate
+- autonomous
+- orchestrate
+- pipeline
+- batch process
+skills:
+  always:
+  - self-improvement-engine
+  - recursive-learning
+  - safety-guardrails
+  optional:
+  - autonomous-learning
+  - code-agentic
+token_budget: ~4500
+foundation: true
+stacks_with:
+- ut++
+- asking-users
+- creating-wizards
+- hitl
+- context-gate
+prompt_injection: '[MODE: AUTOMATION]
+
+
+  Autonomous orchestration protocols active. Safety guardrails enforced.
+
+
+  Core principle: Autonomy requires commensurate safety.
+
+
+  Safety guardrails:
+
+  - Dual-condition exits (completion + explicit signal)
+
+  - Circuit breakers (stagnation, errors, output decline)
+
+  - Rate limiting (100 API/hr, 50 file ops/min)
+
+  - Scope boundaries (define allowed/forbidden)
+
+  - Rollback points (checkpoint before changes)
+
+
+  RSI integration:
+
+  - Capture all task outcomes
+
+  - Extract patterns (3x threshold)
+
+  - Feed learnings back to improve
+
+
+  MANDATORY AskUserQuestion when:
+
+  - Starting autonomous operation
+
+  - Circuit breaker triggers
+
+  - Stage transitions (if checkpointing)
+
+  - Completion confirmation
+
+
+  Never auto-exit. Never unbounded autonomy. Always human oversight channel.
+
+
+  ## Broly Auto-Activation
+
+
+  Broly is AUTO-ACTIVE in this mode at FORK level.
+
+  No /broly command needed -- UNLESS the operator has set the trigger to manual (check with `mode-loader.sh broly status`), in which case fan out ONLY on an explicit /broly. Assess task complexity and invoke automatically.
+
+
+  Default: FORK (Task tool subagents, up to 3 agents)
+
+  Team pattern: none | Reasoning: ReAct (react)
+
+
+  ### Escalation to CLUSTER
+
+  - Automation pipeline has more than 3 independent stages
+
+  - Batch operation across multiple repositories
+
+  - Orchestration requires parallel monitoring and execution
+
+
+  ### De-escalation to THREAD
+
+  - Single script automation
+
+  - Quick cron/launchd setup
+
+  - Simple one-step automation
+
+
+  ### Budget
+
+  FORK uses ~2x tokens. De-escalate to THREAD for simple tasks.
+
+  AskUserQuestion if scope is unclear.
+
+  '
+wave:
+  category: meta_loop
+broly:
+  enabled: true
+  default_level: fork
+  team_pattern: null
+  reasoning_hint: react
+  escalation:
+    to: cluster
+    signals:
+    - automation pipeline has more than 3 independent stages
+    - batch operation across multiple repositories
+    - orchestration requires parallel monitoring and execution
+context:
+- Automating repetitive workflows
+- Building CI/CD pipelines
+- Batch processing tasks
+- Self-improving systems
+- Multi-stage orchestrations
+welcome_message: Automation mode active. Workflow safety guardrails and recursive learning enabled.

@@ -1,0 +1,517 @@
+#!/usr/bin/env python3
+"""Publish GRIP's MIT packages to PyPI — one command, run by the operator.
+
+WHY THIS EXISTS. Five packages have built and passed ``twine check`` for weeks and
+none is published, because publishing needs the operator's PyPI token and an agent
+must never handle it. That made "publish" read like a project when it is one
+command, so this is the command: it does every check an agent CAN do, then hands
+the upload to the operator's own credential without ever seeing it.
+
+THE CREDENTIAL NEVER REACHES THIS SCRIPT'S LOGIC. ``twine`` reads it from the
+environment (``TWINE_USERNAME`` / ``TWINE_PASSWORD``), from ``~/.pypirc``, or by
+prompting. This script does not read it, does not pass it as an argument — where it
+would land in the process table and any shell history — does not print it, and
+does not write it anywhere. ``--check`` deliberately needs no credential at all, so
+the whole verification pass runs with nothing sensitive present.
+
+WHAT IT REFUSES TO DO, because a publish is irreversible: a version on PyPI cannot
+be replaced or re-uploaded, only yanked. So it refuses when the built version
+already exists on the index, refuses a name that is taken by someone else's
+project, refuses a version at or behind the package's own PUBLIC repository in
+this org, refuses any artefact ``twine check`` rejects, and refuses to touch the
+real index without ``--confirm``. TestPyPI is the default target for exactly that
+reason.
+
+Usage:
+  grip-oss-publish --check              verify everything; NO credential, NO upload
+  grip-oss-publish --test               upload to TestPyPI (needs the operator's token)
+  grip-oss-publish --confirm            upload to PyPI FOR REAL
+  grip-oss-publish --check --only idr-chain
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+OSS = REPO / "oss"
+PYPI_JSON = "https://pypi.org/pypi/{name}/json"
+#: Only these are published. An allowlist, never a scan of `oss/*`: a directory
+#: added tomorrow must be a deliberate decision to publish, not an accident.
+PUBLISHABLE = (
+    "agent-room",
+    "cc-context-budget",
+    "false-signal-lint",
+    "idr-chain",
+)
+#: `oss/prompt-cache-keepalive` is deliberately ABSENT. It has a canonical public
+#: home at github.com/CodeTonight-SA/prompt-cache-keepalive — 0.2.0, own CI, a
+#: 14.8 KB README, `docs/`, `hooks/`, `scripts/` — while this copy is 0.1.0 and a
+#: smaller, divergent fork of it. Publish that package FROM ITS OWN REPO.
+#:
+#: `_check_not_behind_canonical` already refuses it on `<=`, and that is a safety
+#: net rather than the control: bump this copy to 0.3.0 and the gate would wave
+#: the stale fork straight through. An allowlist cannot be out-argued by a version
+#: number, so the decision lives here.
+NOT_PUBLISHABLE_FROM_OSS = {
+    "prompt-cache-keepalive": (
+        "canonical home is github.com/CodeTonight-SA/prompt-cache-keepalive "
+        "(public, ahead of this copy) — publish from there, not from oss/"
+    ),
+}
+#: Licences we are willing to publish under. Declared AND present as text — the
+#: two can disagree, which is exactly how a competitor's "MIT" turned out to be
+#: Elastic 2.0 on 2026-09-17.
+OPEN_LICENCES = ("MIT",)
+
+
+class PublishError(RuntimeError):
+    """A refusal. Every one of these means do not upload."""
+
+
+_TOOLS = ("build", "twine")
+
+
+def _venv_python(root: Path) -> Path | None:
+    """`root`'s venv interpreter in either platform's layout, or None.
+
+    `grip_python` (lib/_compat.py) is GRIP's shared resolver. It falls back to the
+    running interpreter, which `_py` already tries last, so that fallback is
+    dropped here to keep the candidate order.
+    """
+    lib = str(REPO / "lib")
+    if lib not in sys.path:
+        sys.path.insert(0, lib)
+    from _compat import grip_python
+
+    cand = Path(grip_python(root))
+    return cand if (root / "venv") in cand.parents else None
+
+
+def _py() -> str:
+    """An interpreter that ACTUALLY HAS `build` and `twine`, not merely one at a path.
+
+    The first version returned this checkout's venv interpreter whenever that file
+    existed. It exists in every worktree and does not carry these tools, so all five
+    packages failed with `No module named build` — five cryptic failures where one
+    clear refusal belonged. A path check is not a capability check
+    (`never-system-python-for-grip.md`), and this is that lesson in a new place.
+
+    Candidates in order: this worktree's venv, the shared GRIP venv, the running
+    interpreter, each venv resolved in either platform's layout by `_venv_python`.
+    The first that can import both wins; if none can, we raise with the command
+    that fixes it rather than letting each build fail separately.
+    """
+    seen = []
+    roots = (REPO, Path.home() / ".grip", Path.home() / ".claude")
+    for cand in (*[_venv_python(root) for root in roots], Path(sys.executable)):
+        if cand is None or not cand.is_file() or str(cand) in seen:
+            continue
+        seen.append(str(cand))
+        probe = subprocess.run(
+            [str(cand), "-c", "import build, twine"],
+            capture_output=True, text=True, timeout=60)
+        if probe.returncode == 0:
+            return str(cand)
+    # The sibling grip-py by its full path, so the hint works with bin/ off PATH;
+    # it finds the GRIP venv's interpreter in either platform's layout.
+    grip_py = (REPO / "bin" / "grip-py").as_posix()
+    raise PublishError(
+        "no interpreter here has both `build` and `twine`. Install them into the "
+        "GRIP venv and re-run:\n"
+        f'      "{grip_py}" -m pip install build twine\n'
+        f"    Tried: {', '.join(seen)}"
+    )
+
+
+def _run(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=600)
+
+
+def _meta(pkg: Path) -> dict:
+    t = (pkg / "pyproject.toml").read_text()
+
+    def g(pat: str) -> str:
+        m = re.search(pat, t, re.M)
+        return m.group(1).strip() if m else ""
+
+    return {
+        "name": g(r'^name\s*=\s*"([^"]+)"'),
+        "version": g(r'^version\s*=\s*"([^"]+)"'),
+        "licence": g(r'^license\s*=\s*[{"]?\s*(?:text\s*=\s*")?([^"}\n]+)'),
+    }
+
+
+def _pypi(name: str) -> dict | None:
+    """The index's record for *name*, or None when the name is unregistered.
+
+    A network failure RAISES rather than returning None. "Nobody owns this name"
+    and "I could not ask" are different facts, and treating the second as the
+    first is how you upload into somebody else's namespace.
+    """
+    try:
+        with urllib.request.urlopen(PYPI_JSON.format(name=name), timeout=20) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise PublishError(f"PyPI returned HTTP {exc.code} for {name}") from exc
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise PublishError(
+            f"could not reach PyPI to check {name} ({exc}). Refusing: an "
+            "unanswered availability check is not an available name."
+        ) from exc
+
+
+def _check_licence(meta: dict, pkg: Path) -> None:
+    if meta["licence"] not in OPEN_LICENCES:
+        raise PublishError(
+            f"{meta['name']}: declares licence {meta['licence']!r}, not one of "
+            f"{OPEN_LICENCES}. The point of publishing these is that they are "
+            "genuinely open source."
+        )
+    lf = pkg / "LICENSE"
+    if not lf.is_file():
+        raise PublishError(f"{meta['name']}: declares {meta['licence']} with no LICENSE file")
+    text = lf.read_text()
+    if "Permission is hereby granted, free of charge" not in text:
+        raise PublishError(
+            f"{meta['name']}: LICENSE file does not contain MIT's grant clause, so "
+            "the declaration and the text disagree. Checked because a surveyed "
+            "competitor's 'MIT' proved to be Elastic License 2.0 in its own "
+            "LICENSE file."
+        )
+
+
+def _check_name(meta: dict) -> str:
+    record = _pypi(meta["name"])
+    if record is None:
+        return "name is unregistered"
+    releases = record.get("releases", {}) or {}
+    if meta["version"] in releases:
+        raise PublishError(
+            f"{meta['name']} {meta['version']} is ALREADY on PyPI. A version cannot "
+            "be replaced, only yanked — bump the version instead."
+        )
+    return f"name exists on PyPI with {len(releases)} release(s); {meta['version']} is new"
+
+
+#: The org whose PUBLIC repos are treated as a package's canonical home.
+CANONICAL_OWNER = "CodeTonight-SA"
+
+
+def _canonical_version(name: str) -> "str | None":
+    """The version in the org's PUBLIC repo of this name, or None if there is none.
+
+    Fetched UNAUTHENTICATED on purpose. A 404 then means "no repository the world
+    can read", which is precisely the condition being guarded: the hazard is
+    publishing a version older than one strangers can already see. A private repo
+    is invisible here and that is correct — it is not a published artefact — but it
+    is a real limit, so it is written down rather than left to be inferred.
+
+    A network failure RAISES. "There is no canonical repo" and "I could not ask"
+    are different facts, and treating the second as the first is how you publish
+    over somebody's newer work — the same reasoning as `_pypi`.
+    """
+    url = (f"https://raw.githubusercontent.com/{CANONICAL_OWNER}/{name}"
+           "/HEAD/pyproject.toml")
+    try:
+        with urllib.request.urlopen(url, timeout=20) as resp:  # noqa: S310
+            text = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise PublishError(
+            f"{name}: could not read {url} (HTTP {exc.code}). An unanswered "
+            "canonical-source check is not an absent canonical source."
+        ) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise PublishError(
+            f"{name}: could not reach {url} ({exc}). Refusing rather than assuming "
+            "no public repo exists."
+        ) from exc
+    m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
+    if not m:
+        raise PublishError(
+            f"{name}: {CANONICAL_OWNER}/{name} is public but its pyproject declares "
+            "no version, so this check cannot order the two. Refusing."
+        )
+    return m.group(1)
+
+
+def _vtuple(v: str) -> tuple:
+    """A plain dotted-numeric version as a tuple. Anything else REFUSES.
+
+    Fail closed: a pre-release or local suffix (`0.2.0rc1`, `1.0.0+deb`) cannot be
+    ordered by this function, and guessing an order on an irreversible publish is
+    worse than stopping.
+    """
+    parts = v.split(".")
+    if not parts or not all(p.isdigit() for p in parts):
+        raise PublishError(
+            f"cannot order the version {v!r}: this check handles dotted-numeric "
+            "versions only, and will not guess at an ordering before an "
+            "irreversible upload."
+        )
+    return tuple(int(p) for p in parts)
+
+
+def _check_not_behind_canonical(meta: dict) -> "str | None":
+    """Refuse to publish a version at or behind the package's PUBLIC repo.
+
+    THE DEFECT THIS CLOSES. `_check_name` asks whether the NAME is free on PyPI,
+    and answered "name is unregistered" for all five packages. But
+    `prompt-cache-keepalive` has a public repo in this org at **0.2.0** while
+    `oss/prompt-cache-keepalive` sits at **0.1.0**, so the checker passed 5 of 5
+    while one of them would have permanently established an OLDER version as that
+    package's first PyPI release. A free name is not a safe publish; checking the
+    name was a check at a coarser resolution than the property it guards.
+
+    Refuses on `<=`, not `<`. An equal version whose content has diverged is the
+    same irreversible hazard wearing a matching number, and for a package that has
+    a canonical public home the honest remedy is usually to publish from THERE
+    rather than from this monorepo's extracted copy.
+    """
+    public = _canonical_version(meta["name"])
+    if public is None:
+        return None
+    ours, theirs = _vtuple(meta["version"]), _vtuple(public)
+    if ours <= theirs:
+        raise PublishError(
+            f"{meta['name']} {meta['version']} is NOT AHEAD of "
+            f"github.com/{CANONICAL_OWNER}/{meta['name']}, which is PUBLIC at "
+            f"{public}. Publishing this would fix an older version as the first "
+            f"release on PyPI, permanently. Either publish from that repository, "
+            f"which is the package's canonical home, or bring this copy ahead of "
+            f"{public} deliberately."
+        )
+    return f"ahead of the public repo ({public})"
+
+
+def _build(pkg: Path, out: Path) -> list[Path]:
+    if out.exists():
+        shutil.rmtree(out)
+    r = _run([_py(), "-m", "build", "--outdir", str(out), str(pkg)])
+    if r.returncode != 0:
+        raise PublishError(f"{pkg.name}: build failed\n{r.stdout[-1200:]}{r.stderr[-800:]}")
+    arte = sorted(out.glob("*"))
+    if len(arte) < 2:
+        raise PublishError(
+            f"{pkg.name}: expected a wheel AND an sdist, got {[a.name for a in arte]}"
+        )
+    return arte
+
+
+def _twine_check(arte: list[Path]) -> None:
+    r = _run([_py(), "-m", "twine", "check", *[str(a) for a in arte]])
+    passed = r.stdout.count("PASSED")
+    if r.returncode != 0 or passed != len(arte):
+        raise PublishError(
+            f"twine check: {passed} of {len(arte)} PASSED\n{r.stdout[-900:]}{r.stderr[-600:]}"
+        )
+
+
+def verify(pkg: Path, out: Path) -> dict:
+    """Every check an agent can make without a credential. Raises on any refusal."""
+    meta = _meta(pkg)
+    if meta["name"] not in PUBLISHABLE:
+        why = NOT_PUBLISHABLE_FROM_OSS.get(meta["name"])
+        raise PublishError(
+            f"{meta['name']} is not in the publish allowlist"
+            + (f": {why}" if why else "")
+        )
+    _check_licence(meta, pkg)
+    note = _check_name(meta)
+    ahead = _check_not_behind_canonical(meta)
+    if ahead:
+        note = f"{note}; {ahead}"
+    arte = _build(pkg, out)
+    _twine_check(arte)
+    return {**meta, "note": note, "artefacts": [a.name for a in arte], "dist": out}
+
+
+#: The routes twine can resolve a credential by, in the order it tries them.
+#: Presence is observable; a VALUE is never read, so this function cannot leak one.
+CREDENTIAL_ENV = ("TWINE_PASSWORD", "TWINE_USERNAME")
+
+NO_ROUTE_HINT = """
+  There is no terminal here, so twine CANNOT prompt for a token -- `getpass`
+  fails with `termios.error: Operation not supported by device` and then
+  `EOFError`, which is what a bare traceback above means. Nothing was uploaded.
+
+  Three routes that work without a prompt, any one is enough:
+
+    1. Run it from a real terminal (Terminal.app, iTerm), where twine can ask:
+         ./bin/grip-oss-publish --test
+    2. Put the token in ~/.pypirc once (chmod 600). twine reads it silently, so
+       this script then works from anywhere, including inside a session.
+    3. Export TWINE_USERNAME=__token__ and TWINE_PASSWORD in the shell that runs
+       it -- least preferred, because an environment variable is visible to
+       every child process.
+
+  This script reads none of them. It only checked WHETHER each exists."""
+
+
+def credential_routes(env=None, pypirc=None, stdin_isatty=None) -> list:
+    """Name the routes twine could get a credential by -- never the credential.
+
+    Checks only for the PRESENCE of an environment key, the EXISTENCE of a
+    ~/.pypirc, and whether stdin is a terminal. No value is read, so no token
+    can pass through this function, be logged by it, or appear in its return.
+
+    `keyring` is deliberately NOT probed and NOT reported: probing it can itself
+    surface a system prompt, and a wrong answer either way would be worse than
+    silence. So an empty list means "no route this function can see", never
+    "twine will certainly fail" -- which is why the caller still attempts the
+    upload rather than refusing it.
+    """
+    env = os.environ if env is None else env
+    pypirc = (Path.home() / ".pypirc") if pypirc is None else pypirc
+    if stdin_isatty is None:
+        try:
+            stdin_isatty = sys.stdin.isatty()
+        except (ValueError, OSError):
+            stdin_isatty = False
+
+    routes = [k for k in CREDENTIAL_ENV if env.get(k)]
+    if pypirc.exists():
+        routes.append("~/.pypirc")
+    if stdin_isatty:
+        routes.append("an interactive prompt")
+    return routes
+
+
+def upload(dist: Path, repository: str | None) -> None:
+    """Hand the artefacts to twine. The CREDENTIAL IS TWINE'S BUSINESS, not ours.
+
+    No token is read, passed, printed or stored here. twine resolves it from the
+    environment, ~/.pypirc, or by prompting the operator. Passing it as an
+    argument would put it in the process table and the shell history, so there is
+    deliberately no flag for it.
+    """
+    args = [_py(), "-m", "twine", "upload"]
+    if repository:
+        args += ["--repository-url", repository]
+    args += [str(p) for p in sorted(dist.glob("*"))]
+    # Inherit stdio so twine can PROMPT. Capturing it would both break the prompt
+    # and risk a credential landing in a captured buffer.
+    rc = subprocess.run(args).returncode
+    if rc != 0:
+        raise PublishError(f"twine upload exited {rc} — nothing further attempted")
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--check", action="store_true",
+                   help="verify only. No credential needed, nothing uploaded.")
+    g.add_argument("--test", action="store_true",
+                   help="upload to TestPyPI (needs the operator's TestPyPI token)")
+    g.add_argument("--confirm", action="store_true",
+                   help="upload to the REAL PyPI. Irreversible per version.")
+    ap.add_argument("--only", action="append", metavar="NAME",
+                    help="restrict to one package (repeatable)")
+    ns = ap.parse_args(argv)
+
+    if not (ns.check or ns.test or ns.confirm):
+        ap.print_help()
+        print("\n  Nothing done. --check verifies with no credential and no upload.",
+              file=sys.stderr)
+        return 2
+
+    names = ns.only or list(PUBLISHABLE)
+    unknown = [n for n in names if n not in PUBLISHABLE]
+    if unknown:
+        # Name the REASON here, not only in `verify`. This path validates `--only`
+        # before `verify` ever runs, so a package excluded on purpose used to
+        # refuse with a bare list on the one invocation an operator actually
+        # types — the explanation existed and landed where nobody would see it.
+        print(f"  ERROR: not in the publish allowlist: {unknown}", file=sys.stderr)
+        for n in unknown:
+            why = NOT_PUBLISHABLE_FROM_OSS.get(n)
+            if why:
+                print(f"         {n}: {why}", file=sys.stderr)
+            elif (OSS / n).is_dir():
+                print(f"         {n}: the directory exists but publishing it has "
+                      "not been decided — add it to PUBLISHABLE deliberately, or "
+                      "to NOT_PUBLISHABLE_FROM_OSS with a reason.", file=sys.stderr)
+        return 2
+
+    # Resolve the interpreter BEFORE the loop. Inside it, a missing tool would
+    # print the same failure once per package and bury the one thing to fix.
+    try:
+        _py()
+    except PublishError as exc:
+        print(f"\n  ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    staging = REPO / "dist-oss"
+    verified, failed = [], []
+    for name in names:
+        pkg = OSS / name
+        if not (pkg / "pyproject.toml").is_file():
+            failed.append((name, "no pyproject.toml"))
+            continue
+        try:
+            verified.append(verify(pkg, staging / name))
+        except PublishError as exc:
+            failed.append((name, str(exc)))
+
+    print(f"\n  grip-oss-publish — {len(verified)} verified, {len(failed)} refused\n")
+    for v in verified:
+        print(f"  [ ok ]  {v['name']} {v['version']}  {v['licence']}")
+        print(f"          {v['note']}")
+        print(f"          {', '.join(v['artefacts'])}")
+    for name, why in failed:
+        print(f"  [FAIL]  {name}", file=sys.stderr)
+        print(f"          {why}", file=sys.stderr)
+
+    if failed:
+        print("\n  REFUSING to upload anything: a publish is irreversible per "
+              "version, so a partial run would leave the set inconsistent.",
+              file=sys.stderr)
+        return 1
+
+    if ns.check:
+        print("\n  --check only. Nothing uploaded, no credential was read.")
+        print("  Next: --test for TestPyPI, then --confirm for PyPI.")
+        return 0
+
+    target = "https://test.pypi.org/legacy/" if ns.test else None
+    where = "TestPyPI" if ns.test else "PyPI (REAL, irreversible)"
+    routes = credential_routes()
+    print(f"\n  Uploading {len(verified)} package(s) to {where}.")
+    if routes:
+        print(f"  twine will get your token from: {', '.join(routes)}.")
+    else:
+        # Say the true thing. The old wording promised a prompt unconditionally,
+        # which is false wherever there is no terminal -- the case the hint covers.
+        print("  No credential route is visible to this script (no TWINE_* set,")
+        print("  no ~/.pypirc, stdin is not a terminal). Attempting anyway, since")
+        print("  twine may still reach a keyring this script deliberately does")
+        print("  not probe.")
+    print("  This script never reads, prints or stores it.\n")
+    for v in verified:
+        print(f"  --- {v['name']} {v['version']} ---")
+        try:
+            upload(v["dist"], target)
+        except PublishError as exc:
+            print(f"  {exc}", file=sys.stderr)
+            if not routes:
+                print(NO_ROUTE_HINT, file=sys.stderr)
+            return 1
+    print(f"\n  Done. {len(verified)} package(s) on {where}.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

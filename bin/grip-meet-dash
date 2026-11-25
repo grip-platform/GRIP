@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""grip-meet-dash — live HTML dashboard for grip-meet (demo visual; seeds #2070).
+
+Read-only: serves a self-refreshing page reading the LIVE transcript + grip-meet
+process state. Never touches the capture. Stdlib only, no dependencies.
+
+    grip-meet-dash [--port 8675] [--transcript <path>]
+
+The page polls /data every 2.5s and renders the pipeline (mic -> whisper ->
+claude-opus-4-8 -> transcript), the watchdog state, a ticking chunk counter, and
+the live transcript feed. Bind is 127.0.0.1 only (operator's screen).
+"""
+from __future__ import annotations
+
+# Windows consoles default to cp1252, which cannot encode the glyphs below.
+# Located from __file__, not sys.path[0]: the tests load these commands with
+# SourceFileLoader, which does not put bin/ on the path.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from _grip_console import ensure_utf8_stdio  # noqa: E402
+
+ensure_utf8_stdio()
+
+import argparse
+import datetime as _dt
+import json
+import os
+import re
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+CLAUDE_DIR = Path.home() / ".claude"
+STATE_DIR = CLAUDE_DIR / "state" / "meet"
+CHUNK_RE = re.compile(r"^\*\*\[(\d{2}:\d{2})\]\*\*\s*(.*)$", re.M)
+SILENCE_GRACE = 150  # mirrors grip-meet SILENCE_GRACE_SECS
+
+
+def _pid_alive(name: str) -> bool:
+    try:
+        pid = int((STATE_DIR / f"{name}.pid").read_text().strip())
+        os.kill(pid, 0)
+        return True
+    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+        return False
+
+
+def _meta() -> dict:
+    try:
+        return json.loads((STATE_DIR / "meta.json").read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def resolve_transcript(override: str | None) -> Path:
+    """Pick the transcript to render. An explicit --transcript wins; otherwise
+    follow meta["transcript"] — what grip-meet is ACTUALLY writing, which handles
+    a custom path or a meeting that started on a prior day — falling back to
+    today's default. Resolved per request so the dashboard tracks the live
+    meeting even if it changes mid-run.
+    """
+    if override:
+        return Path(override)
+    tx = _meta().get("transcript")
+    if tx:
+        return Path(tx)
+    return CLAUDE_DIR / "drafts" / f"meeting-transcript-{_dt.date.today().isoformat()}.md"
+
+
+def snapshot(transcript: Path) -> dict:
+    meta = _meta()
+    text = transcript.read_text() if transcript.exists() else ""
+    chunks = [{"ts": m.group(1), "text": m.group(2).strip()}
+              for m in CHUNK_RE.finditer(text)]
+    last_write = int(time.time() - transcript.stat().st_mtime) if transcript.exists() else None
+    listener = _pid_alive("listener")
+    return {
+        "title": meta.get("title", "grip-meet — live meeting intelligence"),
+        "device": meta.get("device", "?"),
+        "model": "claude-opus-4-8",
+        "chunks": len(chunks),
+        "last_write_secs": last_write,
+        "silent": bool(listener) and last_write is not None and last_write > SILENCE_GRACE,
+        "listener": listener,
+        "brain": _pid_alive("actloop"),
+        "watchdog": _pid_alive("watchdog"),
+        "recent": chunks[-14:][::-1],
+        "now": _dt.datetime.now().strftime("%H:%M:%S"),
+    }
+
+
+HTML = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GRIP · Live Meeting Intelligence</title>
+<style>
+  :root{
+    --bg:#0a0e14; --panel:#0f1620; --line:#1d2733; --ink:#e6edf3; --dim:#8b98a9;
+    --live:#3fb950; --warn:#d29922; --dead:#f85149; --accent:#58a6ff; --mono:ui-monospace,"SF Mono",Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(1200px 600px at 50% -10%,#10202e 0%,var(--bg) 60%);
+    color:var(--ink);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1040px;margin:0 auto;padding:28px 22px 60px}
+  header{display:flex;align-items:center;gap:14px;margin-bottom:22px}
+  .dot{width:13px;height:13px;border-radius:50%;background:var(--live);box-shadow:0 0 0 0 rgba(63,185,80,.6);animation:pulse 1.8s infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(63,185,80,.55)}70%{box-shadow:0 0 0 12px rgba(63,185,80,0)}100%{box-shadow:0 0 0 0 rgba(63,185,80,0)}}
+  h1{font-size:19px;margin:0;letter-spacing:.2px;font-weight:650}
+  h1 b{color:var(--live)}
+  .clock{margin-left:auto;font-family:var(--mono);color:var(--dim);font-size:13px}
+  .pills{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:20px}
+  .pill{display:flex;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--line);
+    border-radius:10px;padding:9px 13px;font-size:13px}
+  .pill .k{color:var(--dim)} .pill .v{font-family:var(--mono);font-weight:600}
+  .pill .led{width:8px;height:8px;border-radius:50%;background:var(--dead)}
+  .pill.on .led{background:var(--live)} .pill.warn .led{background:var(--warn)}
+  .grid{display:grid;grid-template-columns:230px 1fr;gap:18px}
+  @media(max-width:720px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px}
+  .count{font-family:var(--mono);font-size:54px;font-weight:700;line-height:1;color:var(--ink);transition:color .25s}
+  .count.flash{color:var(--live)}
+  .count-l{color:var(--dim);font-size:12px;text-transform:uppercase;letter-spacing:1.5px;margin-top:8px}
+  .chain{margin-top:18px;font-size:12.5px;color:var(--dim);line-height:2}
+  .chain b{color:var(--accent);font-weight:600}
+  .feed h2{font-size:12px;text-transform:uppercase;letter-spacing:1.5px;color:var(--dim);margin:0 0 12px}
+  .chunk{border-left:2px solid var(--line);padding:6px 0 10px 14px;margin-bottom:6px;animation:fade .5s ease}
+  .chunk.new{border-color:var(--live)}
+  @keyframes fade{from{opacity:0;transform:translateY(-4px)}to{opacity:1}}
+  .chunk .t{font-family:var(--mono);color:var(--accent);font-size:11.5px}
+  .chunk .x{color:var(--ink);margin-top:2px}
+  .banner{margin-top:20px;font-size:12px;color:var(--dim);border-top:1px solid var(--line);padding-top:14px}
+  .banner b{color:var(--ink)}
+  .silent{color:var(--warn)} .empty{color:var(--dim);font-style:italic}
+</style></head>
+<body><div class="wrap">
+  <header>
+    <span class="dot" id="dot"></span>
+    <h1><b>GRIP</b> · Live Meeting Intelligence</h1>
+    <span class="clock" id="clock">—</span>
+  </header>
+  <div class="pills" id="pills"></div>
+  <div class="grid">
+    <div class="card">
+      <div class="count" id="count">0</div>
+      <div class="count-l">chunks captured</div>
+      <div class="chain">
+        🎙️ <b>mic</b> (probe-verified)<br>
+        ↳ 📝 <b>whisper</b> transcript<br>
+        ↳ 🧠 <b>claude-opus-4-8</b> (HAL-local)<br>
+        ↳ 🐕 <b>watchdog</b> guarding
+      </div>
+    </div>
+    <div class="card feed">
+      <h2>Live transcript</h2>
+      <div id="feed"><div class="empty">waiting for first chunk…</div></div>
+    </div>
+  </div>
+  <div class="banner">
+    <b>Hardened today via an adversarial dogfood loop.</b> This tool lost 15 minutes
+    to a deaf audio device this morning → broly self-review → CI + AGORA-gated RSI
+    convergence → the 5-second start probe + this watchdog. Falsify-before-believing,
+    applied to its own failure. <span id="age"></span>
+  </div>
+</div>
+<script>
+let last=0;
+async function tick(){
+  try{
+    const d=await (await fetch('/data',{cache:'no-store'})).json();
+    document.getElementById('clock').textContent=d.now;
+    const c=document.getElementById('count');
+    if(d.chunks>last){c.classList.add('flash');setTimeout(()=>c.classList.remove('flash'),500);}
+    last=d.chunks; c.textContent=d.chunks;
+    const dot=document.getElementById('dot');
+    dot.style.background=d.silent?'var(--warn)':(d.listener?'var(--live)':'var(--dead)');
+    // pills
+    const P=[
+      ['device', d.device, d.listener],
+      ['listener', d.listener?'LIVE':'down', d.listener, d.silent?'warn':''],
+      ['brain', d.brain?d.model:'down', d.brain],
+      ['watchdog', d.watchdog?'guarding':'down', d.watchdog],
+    ];
+    document.getElementById('pills').innerHTML=P.map(([k,v,on,cls])=>
+      `<div class="pill ${on?'on':''} ${cls||''}"><span class="led"></span><span class="k">${k}</span><span class="v">${v}</span></div>`).join('');
+    // age / silent warning
+    const a=document.getElementById('age');
+    if(d.silent){a.innerHTML='<span class="silent">⚠ watchdog: no chunk for '+d.last_write_secs+'s</span>';}
+    else if(d.last_write_secs!=null){a.textContent='· last chunk '+d.last_write_secs+'s ago';}
+    // feed
+    const f=document.getElementById('feed');
+    if(!d.recent.length){f.innerHTML='<div class="empty">waiting for first chunk…</div>';}
+    else{f.innerHTML=d.recent.map((ch,i)=>
+      `<div class="chunk ${i===0?'new':''}"><div class="t">[${ch.ts}]</div><div class="x">${esc(ch.text)}</div></div>`).join('');}
+  }catch(e){document.getElementById('clock').textContent='reconnecting…';}
+}
+function esc(s){const e=document.createElement('div');e.textContent=s;return e.innerHTML;}
+tick();setInterval(tick,2500);
+</script>
+</body></html>"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    override: str | None = None  # explicit --transcript; else follow meta.json
+
+    def log_message(self, *_a):  # quiet — don't spam the demo terminal
+        pass
+
+    def do_GET(self):
+        if self.path.startswith("/data"):
+            body = json.dumps(snapshot(resolve_transcript(self.override))).encode()
+            ctype = "application/json"
+        else:
+            body = HTML.encode()
+            ctype = "text/html; charset=utf-8"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="grip-meet-dash")
+    ap.add_argument("--port", type=int, default=8675)
+    ap.add_argument("--transcript", default=None)
+    args = ap.parse_args()
+    Handler.override = args.transcript
+    srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    print(f"grip-meet-dash live: http://127.0.0.1:{args.port}  "
+          f"(transcript: {resolve_transcript(args.transcript).name})")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        srv.shutdown()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

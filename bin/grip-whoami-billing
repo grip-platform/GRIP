@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""Which account pays for the next token?
+
+Nothing on this machine answered that question, and on 2026-09-17 it cost
+$303.96 to find out the hard way. The operator saw usage credits at 101% while
+his plan sat at 6% session / 23% weekly, could not tell which of three stored
+accounts was billing, and reasonably asked "why am I using extra money?".
+
+WHAT MAKES THIS MORE THAN `cat ~/.claude.json`
+
+That file carries an `oauthAccount` block with an email, and reading it is how
+the question got answered WRONG: its `profileFetchedAt` was five days stale and
+named a different account than the live session. A cached profile presented as
+current is the whole defect. So this tool always prints the fetch age beside the
+email and says plainly when it cannot confirm the profile is current.
+
+THE FLAG THAT ACTUALLY DECIDES THE MONEY
+
+`hasExtraUsageEnabled`. With it true, work that exceeds the 5-hour session
+allowance does not fail -- it bills to usage credits. That is why a plan can
+read 23% weekly while credits read 101%: they are different clocks, and only
+the session clock was hit. With it false, the same overflow fails loudly and
+costs nothing.
+
+NEVER PRINTS A SECRET. Credential entries are listed by name only; no token,
+key or value is read. The env-var protection gate fires on attempts to read
+these, and this tool is written so it never needs to.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+from claude_dir import get_claude_dir  # noqa: E402
+
+# A profile older than this is reported as STALE rather than as fact. Two days
+# is well inside the window in which an operator can switch accounts and
+# forget, and the 2026-09-17 instance was five days old.
+STALE_AFTER_SECONDS = 2 * 24 * 60 * 60
+
+# Keys worth surfacing, in the order a reader needs them. hasExtraUsageEnabled
+# is last because it is the punchline.
+PROFILE_KEYS = (
+    "emailAddress",
+    "organizationName",
+    "organizationType",
+    "organizationRateLimitTier",
+    "organizationRole",
+    "billingType",
+    "hasExtraUsageEnabled",
+)
+
+# Anything whose name suggests a credential is never printed, even from the
+# profile block, which is not supposed to contain one.
+SECRET_HINTS = ("token", "key", "secret", "credential", "password", "uuid")
+
+
+def _read_profile(claude_dir: Path):
+    """The cached oauthAccount block, or None. Never raises."""
+    for name in (".claude.json", "claude.json"):
+        p = claude_dir.parent / name if name == ".claude.json" else claude_dir / name
+        if not p.is_file():
+            continue
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        acct = data.get("oauthAccount")
+        if isinstance(acct, dict):
+            return acct, p
+    return None, None
+
+
+def _age_line(acct: dict) -> tuple:
+    """(human age, is_stale). The load-bearing half of this whole tool."""
+    fetched = acct.get("profileFetchedAt")
+    if not isinstance(fetched, (int, float)):
+        return "unknown (no profileFetchedAt)", True
+    seconds = time.time() - (fetched / 1000.0)
+    if seconds < 0:
+        return "in the future -- clock skew", True
+    days, rem = divmod(int(seconds), 86400)
+    hours = rem // 3600
+    human = f"{days}d {hours}h ago" if days else f"{hours}h ago"
+    return human, seconds > STALE_AFTER_SECONDS
+
+
+def _credential_entry_names() -> list:
+    """Keychain entries by NAME only. Never reads a secret's value.
+
+    `security dump-keychain` without -d lists metadata and does not prompt for
+    or emit passwords. If it is unavailable or refused, that is reported rather
+    than guessed at.
+    """
+    try:
+        out = subprocess.run(
+            ["security", "dump-keychain"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    names = set()
+    for line in out.stdout.splitlines():
+        if '"svce"' not in line:
+            continue
+        # '    "svce"<blob>="Claude Code-credentials-5f1dc39a"'
+        _, _, tail = line.partition('="')
+        name = tail.rstrip('"').strip()
+        if name and ("Claude Code" in name or "claude" in name.lower()):
+            names.add(name)
+    return sorted(names)
+
+
+def main(argv: list) -> int:
+    as_json = "--json" in argv
+    claude_dir = get_claude_dir()
+    acct, src = _read_profile(claude_dir)
+
+    report = {
+        "cached_profile_source": str(src) if src else None,
+        "profile": {},
+        "profile_age": None,
+        "profile_is_stale": True,
+        "credential_entries": _credential_entry_names(),
+        "warnings": [],
+    }
+
+    if acct is None:
+        report["warnings"].append(
+            "no cached oauthAccount block found -- cannot name the billing account "
+            "from disk. Check the harness's own reported account instead."
+        )
+    else:
+        for k in PROFILE_KEYS:
+            if k in acct and not any(h in k.lower() for h in SECRET_HINTS):
+                report["profile"][k] = acct[k]
+        age, stale = _age_line(acct)
+        report["profile_age"] = age
+        report["profile_is_stale"] = stale
+        if stale:
+            report["warnings"].append(
+                f"this profile was fetched {age} and may name the WRONG account. "
+                "It is a CACHE, not the live session. Compare against the account "
+                "the harness reports for this session before trusting it."
+            )
+        if acct.get("hasExtraUsageEnabled") is True:
+            report["warnings"].append(
+                "hasExtraUsageEnabled is TRUE: work exceeding the 5-hour session "
+                "allowance does not fail, it BILLS to usage credits. A plan can "
+                "read 23% weekly while credits read 101% -- different clocks."
+            )
+
+    if len(report["credential_entries"]) > 1:
+        report["warnings"].append(
+            f"{len(report['credential_entries'])} Claude Code credential entries "
+            "are stored. More than one account exists on this machine, so the "
+            "cached profile is not sufficient to identify which one is live."
+        )
+
+    if as_json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
+
+    print("Which account pays for the next token?")
+    print()
+    if report["profile"]:
+        for k in PROFILE_KEYS:
+            if k in report["profile"]:
+                print(f"  {k:<28} {report['profile'][k]}")
+        print(f"  {'profile fetched':<28} {report['profile_age']}"
+              f"{'  <-- STALE' if report['profile_is_stale'] else ''}")
+        print(f"  {'read from':<28} {report['cached_profile_source']}")
+    else:
+        print("  (no cached profile on disk)")
+
+    print()
+    print(f"  stored credential entries ({len(report['credential_entries'])}, names only):")
+    for n in report["credential_entries"] or ["(none found, or keychain not readable)"]:
+        print(f"    {n}")
+
+    if report["warnings"]:
+        print()
+        for w in report["warnings"]:
+            print(f"  ! {w}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

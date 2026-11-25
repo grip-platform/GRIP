@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""grip-insights -- run Claude Code's /insights headlessly and prove it produced something.
+
+Typing /insights inside a GRIP session gives a hollow report (the pinned `default` model
+alias is refused by the API, and Opus 5.5 answers /insights' small calls with nothing).
+This runs it as `claude -p "/insights" --model claude-sonnet-5` instead, from any harness
+that has the `claude` CLI, and checks the facet files and report it leaves behind.
+
+Usage:
+    grip-insights run [--force] [--max-age-hours N] [--model M] [--timeout S] [--attempts N] [--json]
+    grip-insights status [--json]      # report age, facets, stuck sessions; spends nothing
+    grip-insights digest               # the coarse facet summary /ultralearn feeds its council
+
+`run` spends the Claude weekly limit, so it is skipped while the report is younger than
+24 hours (GRIP_INSIGHTS_MAX_AGE_HOURS) unless --force. GRIP_INSIGHTS_MODEL overrides the model.
+A run that leaves the report unwritten (Claude Code's renderer sometimes crashes on the
+model's JSON, silently) is retried once, and the crash text is read from the nested session.
+
+Exit codes for `run` -- judged from the artefacts, never from claude's own exit code:
+    0  ok (sessions analysed, full report) or fresh-skip
+    2  partial -- sessions analysed, but some report panels or sections came back empty
+    1  hollow, failed or unavailable -- nothing usable was produced
+"""
+import sys
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+from cc_insights_refresh import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""truth-lens — render a probe's workspace-vocabulary readout as an honest terminal card.
+
+The delight IS the provability made visible: what the model's workspace
+(J-space) said at a decision point, what the model actually emitted, and
+whether the two agree — straight from a probe result JSON, no LLM, no
+network. Renders research/jspace-gridlm-probe results by default; any
+probe/jlens result via --input.
+
+Honesty is structural: the card ALWAYS carries the footer stating exactly
+what this is (an offline research signal from an open-weights probe — a
+hypothesis generator, NOT a live confabulation gate), and it renders
+negative/blocked verdicts as prominently as positive ones. A missing file
+exits with a plain-language message; an unrecognised JSON shape renders
+what it can and says what it could not.
+
+Usage:
+    truth-lens                    # default probe result, ANSI card
+    truth-lens --input FILE      # any probe/jlens result JSON
+    truth-lens --json            # machine-readable card data (for tests)
+    NO_COLOR=1 truth-lens        # plain text
+
+Stdlib only. Exit 0 on a rendered card, 1 on a missing/unreadable input.
+"""
+
+from __future__ import annotations
+
+# Windows consoles default to cp1252, which cannot encode the glyphs below.
+# Located from __file__, not sys.path[0]: the tests load these commands with
+# SourceFileLoader, which does not put bin/ on the path.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from _grip_console import ensure_utf8_stdio  # noqa: E402
+
+ensure_utf8_stdio()
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+_DEFAULT_INPUT = (
+    Path(__file__).resolve().parent.parent
+    / "research" / "jspace-gridlm-probe" / "result-mps-gpt2.json"
+)
+
+HONESTY_FOOTER = (
+    "offline research signal from open-weights probe — a hypothesis "
+    "generator, not a live confabulation gate"
+)
+
+# Recognised top-level fields, by card section. Anything else is reported
+# as unrecognised rather than silently dropped.
+_RECOGNISED = frozenset({
+    "model", "device", "decision_position_token", "model_top10",
+    "pooled_jspace_concept_matches", "per_layer", "DELTA_METRIC",
+    "ABLATION", "H749_VERDICT", "blocked", "replicated", "n_layers",
+    "d_model", "src_layers", "load_seconds", "one_prompt_seconds",
+    "n_fit_prompts", "fit_seconds", "n_concept_ids", "control_pool_size",
+    "scaleup", "_provenance", "repro_steps", "divergence_grounded",
+    "divergence_confab", "delta", "caveats", "layers", "n_prompts",
+})
+
+
+def _colour_enabled() -> bool:
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def _paint(text: str, code: str, colour: bool) -> str:
+    return f"\033[{code}m{text}\033[0m" if colour else text
+
+
+def _header(data: dict) -> dict:
+    """Card header: which model, which device, which decision point."""
+    return {
+        "model": str(data.get("model", "unknown-model")),
+        "device": str(data.get("device", "?")),
+        "decision_token": str(data.get("decision_position_token", "?")),
+    }
+
+
+def _workspace_readout(data: dict) -> list[str]:
+    """The workspace vocabulary at the decision point (pooled J-space matches)."""
+    pooled = data.get("pooled_jspace_concept_matches")
+    return [str(t) for t in pooled][:12] if isinstance(pooled, list) else []
+
+
+def _stated_output(data: dict) -> list[str]:
+    """What the model actually put at the top of its output distribution."""
+    top = data.get("model_top10")
+    return [str(t) for t in top][:10] if isinstance(top, list) else []
+
+
+def _agreement_signal(data: dict) -> str:
+    """Divergence/agreement between workspace and stated output, when present."""
+    delta = data.get("DELTA_METRIC")
+    if isinstance(delta, dict) and "mean_concept_delta" in delta:
+        return f"mean concept delta {delta['mean_concept_delta']}"
+    if "delta" in data:
+        return f"divergence delta {data['delta']}"
+    return ""
+
+
+def _verdict_line(data: dict) -> str:
+    """The probe's own honest call — negative and blocked render verbatim."""
+    verdict = data.get("H749_VERDICT")
+    if isinstance(verdict, dict) and verdict.get("call"):
+        return str(verdict["call"])
+    if data.get("blocked"):
+        return f"BLOCKED: {data['blocked']}"
+    if data.get("replicated") is False:
+        return "NOT REPLICATED (a valid, reportable outcome)"
+    return ""
+
+
+def build_card(data: dict) -> dict:
+    """Assemble the card model from a probe result dict (pure, testable)."""
+    unrecognised = sorted(set(data) - _RECOGNISED)
+    return {
+        "header": _header(data),
+        "workspace_readout": _workspace_readout(data),
+        "stated_output": _stated_output(data),
+        "agreement": _agreement_signal(data),
+        "verdict": _verdict_line(data),
+        "unrecognised_fields": unrecognised,
+        "honesty_footer": HONESTY_FOOTER,
+    }
+
+
+def _render_lines(card: dict, colour: bool) -> list[str]:
+    """The terminal card as a list of lines."""
+    head = card["header"]
+    bar = "─" * 62
+    lines = [
+        bar,
+        _paint(
+            f"  TRUTH LENS  {head['model']} · {head['device']} · decision "
+            f"token {head['decision_token']!r}", "1;36", colour),
+        "",
+    ]
+    lines.extend(_section("workspace says", card["workspace_readout"], "32", colour))
+    lines.extend(_section("model types", card["stated_output"], "33", colour))
+    if card["agreement"]:
+        lines.append("  " + _paint(f"agreement: {card['agreement']}", "35", colour))
+    if card["verdict"]:
+        lines.append("  " + _paint(f"verdict: {card['verdict']}", "1", colour))
+    if card["unrecognised_fields"]:
+        lines.append(
+            "  unrecognised fields (not rendered): "
+            + ", ".join(card["unrecognised_fields"]))
+    lines.extend(["", "  " + _paint(card["honesty_footer"], "2", colour), bar])
+    return lines
+
+
+def _section(title: str, tokens: list[str], code: str, colour: bool) -> list[str]:
+    """One card section; empty token lists render an honest '(absent)'."""
+    body = "  ".join(tokens) if tokens else "(absent from this result)"
+    return [f"  {title}:  " + _paint(body, code, colour)]
+
+
+def _load(path: Path) -> dict | None:
+    """Parse the input JSON; None (with a plain message) when unusable."""
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        print(f"truth-lens: no probe result at {path} — run the jspace probe "
+              "first, or point --input at any probe/jlens result JSON.")
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"truth-lens: could not read {path} as JSON ({exc}).")
+        return None
+    if not isinstance(parsed, dict):
+        print(f"truth-lens: {path} is valid JSON but not a result object.")
+        return None
+    return parsed
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", type=Path, default=_DEFAULT_INPUT,
+                        help="probe/jlens result JSON to render")
+    parser.add_argument("--json", action="store_true",
+                        help="emit the parsed card data instead of the ANSI card")
+    args = parser.parse_args(argv)
+
+    data = _load(args.input)
+    if data is None:
+        return 1
+    card = build_card(data)
+    if args.json:
+        print(json.dumps(card, indent=2))
+        return 0
+    print("\n".join(_render_lines(card, _colour_enabled())))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

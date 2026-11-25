@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.grip.whitelist-self-tripwire</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__HOME__/.claude/bin/whitelist-self-tripwire.sh</string>
+    </array>
+
+    <!-- Daily 07:00 SAST — 30 min after W2's 06:15/12:15/18:15/00:15 cadence
+         so a meta-whitelist drift gets surfaced AFTER the W1/W2 monitors
+         have already had a chance to log their own findings. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>7</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>CLAUDE_DIR</key>
+        <string>__HOME__/.claude</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>TZ</key>
+        <string>Africa/Johannesburg</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.claude</string>
+
+    <key>WakeFromSleep</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.claude/logs/security/whitelist-self-tripwire.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.claude/logs/security/whitelist-self-tripwire.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>Nice</key>
+    <integer>10</integer>
+
+    <key>TimeOut</key>
+    <integer>30</integer>
+</dict>
+</plist>

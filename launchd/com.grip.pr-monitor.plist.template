@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.grip.pr-monitor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.claude/bin/grip-pr-monitor</string>
+        <string>--sweep</string>
+        <string>--log</string>
+        <string>__HOME__/.claude/logs/grip-pr-monitor.log</string>
+    </array>
+
+    <!-- gh pr view/merge resolve the repo from the CWD via git, so the agent
+         must not run with launchd's default CWD ("/", not a git repo). The
+         script also passes --repo explicitly, but this is the same
+         WorkingDirectory the VPS systemd unit already sets (parity + defense). -->
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.claude</string>
+
+    <!-- Fire every 5 minutes. Each fire is one idempotent, verdict-aware sweep
+         over the operator's open PRs: merge-on-green, hold on REQUEST_CHANGES /
+         NO_QUORUM / no-verdict. A killed fire costs nothing; the next resumes. -->
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.claude/logs/grip-pr-monitor.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.claude/logs/grip-pr-monitor.log</string>
+</dict>
+</plist>

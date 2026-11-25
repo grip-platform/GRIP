@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# grip-rsi-witness-sync — the self-perpetuating loop for the public RSI witness.
+#
+# One tick: refresh the live signals (open PRs + shipped commits +
+# hypotheses), then deploy to the public gh-pages witness. The deploy pushes ONLY
+# when the rendered tree actually changed (Banach at the git layer) AND the content
+# is shield-clean — a PR/commit that names a client is fail-soft OMITTED, and a
+# locked (git-crypt) denylist fails CLOSED (refuses to publish rather than push
+# unshielded). So the public page updates itself forever as GRIP keeps shipping,
+# and can never auto-leak.
+#
+# Wired into a launchd timer: config/launchd/com.grip.rsi-witness-sync.plist
+# (installed by scripts/install-witness-sync.sh). Also runnable by hand.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GRIP_ROOT="$(dirname "$SCRIPT_DIR")"
+source "$GRIP_ROOT/scripts/lib/venv-utils.sh"
+# $GRIP_PYTHON still wins; otherwise resolve the venv (any platform layout).
+PY="${GRIP_PYTHON:-}"
+if [[ ! -x "$PY" ]]; then
+    if ! PY="$(resolve_venv_python "$GRIP_ROOT/venv")"; then
+        echo "[grip-rsi-witness-sync] no Python interpreter found (searched $GRIP_ROOT/venv, then PATH)" >&2
+        exit 1
+    fi
+fi
+LOG="$GRIP_ROOT/logs/rsi-witness-sync.log"
+mkdir -p "$(dirname "$LOG")"
+WITNESS="$GRIP_ROOT/lib/rsi_witness_publish.py"
+
+# Per-tick ordering: refresh MUST succeed before ITS OWN deploy (&&, never
+# sequential). A killed or failed tick cannot cause an unshielded push later,
+# for two independent reasons (AGORA #3970 item 3, verified): (a) every tick
+# re-runs refresh FIRST, so deploy only ever follows a same-tick successful
+# refresh; and (b) deploy independently re-scans the canonical signal bytes at
+# the push boundary and fails CLOSED on a locked denylist. The { } block needs
+# no atomicity for safety — it only groups the log redirection. Belt-and-braces
+# for AVAILABILITY (not safety): refresh's snapshot writes are atomic
+# (temp+rename in refresh_converging), so a kill mid-write cannot leave a
+# partial/truncated JSON that would make a later render omit that panel.
+{
+    echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) rsi-witness sync ==="
+    PYTHONPATH="$GRIP_ROOT" "$PY" "$WITNESS" refresh \
+      && PYTHONPATH="$GRIP_ROOT" "$PY" "$WITNESS" deploy --push \
+      || echo "sync ABORTED (refresh or deploy failed) — not pushing stale state"
+} >> "$LOG" 2>&1

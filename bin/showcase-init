@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""showcase-init — onboard a new showcase project.
+
+Writes state/showcases/<project>/config.json and an empty views.jsonl.
+After init, the server picks up the new project on the next request — no restart.
+
+Usage:
+  showcase-init <project> \\
+    --firm-name "Firm Name" \\
+    [--tagline "..."] [--footer "..."] \\
+    [--accent "#hex"] [--ink "#hex"] [--paper "#hex"] \\
+    --video /path/to/file.mp4 \\
+    [--recipients alice,bob,carol]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR", Path.home() / ".claude"))
+SHOW = CLAUDE_DIR / "state" / "showcases"
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="onboard a new showcase project")
+    p.add_argument("project", help="project slug (lowercase alphanumeric, hyphen/underscore)")
+    p.add_argument("--firm-name", required=True)
+    p.add_argument("--tagline", default="")
+    p.add_argument("--footer", default="")
+    p.add_argument("--accent", default="#C9A227")
+    p.add_argument("--ink", default="#0F1B3D")
+    p.add_argument("--paper", default="#FFFFFF")
+    p.add_argument("--video", required=True, help="absolute path to MP4")
+    p.add_argument("--recipients", default="", help="comma-separated recipient slugs")
+    args = p.parse_args()
+
+    project = args.project.lower()
+    if not SLUG_RE.match(project):
+        print(f"error: project slug {project!r} must match {SLUG_RE.pattern}", file=sys.stderr)
+        return 2
+
+    video = Path(args.video)
+    if not video.exists():
+        print(f"warning: video {video} not found (config written anyway)", file=sys.stderr)
+
+    proj_dir = SHOW / project
+    proj_dir.mkdir(parents=True, exist_ok=True)
+    cfg = {
+        "project": project,
+        "brand": {
+            "firm_name": args.firm_name,
+            "tagline": args.tagline,
+            "footer": args.footer,
+            "accent_hex": args.accent,
+            "ink_hex": args.ink,
+            "paper_hex": args.paper,
+        },
+        "video": {"path": str(video)},
+        "recipients": [r.strip() for r in args.recipients.split(",") if r.strip()],
+        "watermark": "V>>--<<V",
+    }
+    cfg_path = proj_dir / "config.json"
+    cfg_path.write_text(json.dumps(cfg, indent=2))
+
+    log = proj_dir / "views.jsonl"
+    if not log.exists():
+        log.touch()
+
+    port = os.environ.get("SHOWCASE_PORT", "9000")
+    print(f"project: {project}")
+    print(f"  config: {cfg_path}")
+    print(f"  log:    {log}")
+    for rid in cfg["recipients"]:
+        print(f"  url:    http://127.0.0.1:{port}/v/{project}/{rid}")
+    if not cfg["recipients"]:
+        print(f"  url:    http://127.0.0.1:{port}/v/{project}/<recipient>")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,6 @@
+{
+  "_comment": "Copy to config/grip-browser.local.json (gitignored) and put the real values there. lib/grip_browser_config.py reads it; the gate (hooks/grip-browser-tool-policy-gate.py) lets spawn_browser open ONLY the profile_dir named here, and only with GRIP_BROWSER_ALLOW_INTERACT=1 for anything that acts on the page. Every value below is an obvious fake. With no file the session is ephemeral: a fresh profile per task and nothing to spend, which is the v1 default.",
+  "profile_dir": "/opt/grip-browser-example/profile",
+  "proxy": "http://proxy.example.com:8080",
+  "scratch_dir": "/opt/grip-browser-example/scratch"
+}

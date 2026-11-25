@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""grip-anthropic-limits — probe each stored Max account and report which limits
+have reset, without hand-running `claude -p` and squinting at the error.
+
+Reuses grip-relay-bill's token store (``lib/claude_token_store.py``: an
+owner-only directory outside the GRIP checkout). Each account's OAuth token is
+``cch-oauth-token.<name>`` (0600) and the active one ``cch-oauth-token``. A
+machine that has not yet run ``grip-relay-bill migrate`` shows no accounts
+here. For every stored account this runs one cheap ``claude -p`` turn with that
+token as the subscription sign-in (``CLAUDE_CODE_OAUTH_TOKEN``, built by
+``lib/claude_as.child_env``), with no tools, no hooks, no MCP servers and no
+claude.ai connectors, and classifies what the account answered:
+
+  OK       serving (no limit hit, or already reset)
+  WEEKLY   weekly limit hit; reports the parsed reset date
+  SESSION  session limit hit; reports the parsed reset time
+  CREDIT   empty credit / billing problem (not a limit)
+  ERROR    anything else (auth, network, unknown model)
+
+Tokens are never printed — only account name, status, and reset hint.
+
+Why the sign-in variable (measured 2026-10-12, Claude Code 2.1.296): the token used to
+go in ``ANTHROPIC_API_KEY``. A stored token is a sign-in token, not an API key, so the
+CLI answered "Invalid API key · Fix external API key" and printed an advisory warning
+that claude.ai connectors were disabled, and this tool reported that warning as every
+account's error. Connectors are switched off because a full sign-in loads every
+claude.ai connector before it answers: one probe took 43 seconds with them and 4 without.
+
+Usage:
+  grip-anthropic-limits              probe every stored account, print a table
+  grip-anthropic-limits --json       one JSON object per account on stdout
+  grip-anthropic-limits --switch     probe, then switch active to the first OK account
+  grip-anthropic-limits acct-a acct-b  probe only the named account(s)
+
+One-time setup (per account, do once):
+  claude setup-token   # while logged in as that account, prints an sk-ant-oat token
+  grip-relay-bill store <account> < token
+  grip-relay-bill pool <account> <account>
+Then a scheduled `grip-anthropic-limits --switch` (launchd / cron) is the automatic
+"has it reset yet" check.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+# The cheapest model that answers. The five-hour and weekly limits cover every model, so
+# the model does not change the verdict; a one-model allowance (Fable's) is not probed.
+_PROBE_MODEL = os.environ.get("GRIP_LIMIT_PROBE_MODEL", "claude-haiku-5-5")
+_PROBE_TIMEOUT_S = int(os.environ.get("GRIP_LIMIT_PROBE_TIMEOUT", "60"))
+
+_WEEKLY_RE = re.compile(r"weekly limit[^\n]*?resets[^\n]*?([A-Z][^\n]*)", re.I)
+_SESSION_RE = re.compile(r"session limit[^\n]*?resets[^\n]*?([^\n]*)", re.I)
+_CREDIT_RE = re.compile(r"credit[^\n]*?(too low|balance|low)", re.I)
+_LIMITS = (("WEEKLY", _WEEKLY_RE), ("SESSION", _SESSION_RE))
+
+#: One turn, no tools, and nothing of this machine's: a probe must never run its hooks
+#: (they record usage caps and can switch billing) or load its MCP servers.
+_PROBE_FLAGS = ("--max-turns", "1", "--tools", "", "--strict-mcp-config",
+                "--settings", '{"disableAllHooks":true}', "--output-format", "json")
+#: Claude Code starts its advisory stderr lines with a warning sign.
+_ADVISORY = "⚠"
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+import claude_token_store  # noqa: E402 — the one definition of where tokens live
+import claude_as  # noqa: E402 — one account's token, with nothing that outranks it
+
+# Windows consoles default to cp1252, which cannot encode every character Claude
+# Code's messages carry (the warning sign above among them). Located from
+# __file__, not sys.path[0]: the tests load this command with SourceFileLoader.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _grip_console import ensure_utf8_stdio  # noqa: E402
+
+ensure_utf8_stdio()
+
+
+def _active_path() -> Path:
+    return claude_token_store.active_path()
+
+
+def _stored_accounts(active: Path) -> list[str]:
+    prefix = active.name + "."
+    return sorted(
+        p.name[len(prefix):]
+        for p in active.parent.glob(prefix + "*")
+        if p.name[len(prefix):] not in ("pool",)
+    )
+
+
+def _probe_env(token: str) -> dict:
+    """``token`` as the subscription sign-in, nothing that outranks or redirects it,
+    and claude.ai connectors switched off."""
+    env = claude_as.child_env(os.environ, token)
+    env["ENABLE_CLAUDEAI_MCP_SERVERS"] = "false"
+    return env
+
+
+def _result(stdout: str) -> dict | None:
+    """The CLI's JSON result object, wherever it sits among other lines."""
+    for line in reversed(stdout.splitlines()):
+        try:
+            doc = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(doc, dict) and doc.get("type") == "result":
+            return doc
+    return None
+
+
+def _said(stdout: str, stderr: str, doc: dict | None) -> str:
+    """What the account answered: the result's own text, else every output line that
+    is not one of Claude Code's advisory warnings."""
+    if doc is not None:
+        return str(doc.get("result") or "")
+    lines = f"{stdout}\n{stderr}".splitlines()
+    return "\n".join(line for line in lines
+                     if line.strip() and not line.lstrip().startswith(_ADVISORY))
+
+
+def classify(stdout: str, stderr: str) -> tuple[str, str]:
+    """(status, reset hint) for one probe's output."""
+    doc = _result(stdout)
+    if doc is not None and not doc.get("is_error"):
+        return ("OK", "")
+    said = _said(stdout, stderr, doc)
+    for status, pattern in _LIMITS:
+        found = pattern.search(said)
+        if found:
+            return (status, found.group(1).strip())
+    if _CREDIT_RE.search(said):
+        return ("CREDIT", "")
+    first = next((line for line in said.splitlines() if line.strip()), "unknown")
+    return ("ERROR", claude_token_store.scrubbed(first, 90, end=False))
+
+
+def _probe(token: str) -> tuple[str, str]:
+    """Returns (status, reset_hint)."""
+    cmd = ["claude", "-p", "--model", _PROBE_MODEL, *_PROBE_FLAGS, "Reply with exactly: OK"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                              timeout=_PROBE_TIMEOUT_S, env=_probe_env(token))
+    except FileNotFoundError:
+        return ("ERROR", "claude not on PATH")
+    except subprocess.TimeoutExpired:
+        return ("ERROR", "probe timed out")
+    return classify(proc.stdout or "", proc.stderr or "")
+
+
+def _switch(active: Path, name: str) -> None:
+    src = active.with_name(active.name + "." + name)
+    active.write_bytes(src.read_bytes())
+    os.chmod(active, 0o600)
+    print(f"active now: {name}")
+
+
+def main(argv: list[str]) -> int:
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__)
+        return 0
+    do_json = "--json" in argv
+    do_switch = "--switch" in argv
+    names_wanted = [a for a in argv if not a.startswith("-")]
+    active = _active_path()
+    stored = _stored_accounts(active)
+    if not stored:
+        print("no stored accounts — run: grip-relay-bill store <name> --from-active",
+              file=sys.stderr)
+        return 1
+    names = [n for n in names_wanted if n in stored] or stored
+
+    results: list[tuple[str, str, str]] = []
+    first_ok = None
+    for name in names:
+        token = active.with_name(active.name + "." + name).read_text().strip()
+        status, hint = _probe(token)
+        results.append((name, status, hint))
+        if status == "OK" and first_ok is None:
+            first_ok = name
+
+    if do_json:
+        print(json.dumps(
+            [{"account": n, "status": s, "resets": h} for n, s, h in results], indent=2))
+    else:
+        for n, s, h in results:
+            line = f"{s:8}  {n}"
+            if h:
+                line += f"  (resets {h})"
+            print(line)
+
+    if do_switch:
+        if first_ok:
+            _switch(active, first_ok)
+        else:
+            print("no account is serving — none switched", file=sys.stderr)
+            return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

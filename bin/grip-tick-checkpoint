@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# grip-tick-checkpoint -- list or remove the always-on tick's recovery checkpoints (lib/tick_checkpoint.py).
+# A checkpoint is the tick's one granted act: a copy of a hot or stuck session's transcript through
+# its last complete record, in a folder the tick owns, sealed as an IDR leaf. remove is the reversal.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec "$here/bin/grip-py" "$here/lib/tick_checkpoint.py" "$@"

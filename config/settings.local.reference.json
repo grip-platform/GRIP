@@ -1,0 +1,25 @@
+{
+  "_comment": "Template for settings.local.json. Created during GRIP install. GRIP_OPERATOR is set per-user during onboarding (/activate-grip). Permissions and statusLine are GRIP defaults.",
+  "permissions": {
+    "allow": [
+      "Bash(git clone:*)",
+      "Bash(brew:*)",
+      "Bash(gh:*)",
+      "Bash(git config:*)",
+      "Bash(rsync:*)",
+      "Bash(git init:*)",
+      "Bash(git remote add:*)",
+      "Bash(git fetch:*)",
+      "Bash(git reset:*)",
+      "Bash(git branch:*)"
+    ]
+  },
+  "env": {
+    "GRIP_OPERATOR": "__OPERATOR__",
+    "GRIP_BUDGET_MODE": "true"
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "bash $HOME/.claude/statusline-command.sh"
+  }
+}

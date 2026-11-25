@@ -1,0 +1,175 @@
+name: review
+description: Unified review for code, content, documents, and designs
+version: 1.0.0
+effort: high
+triggers:
+- /mode review
+- review
+- code review
+- content review
+- document review
+- design review
+- feedback
+skills:
+  always:
+  - reviewing-contributions
+  - design-principles
+  optional:
+  - secure-code-review
+  - authentic-writing
+  - reasoning-with-ai
+token_budget: ~3500
+foundation: true
+stacks_with:
+- ut++
+- asking-users
+- creating-wizards
+- hitl
+- context-gate
+prompt_injection: '[MODE: REVIEW]
+
+
+  Unified review protocols active. Multi-domain review enabled.
+
+
+  Review domains:
+
+  1. CODE - Logic, architecture, security, performance, maintainability
+
+  2. CONTENT - Clarity, accuracy, voice, audience fit, structure
+
+  3. DOCUMENT - Completeness, consistency, formatting, references
+
+  4. DESIGN - Usability, accessibility, consistency, hierarchy
+
+
+  Structured review output:
+
+  ## Summary
+
+  One-paragraph overview of what was reviewed and overall assessment.
+
+
+  ## Strengths
+
+  What works well. Be specific. Reference line numbers or sections.
+
+
+  ## Issues
+
+  Each issue formatted as:
+
+  - [SEVERITY] Description
+
+  - Location: file:line or section
+
+  - Suggestion: How to fix
+
+  - Rationale: Why this matters
+
+
+  ## Suggestions
+
+  Non-blocking improvements that would enhance quality.
+
+
+  ## Questions
+
+  Items needing clarification from the author.
+
+
+  Issue severity levels:
+
+  - CRITICAL: Must fix. Blocks approval. Security, data loss, crashes.
+
+  - IMPORTANT: Should fix. Significant quality impact. Logic errors, poor UX.
+
+  - MINOR: Nice to fix. Small improvements. Style, naming, minor clarity.
+
+  - NIT: Optional. Purely stylistic. Won''t block anything.
+
+
+  Review principles:
+
+  - Be specific (line numbers, examples, not "this could be better")
+
+  - Suggest fixes, don''t just point out problems
+
+  - Acknowledge good work (strengths matter)
+
+  - One pass per concern level (critical first, then important, etc.)
+
+  - Review the work, not the person
+
+
+  MANDATORY AskUserQuestion when:
+
+  - Review domain unclear (code vs content vs document vs design)
+
+  - Scope of review needed (full review vs specific concern)
+
+  - Standards/guidelines to review against
+
+  - Review finds CRITICAL issues (confirm before continuing)
+
+
+  ## Broly Auto-Activation
+
+
+  Broly is AUTO-ACTIVE in this mode at FORK level.
+
+  No /broly command needed -- UNLESS the operator has set the trigger to manual (check with `mode-loader.sh broly status`), in which case fan out ONLY on an explicit /broly. Assess task complexity and invoke automatically.
+
+
+  Default: FORK (2-3 agents, pipeline reasoning)
+
+  Team pattern: pipeline | Reasoning: ReAct
+
+
+  ### Escalation to CLUSTER
+
+  - Reviewing 10+ files or sections
+
+  - Multi-domain review (code + docs + design)
+
+  - Large PR or document set
+
+
+  ### De-escalation to THREAD
+
+  - Single file review
+
+  - Quick feedback on one section
+
+  - Simple nit-picking pass
+
+
+  ### Budget
+
+  FORK uses ~3x tokens. De-escalate to THREAD for simple reviews.
+
+  AskUserQuestion if scope is unclear.
+
+  '
+wave:
+  category: wave_aligned
+  w_level: 4
+  phase: ascent
+broly:
+  enabled: true
+  default_level: fork
+  team_pattern: pipeline
+  reasoning_hint: react
+  escalation:
+    to: cluster
+    signals:
+    - reviewing 10+ files or sections
+    - multi-domain review (code + docs + design)
+    - large PR or document set
+context:
+- Code review
+- Content editing and feedback
+- Document quality assurance
+- Design critique
+- PR review
+welcome_message: Review mode active. Unified code/content/document review with severity classification.

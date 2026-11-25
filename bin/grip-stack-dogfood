@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# grip-stack-dogfood -- dogfood the CodeTonight AI suite (GRASP, HAPPI, HAL, GRIP)
+# onto itself: status / report / install / prove across every harness.
+# Thin wrapper: lib/stack_dogfood is the implementation; -m keeps the package's
+# relative imports intact. Runs from the repo root so `lib.stack_dogfood` imports.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$here"
+exec "$here/bin/grip-py" -m lib.stack_dogfood "$@"

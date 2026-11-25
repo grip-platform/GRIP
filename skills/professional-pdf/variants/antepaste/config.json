@@ -1,0 +1,35 @@
+{
+  "variant_id": "antepaste",
+  "company_name": "Antepaste",
+  "variant": "antepaste-record",
+  "operator": "",
+  "colours": {
+    "accent": "#0F766E",
+    "text": "#0f172a",
+    "background": "#fafafa",
+    "border": "#e2e8f0",
+    "surface": "#ffffff",
+    "muted": "#64748b"
+  },
+  "typography": "swiss",
+  "fonts": {
+    "heading": "-apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, sans-serif",
+    "body": "-apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, sans-serif",
+    "mono": "\"SF Mono\", \"JetBrains Mono\", \"Consolas\", monospace"
+  },
+  "logo_path": null,
+  "footer": "Antepaste — the record · 2026-09-11 · for V>> only",
+  "footer_separator": " · ",
+  "scale": {
+    "h1_size": "28pt",
+    "h1_weight": "800",
+    "h1_tracking": "-0.03em",
+    "h2_size": "16pt",
+    "h2_weight": "700",
+    "h3_size": "12pt",
+    "h4_size": "10pt",
+    "body_size": "11pt",
+    "body_line_height": "1.6",
+    "code_size": "9pt"
+  }
+}

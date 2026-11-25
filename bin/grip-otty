@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""grip-otty — GRIP's Otty cockpit: status card, doctor, pad launcher.
+
+  grip-otty            status card (panes, agents, send-keys, hook gating)
+  grip-otty doctor     integration health checks
+  grip-otty doctor --fix   enable send-keys + gate the settings.json hooks
+  grip-otty pad [...]  passthrough to otty-pad (the editor-pane prompt sender)
+
+Safe everywhere: on a machine without Otty it prints one line and exits 0
+(status) — the whole surface is detection-gated by design.
+"""
+from __future__ import annotations
+
+# Windows consoles default to cp1252, which cannot encode the glyphs below.
+# Located from __file__, not sys.path[0]: the tests load these commands with
+# SourceFileLoader, which does not put bin/ on the path.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from _grip_console import ensure_utf8_stdio  # noqa: E402
+
+ensure_utf8_stdio()
+
+import json
+import os
+import sys
+from pathlib import Path
+
+_GRIP = Path(__file__).resolve().parent.parent
+if str(_GRIP) not in sys.path:
+    sys.path.insert(0, str(_GRIP))
+
+from lib import gated_machine_hooks as gmh  # noqa: E402
+from lib import otty_transport as ot  # noqa: E402
+
+SETTINGS = Path.home() / ".claude" / "settings.json"
+
+
+def _load_settings() -> dict:
+    try:
+        return json.loads(SETTINGS.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def cmd_status() -> int:
+    info = ot.info()
+    if not info.available:
+        print("otty: not installed on this machine (macOS-only for now) — GRIP's "
+              "Otty integration is dormant here, by design.")
+        return 0
+    panes = ot.pane_list()
+    agents = ot.agent_panes(panes)
+    agent_ids = {p.get("id") for p in agents}
+    send_ok = ot.send_keys_enabled()
+    problems = gmh.check(_load_settings())
+    print(f"\n  Otty ⇄ GRIP · otty {info.version or '?'}"
+          f" · {'inside otty' if info.inside else 'outside otty'}"
+          f" · send-keys {'ON' if send_ok else 'OFF (doctor --fix)'}")
+    print(f"  panes {len(panes)} · agent sessions {len(agents)}"
+          f" · hooks {'gated ✓' if not problems else f'{len(problems)} problem(s) — run doctor'}\n")
+    for pane in panes:
+        star = "★" if pane.get("id") in agent_ids else " "
+        title = str(pane.get("process") or "").strip() or "(shell)"
+        print(f"   {star} {pane.get('id')}  {title[:70]}")
+    print()
+    return 0
+
+
+def _doctor_checks() -> list[tuple[str, bool, str]]:
+    info = ot.info()
+    checks: list[tuple[str, bool, str]] = [
+        ("otty binary reachable", info.available, "install Otty from otty.sh (macOS)"),
+        ("running inside an Otty shell", info.inside, "informational — CLI still works via the app socket"),
+    ]
+    if info.available:
+        checks.append(("app responds over IPC", info.version is not None,
+                       "open the Otty app (CLI needs the running app)"))
+        checks.append(("ipc-allow-send-keys enabled", ot.send_keys_enabled(),
+                       "doctor --fix (or: otty config set ipc-allow-send-keys true && otty config reload)"))
+    problems = gmh.check(_load_settings())
+    checks.append((f"settings.json hooks gated ({len(gmh.SPECS)} expected)", not problems,
+                   "doctor --fix (or run lib/gated_machine_hooks.py --apply "
+                   "under the GRIP venv)"))
+    for wrapper in ("otty-state-hook.sh", "cache-keepalive-hook.sh"):
+        path = _GRIP / "hooks" / wrapper
+        checks.append((f"hooks/{wrapper} present+executable",
+                       path.exists() and os.access(path, os.X_OK), "restore from git"))
+    return checks
+
+
+def cmd_doctor(fix: bool) -> int:
+    if fix and ot.is_available():
+        if ot.ensure_send_keys():
+            print("  fixed: ipc-allow-send-keys enabled + config reloaded")
+        gmh.main(["--file", str(SETTINGS), "--apply"])
+    failed = 0
+    print()
+    for label, ok, remedy in _doctor_checks():
+        mark = "✓" if ok else "✗"
+        print(f"   {mark} {label}" + ("" if ok else f"\n     ↳ {remedy}"))
+        failed += 0 if ok else 1
+    print()
+    if failed and not fix:
+        print("  run: grip-otty doctor --fix")
+    return 1 if failed else 0
+
+
+def main(argv: list[str]) -> int:
+    cmd = argv[0] if argv else "status"
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "doctor":
+        return cmd_doctor(fix="--fix" in argv[1:])
+    if cmd == "pad":
+        pad = str(_GRIP / "bin" / "otty-pad")
+        os.execv(sys.executable, [sys.executable, pad] + argv[1:])
+    print(__doc__)
+    return 0 if cmd in ("help", "-h", "--help") else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

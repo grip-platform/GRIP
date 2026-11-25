@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# grip-ascent — The Ascent of GRIP
+#
+# Renders GRIP's genome as a March-of-Progress: each figure's posture is the
+# real measured fitness of a gene, marched weakest → strongest. Delight bound
+# to truth — the posture cannot flatter (see lib/evolution_march.py).
+#
+# Usage:
+#   grip-ascent                 # richest genome, colour if TTY
+#   grip-ascent --no-colour     # plain text (pipes, logs)
+#   grip-ascent --colour        # force colour (e.g. | less -R, or a relay)
+#   grip-ascent --figures 12    # longer march
+#   grip-ascent --open          # open in your text editor (clean, no terminal mangling)
+#   grip-ascent --html          # colour HTML version, opens in your browser
+#   grip-ascent --genome PATH   # specific genome JSON
+#   grip-ascent --json          # machine-readable
+set -euo pipefail
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+cd "$CLAUDE_DIR"
+exec python3 -m lib.evolution_march "$@"

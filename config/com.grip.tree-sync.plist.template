@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  grip-tree-sync — keep the SHARED tree level with origin/main. TEMPLATE.
+
+  Why the shared tree specifically: launchd agents EXECUTE from it, so letting
+  it drift behind main is an unreviewed deploy
+  (rules/shared-tree-is-not-canonical.md). Standing goal, V>> 2026-08-19:
+  never have a dirty tree behind main.
+
+  NOT auto-installed (a fresh GRIP install stays byte-identical). To enable:
+      sed "s|__GRIP_HOME__|$HOME/.claude|g" \
+        config/com.grip.tree-sync.plist.template \
+        > ~/Library/LaunchAgents/com.grip.tree-sync.plist
+      launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.grip.tree-sync.plist
+
+  Verify bin/grip-tree-sync exists at that path FIRST. A shim that lives only
+  in an unmerged worktree resolves to nothing here, and launchd will retry a
+  missing file on every interval without ever saying why.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.grip.tree-sync</string>
+
+  <!-- PATH is explicit because `launchctl getenv PATH` is EMPTY: an agent
+       inherits /usr/bin:/bin:/usr/sbin:/sbin and cannot see /opt/homebrew/bin,
+       where git lives on Apple Silicon. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__GRIP_HOME__/bin/grip-tree-sync</string>
+    <string>--shared</string>
+  </array>
+
+  <!-- Deliberately NO --autostash. Unattended healing of a DIRTY tree is a
+       different risk class from keeping a clean one level: the operator is not
+       there to notice a reapplied stash. The timer keeps a clean tree level and
+       REPORTS a dirty one; healing stays a deliberate foreground act. -->
+
+  <!-- 20 minutes: short enough that drift stays small, long enough that the
+       fetch is not a constant network tap. Idempotent, so a run against a level
+       tree costs one fetch and exits 0. -->
+  <key>StartInterval</key>
+  <integer>1200</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/grip-tree-sync.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/grip-tree-sync.err</string>
+</dict>
+</plist>

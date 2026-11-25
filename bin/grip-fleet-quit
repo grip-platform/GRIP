@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""grip-fleet-quit — ask every other live GRIP session to save and exit.
+
+DRY-RUN IS THE DEFAULT. A bare `grip-fleet-quit` prints the plan and changes
+nothing; quitting requires an explicit `--go`.
+
+    grip-fleet-quit                      # plan only (default)
+    grip-fleet-quit --go                 # broadcast, await saves, actuate
+    grip-fleet-quit --go --force         # also signal sessions that saved but
+                                         # did not exit (never a guessed pid)
+    grip-fleet-quit --protect <id> [why] # never quit this session, persistently
+    grip-fleet-quit --unprotect <id>     # drop it from the protected list
+    grip-fleet-quit --list-protected     # show the protected list
+    grip-fleet-quit --abort              # halt an in-flight run at the next phase
+    grip-fleet-quit --clear-abort        # release the brake
+
+`--exclude <id>` protects for ONE run without writing the list.
+Both spellings of a session id are accepted (`cc-<uuid>` or bare `<uuid>`).
+
+The engine, its three grounding measurements and the safety invariants live in
+lib/fleet_quit.py. This file is argument parsing, actuator detection and
+printing — deliberately thin, so the decision procedure has exactly one home
+and the dry-run cannot preview a different algorithm than the one that runs.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+try:
+    from claude_dir import get_claude_dir
+except Exception:  # pragma: no cover - path-portability fallback
+    def get_claude_dir() -> Path:
+        return Path(os.environ.get("CLAUDE_DIR") or (Path.home() / ".claude"))
+
+import fleet_quit as fq  # noqa: E402
+
+
+def _self_session_id() -> str:
+    raw = (os.environ.get("CLAUDE_CODE_SESSION_ID")
+           or os.environ.get("CLAUDE_SESSION_ID") or "").strip()
+    if raw:
+        return fq.normalise_session_id(raw)
+    # No session id in the environment means we cannot prove which row is us.
+    # Returning "" would make self-exclusion match NOTHING, so the initiator
+    # would be a target of its own broadcast — the one outcome
+    # rules/gate-resolution-escape-hatch.md Invariant 1 forbids. Refuse instead.
+    return ""
+
+
+def _detect_pane_actuator() -> tuple[str | None, str]:
+    """Which pane actuator can deliver a keystroke here, and why not if none.
+
+    Probed rather than assumed: on the machine this was written on, Otty was
+    INSTALLED but not RUNNING, so a presence check on the binary would have
+    reported an actuator that could not actuate.
+    """
+    sock = (Path.home() / "Library" / "Application Support"
+            / "io.appmakes.otty" / "otty.sock")
+    if sock.exists():
+        try:
+            r = subprocess.run(["otty", "pane", "list"], capture_output=True,
+                               text=True, timeout=5)
+            if r.returncode == 0:
+                return "otty", "otty is running"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        r = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id}"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return "tmux", "tmux has panes"
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None, ("no pane actuator: tmux absent or paneless, and Otty not "
+                  "running (socket missing)")
+
+
+def _fmt(t: fq.Target) -> str:
+    age = "unreadable" if t.age_s == float("inf") else f"{t.age_s:6.0f}s"
+    out = f"  {t.state:<9} {t.session_id}  age={age}  {t.name}"
+    if t.outcome:
+        out += f"  -> {t.outcome}"
+    if t.detail:
+        out += f"\n            {t.detail}"
+    return out
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="grip-fleet-quit", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--go", action="store_true",
+                    help="actually broadcast and actuate (default is dry-run)")
+    ap.add_argument("--force", action="store_true",
+                    help="signal sessions that saved but did not exit; never a guessed pid")
+    ap.add_argument("--timeout", type=float, default=fq.DEFAULT_TIMEOUT_S,
+                    help=f"seconds to await readiness (default {fq.DEFAULT_TIMEOUT_S:.0f})")
+    ap.add_argument("--live-window", type=float, default=fq.DEFAULT_LIVE_WINDOW_S,
+                    help=f"heartbeat age counted as live (default {fq.DEFAULT_LIVE_WINDOW_S:.0f}s)")
+    ap.add_argument("--exclude", action="append", default=[], metavar="ID",
+                    help="protect a session for this run only (repeatable)")
+    ap.add_argument("--protect", metavar="ID", help="add a session to the persistent protected list")
+    ap.add_argument("--reason", default="", help="note stored beside a --protect entry")
+    ap.add_argument("--unprotect", metavar="ID", help="remove a session from the protected list")
+    ap.add_argument("--list-protected", action="store_true")
+    ap.add_argument("--abort", action="store_true", help="halt an in-flight run")
+    ap.add_argument("--clear-abort", action="store_true")
+    ap.add_argument("--db", default=os.environ.get("CLAUDE_MESH_DB_PATH")
+                    or str(Path.home() / ".grip-session-mesh" / "presence.db"))
+    args = ap.parse_args(argv)
+
+    claude_dir = get_claude_dir()
+
+    if args.abort:
+        print(f"fleet-quit: ABORT requested -> {fq.request_abort(claude_dir)}")
+        return 0
+    if args.clear_abort:
+        fq.clear_abort(claude_dir)
+        print("fleet-quit: abort released")
+        return 0
+    if args.protect:
+        p = fq.add_protected(claude_dir, args.protect, args.reason)
+        print(f"fleet-quit: protected {fq.normalise_session_id(args.protect)} -> {p}")
+        return 0
+    if args.unprotect:
+        sid = fq.normalise_session_id(args.unprotect)
+        p = fq.protected_path(claude_dir)
+        if p.exists():
+            kept = [ln for ln in p.read_text().splitlines()
+                    if fq.normalise_session_id(ln.split("#", 1)[0].strip()) != sid]
+            p.write_text("\n".join(kept) + ("\n" if kept else ""))
+        print(f"fleet-quit: unprotected {sid}")
+        return 0
+    if args.list_protected:
+        prot = fq.load_protected(claude_dir)
+        print(f"fleet-quit: {len(prot)} protected session(s)")
+        for s in sorted(prot):
+            print(f"  {s}")
+        return 0
+
+    self_id = _self_session_id()
+    if not self_id:
+        print("fleet-quit: REFUSING — no CLAUDE_SESSION_ID in the environment, so this\n"
+              "            process cannot prove which presence row is itself. Without that\n"
+              "            proof it could quit the session running this command.",
+              file=sys.stderr)
+        return 2
+
+    protected = fq.load_protected(claude_dir, args.exclude)
+    try:
+        rows = fq.read_sessions(Path(args.db))
+    except fq.FleetQuitError as exc:
+        print(f"fleet-quit: {exc}", file=sys.stderr)
+        return 2
+
+    targets = fq.classify(rows, self_id=self_id, protected=protected,
+                          now=time.time(), live_window_s=args.live_window)
+    actuator, actuator_why = _detect_pane_actuator()
+    live = [t for t in targets if t.targetable]
+
+    print(f"fleet-quit: {len(rows)} presence row(s); initiator {self_id}")
+    print(f"            actuator: {actuator or 'NONE'} ({actuator_why})")
+    print(f"            protected: {len(protected)}")
+    for t in targets:
+        print(_fmt(t))
+
+    if not args.go:
+        plan = fq.actuation_plan(targets, force=args.force, self_pid=os.getpid(),
+                                 pane_actuator=actuator)
+        print(f"\n  DRY RUN — nothing sent, nothing quit. Would message {len(live)} session(s).")
+        for step in plan:
+            if step["action"] != "skip":
+                print(f"    {step['action']:<10} {step['target'].session_id}  {step['why']}")
+        print("\n  Re-run with --go to actually do it.")
+        return 0
+
+    if fq.abort_requested(claude_dir):
+        print("fleet-quit: abort marker present — refusing to start. "
+              "Clear it with --clear-abort.", file=sys.stderr)
+        return 3
+    if not live:
+        print("\n  Nothing to do: no live session other than this one.")
+        return 0
+
+    fq.clear_ready(claude_dir, targets)
+    sent = fq.broadcast_shutdown(Path(args.db), initiator=self_id, targets=targets,
+                                 deadline_s=int(args.timeout))
+    print(f"\n  Broadcast shutdown to {sent} live session(s); awaiting saves "
+          f"(timeout {args.timeout:.0f}s)...")
+    resolved = fq.await_ready(claude_dir, targets, timeout_s=args.timeout)
+
+    if fq.abort_requested(claude_dir):
+        print("  ABORTED at the await boundary — nothing was actuated.", file=sys.stderr)
+        return 3
+
+    plan = fq.actuation_plan(resolved, force=args.force, self_pid=os.getpid(),
+                             pane_actuator=actuator)
+    print("\n  Actuation:")
+    for step in plan:
+        t = step["target"]
+        if step["action"] == "skip":
+            continue
+        print(f"    {step['action']:<10} {t.session_id}  {step['why']}")
+        if step["action"] == "signal":
+            try:
+                os.kill(step["pid"], signal.SIGTERM)
+                time.sleep(fq.DEFAULT_KILL_GRACE_S)
+                try:
+                    os.kill(step["pid"], 0)
+                    os.kill(step["pid"], signal.SIGKILL)
+                    print(f"      pid {step['pid']}: SIGTERM ignored, SIGKILL sent")
+                except ProcessLookupError:
+                    print(f"      pid {step['pid']}: exited on SIGTERM")
+            except ProcessLookupError:
+                print(f"      pid {step['pid']}: already gone")
+            except PermissionError:
+                print(f"      pid {step['pid']}: PERMISSION DENIED — not signalled")
+        elif step["action"] == "pane-exit":
+            # Delivered through lib/otty_transport, never a raw shell-out: that
+            # module's _require_pane hard-fails on an empty pane id, which is the
+            # guard standing between this and closing somebody else's pane.
+            try:
+                import otty_transport as ot
+                ot.send_prompt(step["pane"], "/exit", submit=True, bracketed=False)
+                print(f"      pane {step['pane']}: /exit delivered")
+            except Exception as exc:
+                print(f"      pane {step['pane']}: DELIVERY FAILED ({exc}) — still running")
+
+    s = fq.summarise(resolved, plan)
+    print(f"\n  Summary: {s['by_state']}  actions={s['by_action']}")
+    degraded = [p for p in plan if p["action"] == "degraded"]
+    if degraded:
+        print(f"  {len(degraded)} session(s) DEGRADED — they saved but this machine could "
+              f"not deliver an exit. They are still running.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""grip-recall — moat-backed recall CLI (query / preassert / build / verify).
+
+Exit codes: query 0 = artefacts found, 4 = none. preassert 0 = ALLOW,
+3 = UNVERIFIABLE, 5 = DENY. dejavu/wizard 6 = surface not yet delivered.
+Store: --store, else $GRIP_RECALL_STORE, else <claude_dir>/state/recall/.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+for _p in (str(_ROOT), str(_ROOT / "lib")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from lib.recall import forensic, index, preassert as preassert_mod  # noqa: E402
+from lib.recall import report as report_mod  # noqa: E402
+
+
+def _print(obj, as_json: bool, plain_lines) -> None:
+    if as_json:
+        print(json.dumps(obj, indent=2))
+    else:
+        print("\n".join(plain_lines))
+
+
+def _cmd_query(args) -> int:
+    result = index.query_subject(args.subject, type=args.type, store=args.store)
+    lines = [f"subject: {args.subject} — {len(result.artefacts)} artefact(s); "
+             f"freshness verified={result.freshness.get('verified')}"]
+    lines += [f"  [{a.get('status')}] {a.get('type')}: {a.get('path')} "
+              f"(sha256={a.get('blob_hash') or '-'}, idr={a.get('idr_id') or '-'})"
+              for a in result.artefacts]
+    _print(result.to_dict(), args.json, lines)
+    return 0 if result.artefacts else 4
+
+
+_PREASSERT_EXIT = {"ALLOW": 0, "UNVERIFIABLE": 3, "DENY": 5}
+
+
+def _cmd_preassert(args) -> int:
+    verdict = preassert_mod.preassert(args.claim, scope=args.scope or None, store=args.store)
+    lines = [f"{verdict.verdict}: {verdict.reason} (basis={verdict.basis})"]
+    lines += [f"  evidence: {e.get('path')} (sha256={e.get('blob_hash') or '-'})"
+              for e in verdict.evidence]
+    _print(verdict.to_dict(), args.json, lines)
+    return _PREASSERT_EXIT.get(verdict.verdict, 3)
+
+
+def _cmd_build(args) -> int:
+    summary = index.build(store_dir=args.store)
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def _cmd_verify(args) -> int:
+    fresh = index.store_freshness(args.store).to_dict()
+    chain = forensic.verify_chain(store=args.store)
+    print(json.dumps({"index": fresh, "forensic": chain}, indent=2))
+    return 0 if fresh.get("verified") and chain.get("ok") else 1
+
+
+_REPORT_RENDER = {
+    "terminal": lambda rep: report_mod.render_terminal(rep),
+    "receipt": lambda rep: report_mod.render_receipt(rep),
+    "json": lambda rep: report_mod.report_json(rep),
+}
+
+
+def _cmd_report(args) -> int:
+    """Deterministic forensic report. Exit 0 clean, 1 chain broken,
+    2 open contradictions, 7 publish-check refused."""
+    rep = report_mod.build_report(store=args.store)
+    print(_REPORT_RENDER[args.format](rep))
+    if args.publish_check:
+        gate = report_mod.publish_gate(report_mod.render_receipt(rep))
+        print(json.dumps({"publish_gate": gate}, indent=2))
+        if not gate["ok"]:
+            return 7
+    verdict = rep["executive"]["verdict"]
+    if verdict == "CHAIN_BROKEN":
+        return 1
+    return 2 if verdict == "OPEN_CONTRADICTIONS" else 0
+
+
+def _cmd_dejavu(args) -> int:
+    try:
+        from lib.recall.dejavu import check_before_create  # noqa: PLC0415 — runtime boundary
+    except ImportError:
+        print("dejavu is delivered by track 2 of the recall build and is not "
+              "yet present on this machine — try again after that track lands.")
+        return 6
+    verdict = check_before_create(args.intent, store_dir=args.store)
+    print(verdict["card"] if verdict.get("card")
+          else f"no near-duplicates found for: {args.intent}")
+    return 0
+
+
+def _cmd_wizard(args) -> int:
+    try:
+        from lib.recall.wizard import run_wizard  # noqa: PLC0415 — runtime boundary
+    except ImportError:
+        print("wizard is delivered by track 2 of the recall build and is not "
+              "yet present on this machine — try again after that track lands.")
+        return 6
+    run_wizard(store_dir=args.store)
+    return 0
+
+
+_COMMANDS = {
+    "query": _cmd_query,
+    "preassert": _cmd_preassert,
+    "build": _cmd_build,
+    "verify": _cmd_verify,
+    "report": _cmd_report,
+    "dejavu": _cmd_dejavu,
+    "wizard": _cmd_wizard,
+}
+
+
+def _cmd_ask(args) -> int:
+    from lib.recall.cascade import recall, last_timings
+
+    answer = recall(args.question, mode="absence" if args.absence else "lookup",
+                    key=args.key, why=args.why, deep=args.deep, k=args.k,
+                    moat_store=args.store)
+    lines = [answer["certainty"]]
+    lines.extend(f"  {hit['id']} [{hit['layer']}] — {hit['title']}" for hit in answer["hits"])
+    lines.extend(f"  not searched: {item['scope']} — {item['reason']}"
+                 for item in answer["scopes_not_searched"])
+    if answer["absence"]:
+        lines.append(f"  absence: {answer['absence']}")
+    _print(answer, args.json, lines)
+    if args.timings:
+        print(json.dumps(last_timings(), sort_keys=True), file=sys.stderr)
+    return 0
+
+
+_COMMANDS["ask"] = _cmd_ask
+
+
+def _ask_parser(sub):
+    ask = sub.add_parser("ask", help="search local memory through the recall cascade")
+    ask.add_argument("question")
+    ask.add_argument("--absence", action="store_true")
+    ask.add_argument("--key")
+    ask.add_argument("--why", action="store_true")
+    ask.add_argument("--deep", action="store_true")
+    ask.add_argument("--k", type=int, default=5)
+    ask.add_argument("--json", action="store_true")
+    ask.add_argument("--timings", action="store_true")
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="grip-recall", description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    q = sub.add_parser("query", help="look a subject up in the moat index")
+    q.add_argument("--subject", required=True)
+    q.add_argument("--type", default=None)
+    q.add_argument("--json", action="store_true")
+    p = sub.add_parser("preassert", help="verdict on a negative-existence claim")
+    p.add_argument("--claim", required=True)
+    p.add_argument("--scope", action="append", default=[])
+    p.add_argument("--json", action="store_true")
+    sub.add_parser("build", help="full rebuild of the index from the moat")
+    sub.add_parser("verify", help="verify index freshness + forensic chain")
+    r = sub.add_parser("report", help="deterministic forensic report over the RED chain")
+    r.add_argument("--format", choices=("terminal", "receipt", "json"),
+                   default="terminal")
+    r.add_argument("--publish-check", action="store_true",
+                   help="run the fail-closed publish gate on the receipt "
+                        "rendering (exit 7 on refusal)")
+    d = sub.add_parser("dejavu", help="deja-vu surface (track 2)")
+    d.add_argument("--intent", default="")
+    sub.add_parser("wizard", help="interactive recall wizard (track 2)")
+    _ask_parser(sub)
+    for sp in sub.choices.values():
+        sp.add_argument("--store", default=None, help="store dir override")
+    return parser
+
+
+def main(argv=None) -> int:
+    args = _parser().parse_args(argv)
+    return _COMMANDS[args.command](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

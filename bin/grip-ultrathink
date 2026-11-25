@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# grip-ultrathink -- /ultrathink's three-seat deliberation from the command line.
+#
+# Thin wrapper: lib/ultrathink_trio.py does the work, and skills/ultrathink/SKILL.md
+# is the procedure. Three frontier seats from three vendors (Fable 5.1, GPT-6
+# Astra, DeepSeek v4 Pro) answer in parallel, then debate and falsify each other.
+# It prints the synthesis brief for the main thread, then a footer naming the rung
+# that answered per seat, latency, degraded seats, the record path and the IDR leaf.
+#
+# Usage:
+#   grip-ultrathink [--json] [--seats fable,astra,deepseek] [--rounds 1|2]
+#                   [--allow-same-vendor] [--single-seat-ok]
+#                   [--session-fable] [--fable-position-file FILE]
+#                   [--context-file FILE] <question...>
+#
+# Exit codes: 0 deliberated; 2 refused (fewer than two seats answered, or a
+# vendor clash); 64 a bad request.
+#
+# -P keeps the current directory off sys.path. `lib` is a namespace package, so
+# without it a caller standing in another checkout gets a silent mix: measured
+# from the shared tree, lib.roundtable loaded from there while this module loaded
+# from here. With -P every module comes from THIS checkout (PYTHONPATH below).
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="$here${PYTHONPATH:+:$PYTHONPATH}"
+exec "$here/bin/grip-py" -P -m lib.ultrathink_trio "$@"

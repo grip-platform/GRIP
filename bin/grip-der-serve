@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""grip-der-serve — launch the Decision Evidence Receipt endpoint (#527/#546).
+
+  grip-der-serve [--host 127.0.0.1] [--port 8646] [--token BEARER]
+
+Routes: POST /receipt · POST /verify · GET /health. See lib/der_endpoint.py.
+"""
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+from lib.der_endpoint import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main())

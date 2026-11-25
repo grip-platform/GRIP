@@ -1,0 +1,21 @@
+{
+  "_comment": "Copy to config/wa-identities.local.json (gitignored) and put the real values there. lib/wa_identities.py reads it. Every value below is an obvious fake.",
+  "operator": "27000000000@s.whatsapp.net",
+  "operator_lid": "000000000000000000@g.us",
+  "full_capability_names": ["Example Teammate"],
+  "contacts": {
+    "example-contact": "27000000000@s.whatsapp.net"
+  },
+  "groups": {
+    "example-group": "000000000000000000@g.us"
+  },
+  "relay": {
+    "full_capability": {
+      "27000000000@s.whatsapp.net": "Example Teammate",
+      "000000000000000000@g.us": "Example Teammate"
+    },
+    "reply": {
+      "Example Teammate": "27000000000@s.whatsapp.net"
+    }
+  }
+}

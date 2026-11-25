@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""grip-mob-start -- guarded wrapper over `mob start`.
+
+Refuses if mob is not on PATH, if the current branch is main/master, or if
+the working tree has uncommitted changes. Otherwise execs the real
+`mob start <args>`, so the timer and branch creation behave exactly as
+upstream mob.sh documents.
+
+Usage: bin/grip-mob-start [mob start args, e.g. a timer in minutes]
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+from mob_guards import preflight_start, run_guarded  # noqa: E402
+
+if __name__ == "__main__":
+    cwd = Path.cwd()
+    sys.exit(run_guarded("start", preflight_start(cwd), ["start", *sys.argv[1:]]))

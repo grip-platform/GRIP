@@ -1,0 +1,26 @@
+# GRIP Status Line v6
+# Comment out or remove segments to hide them. Reorder to change position.
+#
+# Row 1: GRIP + Git Intelligence
+#   GRIP · main ↑2 · +70 -140 COMMIT
+#
+# Row 2: Session Metrics
+#   $3.14 60m · ██████████ 34% 340K · Fable 1M · code W1↑
+#
+# Context bar: 10-segment bar with K-count for 1M awareness
+# Model: two-stage source — fresh active-llm marker wins, else CC stdin id
+# (Fable/Mythos/Opus/Sonnet/Haiku; unknown Claude ids say "Claude", non-Claude
+# ids render verbatim). Window is whatever the source reports — never assumed.
+
+segments:
+  - grip-indicator    # [G] + project name
+  - directory         # dir name
+  - git               # branch, ahead/behind, staged/modified/untracked, stash
+  - mode              # active mode(s) + skills
+  - broly             # bro:level(hint)
+  - context-bar       # [██████████░░░░░░░░░░] 34% 340K (10-segment, K-count)
+  - session-id        # sid:d7e5e8fd (first 8 chars)
+  - cost              # $0.42 (12m) session cost + duration
+  - model             # marker-first (HAL /llm pin), else CC stdin model + its ACTIVE window
+  - rsi               # rsi:N/N
+  - hints             # hint:skills (COMMIT, PUSH, REFACTOR, GROWING)

@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""aide-morning — AIDE's start-of-day digest, posted to #daily-chat.
+
+Summarises AIDE's overnight state: prediction track record (trust line),
+open predictions awaiting grading, and overdue ungraded predictions.
+Block Kit styled, plain language, tldr by construction.
+
+Usage:
+    aide-morning            # post to Slack (codetonight / #daily-chat)
+    aide-morning --dry-run  # print the blocks JSON without posting
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+# --- Environment -----------------------------------------------------------
+CLAUDE_DIR = os.environ.get("CLAUDE_DIR") or os.path.expanduser("~/.claude")
+if CLAUDE_DIR not in sys.path:
+    sys.path.insert(0, CLAUDE_DIR)  # make lib.* importable; never touch cwd entry
+
+WORKSPACE = "codetonight"
+CHANNEL_ID = "C0EXAMPLE01"          # #daily-chat
+
+# REVERSIBLE (dojo-v2, 2026-10-01): #daily-chat is now tip-of-the-day, so Aide
+# digests no longer post there. Set back to True to re-enable the morning post.
+# The block-building machinery below is untouched — only the post call is gated.
+SLACK_POST_ENABLED = False
+
+MAX_BULLETS = 5
+MAX_BULLET_CHARS = 70
+MAX_LINE_CHARS = 140
+
+
+# --- Helpers ---------------------------------------------------------------
+def clip(text: str, limit: int) -> str:
+    """Clip text to limit chars, appending an ellipsis when truncated."""
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _check_dt(pred: dict):
+    """Parse check_at_utc -> aware datetime; None when missing/unparseable."""
+    raw = pred.get("check_at_utc")
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def is_overdue(pred: dict, now: datetime) -> bool:
+    """True when the prediction is ungraded and its check time has passed."""
+    dt = _check_dt(pred)
+    return dt is not None and dt < now
+
+
+def _inline_summary(preds: list) -> dict:
+    """Inline accuracy summary (scoreboard module may not exist yet)."""
+    confirmed = sum(1 for p in preds if p.get("outcome") == "confirmed")
+    falsified = sum(1 for p in preds if p.get("outcome") == "falsified")
+    graded = confirmed + falsified
+    total = len(preds)
+    return {
+        "graded": graded,
+        "confirmed": confirmed,
+        "falsified": falsified,
+        "open": total - graded,
+        "total": total,
+        "accuracy": (confirmed / graded) if graded else 0.0,
+        "human_graded": 0,
+        "auto_graded": 0,
+    }
+
+
+def _inline_trust_line(s: dict) -> str:
+    if s.get("graded", 0) == 0:
+        return "AIDE has no graded predictions yet — tap a button to start teaching it."
+    acc = s.get("accuracy")
+    acc_txt = f"{acc * 100:.0f}%" if acc is not None else "n/a"
+    return (
+        f"*Track record:* {s['confirmed']} confirmed · {s['falsified']} falsified · "
+        f"{s['graded']} graded · {s['open']} open · {acc_txt} accuracy"
+    )
+
+
+def load_summary(preds: list) -> tuple:
+    """Return (summary_dict, trust_line). Prefer the scoreboard module when
+    importable; fall back to inline computation on ImportError."""
+    try:
+        from lib.aide.scoreboard import accuracy_summary, render_trust_line
+        summary = accuracy_summary()
+        return summary, render_trust_line(summary)
+    except (ImportError, AttributeError, TypeError, KeyError):
+        pass
+    summary = _inline_summary(preds)
+    return summary, _inline_trust_line(summary)
+
+
+def _bullet_section(header: str, preds: list) -> dict:
+    bullets = "\n".join("• " + clip(p.get("claim") or "", MAX_BULLET_CHARS)
+                        for p in preds[:MAX_BULLETS])
+    return {"type": "section",
+            "text": {"type": "mrkdwn", "text": f"{header}\n{bullets}"}}
+
+
+def build_blocks(summary: dict, trust_line: str,
+                 open_preds: list, overdue_preds: list,
+                 footer_text: str) -> list:
+    blocks = [
+        {"type": "header",
+         "text": {"type": "plain_text", "text": ":sunrise: AIDE morning report"}},
+        {"type": "section",
+         "text": {"type": "mrkdwn", "text": clip(trust_line or "", MAX_LINE_CHARS)}},
+    ]
+    if open_preds:
+        blocks.append(_bullet_section(":crystal_ball: *Still open — tap to grade*",
+                                      open_preds))
+    if overdue_preds:
+        blocks.append(_bullet_section(":rotating_light: *Overdue — your call*",
+                                      overdue_preds))
+    if not open_preds and not overdue_preds:
+        blocks.append({"type": "section",
+                       "text": {"type": "mrkdwn",
+                                "text": ":sparkles: All caught up — AIDE has no open predictions."}})
+    blocks.append({"type": "context",
+                   "elements": [{"type": "mrkdwn", "text": footer_text}]})
+    return blocks
+
+
+# --- Main ------------------------------------------------------------------
+def main(argv: list | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Post AIDE's morning report (prediction state) to Slack.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print the blocks JSON to stdout without posting")
+    args = parser.parse_args(argv)
+
+    try:
+        from lib.aide.adaptive_engine import PredictionRegistry
+        preds = PredictionRegistry().all(limit=0)
+    except Exception as exc:  # noqa: BLE001 — a broken registry must not crash silently
+        print(f"aide-morning: failed to load predictions: {exc}", file=sys.stderr)
+        return 2
+
+    now = datetime.now(timezone.utc)
+    open_preds = [p for p in preds if p.get("outcome") is None]
+    overdue = [p for p in open_preds if is_overdue(p, now)]
+    overdue.sort(key=lambda p: _check_dt(p))  # most overdue first
+
+    summary, trust_line = load_summary(preds)
+
+    graded = int(summary.get("graded", 0))
+    open_n = int(summary.get("open", len(open_preds)))
+    footer_text = (f":robot_face: AIDE · {graded} graded, {open_n} open · "
+                   f"{now.strftime('%Y-%m-%d %H:%M')} UTC")
+
+    blocks = build_blocks(summary, trust_line, open_preds, overdue, footer_text)
+    fallback_text = f"AIDE morning report — {graded} graded, {open_n} open."
+
+    if args.dry_run:
+        print(json.dumps(blocks, indent=2, ensure_ascii=False))
+        return 0
+
+    if not SLACK_POST_ENABLED:
+        print(f"aide-morning: #daily-chat posting disabled (SLACK_POST_ENABLED=False); "
+              f"not posting. ts=none")
+        return 0
+
+    from lib.slack_transport import post
+    result = post(workspace=WORKSPACE, channel_id=CHANNEL_ID,
+                  text=fallback_text, blocks=blocks)
+    if not result.get("ok"):
+        print(f"aide-morning: slack post failed: {result.get('error')}",
+              file=sys.stderr)
+        return 1
+    print(f"posted: ts={result.get('ts')} channel={result.get('channel')}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""grip-remind — durable one-shot reminders that survive session exit.
+
+    grip-remind "message" "2026-07-15 23:37"          # local time
+    grip-remind "message" "23:37"                     # today (or tomorrow if past)
+    grip-remind --list
+    grip-remind --cancel <id>
+
+Why an OS scheduler and not the in-session one: Claude Code's cron jobs are
+session-only (the `durable` flag is silently ignored on CC 2.1.202 —
+verified 2026-07-15: no scheduled_tasks.json is ever written), so a
+reminder must live OUTSIDE the session.
+
+Two backends, chosen by platform, with the SAME lifecycle (arm / --list /
+--cancel) and the same on-disk payload directory:
+
+  macOS   — launchd user agent (`launchctl bootstrap gui/<uid>`).
+            Honest boundary: asleep at fire time -> fires on wake; powered
+            OFF -> a calendar-interval job does NOT fire retroactively, so
+            that occurrence is simply lost. Delivery at fire time: WhatsApp
+            to the operator (GRIP-prefixed) + a local macOS notification +
+            an audit row in logs/reminders.jsonl.
+
+  Windows — Task Scheduler one-shot task (`schtasks /Create /XML`), the
+            automated form of the `GRIP-Remind-*` task proved by hand.
+            The task sets StartWhenAvailable, so: asleep at fire time ->
+            fires on wake; powered OFF -> fires at next startup (this is
+            the one place Windows is STRONGER than launchd, which drops the
+            occurrence). It runs under an InteractiveToken, so it needs the
+            operator to be logged on to draw on screen. Delivery at fire
+            time: a desktop dialog + an audit row in logs/reminders.jsonl
+            (WhatsApp is attempted too and its real result recorded, but it
+            is not promised — that depends on transport config being set up
+            on the machine, which on Windows it may well not be).
+
+There is no third backend. On any other platform grip-remind REFUSES to
+arm and says so loudly: a reminder that silently does nothing is worse
+than an error, because the whole value of this tool is the promise that
+the reminder will actually arrive.
+
+The job self-removes after firing (see lib/remind_fire.py).
+"""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import plistlib
+import secrets
+import subprocess
+import sys
+from pathlib import Path
+from xml.sax.saxutils import escape as _xml_escape
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from wa_identities import MISSING_HINT, operator_jid  # noqa: E402
+
+CLAUDE_DIR = Path.home() / ".claude"
+AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
+STATE_DIR = CLAUDE_DIR / "state" / "reminders"
+# Windows has no LaunchAgents equivalent; the task XML handed to schtasks
+# lives beside the payloads so --cancel can find and remove it.
+TASKS_DIR = CLAUDE_DIR / "state" / "reminders" / "tasks"
+DEFAULT_RECIPIENT = operator_jid()  # the operator, from the private file; None when unset
+
+
+def _is_windows() -> bool:
+    """The single Windows signal, deliberately read from sys.platform.
+
+    NOT `os.name == "nt"`, even though that is the more usual idiom:
+    pathlib picks WindowsPath vs PosixPath off `os.name`, so a test that
+    fakes Windows by setting it turns every Path in the process into a
+    WindowsPath and quietly breaks unrelated file operations (observed
+    while writing tests/test_grip_remind_windows.py — `.exists()` started
+    returning False for files that were plainly there). sys.platform is
+    inert, so faking it is safe and the Windows path stays testable.
+    """
+    return sys.platform in ("win32", "cygwin")
+
+
+def _venv_python() -> str:
+    """Path to the venv interpreter for THIS platform.
+
+    A venv lays its interpreter out differently per OS: `bin/python` on
+    POSIX, `Scripts/python.exe` on Windows. Hardcoding the POSIX form
+    produces a task whose Command does not exist, which Task Scheduler
+    reports only as a non-zero last-run result — a silent-by-default
+    failure of exactly the durability promise this tool sells.
+    """
+    if _is_windows():
+        return str(CLAUDE_DIR / "venv" / "Scripts" / "python.exe")
+    return str(CLAUDE_DIR / "venv" / "bin" / "python")
+
+
+PYTHON = _venv_python()
+
+
+def _parse_when(raw: str) -> dt.datetime:
+    now = dt.datetime.now()
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"):
+        try:
+            return dt.datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    try:
+        clock = dt.datetime.strptime(raw, "%H:%M").time()
+    except ValueError:
+        raise SystemExit(
+            f"cannot parse time {raw!r} — use 'HH:MM' or 'YYYY-MM-DD HH:MM'")
+    fire = dt.datetime.combine(now.date(), clock)
+    if fire <= now:
+        fire += dt.timedelta(days=1)  # past today -> tomorrow, honestly
+    return fire
+
+
+def _local_iso(fire: dt.datetime) -> str:
+    """fire_at stamp with the LOCAL offset for THAT datetime — not today's —
+    so a reminder scheduled across a DST boundary stamps the offset the fire
+    moment will actually have (verified: -05:00 Jan vs -04:00 Jul under
+    TZ=America/New_York). Naive astimezone() raises on platforms where the
+    local zone cannot be resolved — fall back to the offset-less wall-clock
+    string rather than crash or invent a wrong offset (launchd fires on the
+    local wall clock either way; the offset is informational)."""
+    try:
+        return fire.astimezone().isoformat()
+    except (ValueError, OSError):
+        return fire.isoformat()
+
+
+def _local_tz_name() -> str:
+    """Best-effort local tz label for the confirmation line — same naive
+    astimezone() hazard as _local_iso, same honest fallback."""
+    try:
+        return dt.datetime.now().astimezone().tzname() or "local"
+    except (ValueError, OSError):
+        return "local"
+
+
+def backend_name() -> str:
+    """Which durable-scheduler backend this platform has, '' if none.
+
+    Detection is on the OS family, not on whether the binary happens to be
+    on PATH: a macOS box without `launchctl` is a broken macOS box, and
+    reporting that as "unsupported platform" would send the operator
+    hunting for the wrong thing. The registration call reports its own
+    failure with the scheduler's own words.
+    """
+    if sys.platform == "darwin":
+        return "launchd"
+    if _is_windows():
+        return "schtasks"
+    return ""
+
+
+def _refuse_unsupported() -> None:
+    """Fail loudly on a platform with no durable backend.
+
+    Deliberately NOT a warn-and-continue. The single thing grip-remind
+    promises is that the reminder outlives the session, so arming a
+    reminder that can never fire would be a lie told quietly — the worst
+    possible failure for this tool.
+    """
+    raise SystemExit(
+        f"grip-remind: no durable scheduler backend for this platform "
+        f"(sys.platform={sys.platform!r}).\n"
+        f"Supported: macOS (launchd) and Windows (Task Scheduler).\n"
+        f"Refusing to arm — a reminder that silently never fires is worse "
+        f"than this error.")
+
+
+# --- macOS backend: launchd -------------------------------------------------
+
+def _arm_launchd(rid: str, fire: dt.datetime, payload_path: Path) -> dict:
+    """Write + bootstrap a launchd user agent. Returns extra payload fields."""
+    label = f"com.grip.remind.{rid}"
+    plist_path = AGENTS_DIR / f"{label}.plist"
+
+    AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+    with plist_path.open("wb") as fh:
+        plistlib.dump({
+            "Label": label,
+            "ProgramArguments": [PYTHON, str(CLAUDE_DIR / "lib" / "remind_fire.py"),
+                                 str(payload_path)],
+            "StartCalendarInterval": {
+                "Year": fire.year, "Month": fire.month, "Day": fire.day,
+                "Hour": fire.hour, "Minute": fire.minute,
+            },
+            "StandardErrorPath": str(CLAUDE_DIR / "logs" / "reminders.stderr.log"),
+        }, fh)
+
+    boot = subprocess.run(
+        ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)],
+        capture_output=True, text=True)
+    if boot.returncode != 0:
+        plist_path.unlink(missing_ok=True)
+        raise SystemExit(f"launchctl bootstrap failed: {boot.stderr.strip()}")
+    return {"label": label, "plist": str(plist_path)}
+
+
+def _cancel_launchd(data: dict) -> None:
+    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{data['label']}"],
+                   capture_output=True, check=False)
+    Path(data["plist"]).unlink(missing_ok=True)
+
+
+# --- Windows backend: Task Scheduler ----------------------------------------
+
+def task_xml(task_name: str, fire: dt.datetime, payload_path: Path) -> str:
+    """Task Scheduler definition for a one-shot GRIP reminder.
+
+    XML rather than the shorter `/SC ONCE /SD <date> /ST <time>` flags for
+    two reasons. First, /SD parses the date in the machine's LOCALE short
+    format, so the same command means different days on en-US and en-GB —
+    StartBoundary is ISO-8601 and cannot be misread. Second, the flags
+    cannot express StartWhenAvailable, which is what makes a reminder
+    missed during sleep or shutdown still fire on wake or at next startup
+    instead of being dropped.
+
+    InteractiveToken (not a service account) is required for the fire-time
+    dialog to be drawn on the operator's desktop at all.
+    """
+    command = _xml_escape(PYTHON)
+    args = _xml_escape(
+        f'"{CLAUDE_DIR / "lib" / "remind_fire.py"}" "{payload_path}"')
+    return (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task version="1.2" '
+        'xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        '  <RegistrationInfo>\n'
+        f'    <Description>GRIP durable reminder {_xml_escape(task_name)}'
+        '</Description>\n'
+        '  </RegistrationInfo>\n'
+        '  <Triggers>\n'
+        '    <TimeTrigger>\n'
+        f'      <StartBoundary>{fire:%Y-%m-%dT%H:%M:%S}</StartBoundary>\n'
+        '      <Enabled>true</Enabled>\n'
+        '    </TimeTrigger>\n'
+        '  </Triggers>\n'
+        '  <Principals>\n'
+        '    <Principal id="Author">\n'
+        '      <LogonType>InteractiveToken</LogonType>\n'
+        '      <RunLevel>LeastPrivilege</RunLevel>\n'
+        '    </Principal>\n'
+        '  </Principals>\n'
+        '  <Settings>\n'
+        '    <StartWhenAvailable>true</StartWhenAvailable>\n'
+        '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n'
+        '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n'
+        '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n'
+        '    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>\n'
+        '    <Enabled>true</Enabled>\n'
+        '  </Settings>\n'
+        '  <Actions Context="Author">\n'
+        '    <Exec>\n'
+        f'      <Command>{command}</Command>\n'
+        f'      <Arguments>{args}</Arguments>\n'
+        '    </Exec>\n'
+        '  </Actions>\n'
+        '</Task>\n')
+
+
+def _arm_schtasks(rid: str, fire: dt.datetime, payload_path: Path) -> dict:
+    """Register a one-shot Task Scheduler job. Returns extra payload fields."""
+    task_name = f"GRIP-Remind-{rid}"
+    xml_path = TASKS_DIR / f"{task_name}.xml"
+
+    TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    # UTF-16 with a BOM is what schtasks /XML documents and reliably reads;
+    # a UTF-8 file is rejected on older builds with an unhelpful parse error.
+    xml_path.write_text(task_xml(task_name, fire, payload_path),
+                        encoding="utf-16")
+
+    created = subprocess.run(
+        ["schtasks", "/Create", "/TN", task_name, "/XML", str(xml_path), "/F"],
+        capture_output=True, text=True)
+    if created.returncode != 0:
+        xml_path.unlink(missing_ok=True)
+        detail = (created.stderr or created.stdout or "").strip()
+        raise SystemExit(f"schtasks /Create failed: {detail}")
+    return {"label": task_name, "task_xml": str(xml_path)}
+
+
+def _cancel_schtasks(data: dict) -> None:
+    subprocess.run(["schtasks", "/Delete", "/TN", data["label"], "/F"],
+                   capture_output=True, check=False)
+    xml_path = data.get("task_xml")
+    if xml_path:
+        Path(xml_path).unlink(missing_ok=True)
+
+
+# --- backend table ----------------------------------------------------------
+
+# arm, cancel, and the honest one-line delivery promise for each platform.
+_BACKENDS = {
+    "launchd": (
+        _arm_launchd, _cancel_launchd,
+        "launchd fires on this machine's local clock; a time that a DST jump "
+        "skips fires at the next valid minute) — survives session exit + "
+        "reboot; sleeps fire on wake; delivery: WhatsApp + local notification",
+    ),
+    "schtasks": (
+        _arm_schtasks, _cancel_schtasks,
+        "Task Scheduler fires on this machine's local clock) — survives "
+        "session exit + reboot; asleep fires on wake, powered off fires at "
+        "next startup; needs you logged on to draw the dialog; delivery: "
+        "desktop dialog + audit row in logs/reminders.jsonl",
+    ),
+}
+
+
+def _schedule(message: str, when_raw: str, recipient: str) -> None:
+    fire = _parse_when(when_raw)
+    if fire <= dt.datetime.now():
+        raise SystemExit(f"{fire} is in the past")
+    backend = backend_name()
+    if not backend:
+        _refuse_unsupported()
+    arm, _cancel_fn, promise = _BACKENDS[backend]
+
+    rid = secrets.token_hex(4)
+    payload_path = STATE_DIR / f"{rid}.json"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    # fire_at carries the local offset explicitly (both schedulers interpret
+    # their trigger in local time; the audit log stamps UTC). The payload is
+    # written BEFORE the job because the job's command line points at it.
+    payload = {
+        "id": rid, "message": message, "recipient": recipient,
+        "fire_at": _local_iso(fire), "backend": backend,
+    }
+    payload_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    try:
+        payload.update(arm(rid, fire, payload_path))
+    except BaseException:
+        # Any arm failure (including the SystemExit each backend raises with
+        # the scheduler's own error text) must not leave an orphan payload
+        # that `--list` would then report as a pending reminder.
+        payload_path.unlink(missing_ok=True)
+        raise
+    payload_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    print(f"reminder {rid} armed for {fire:%Y-%m-%d %H:%M} {_local_tz_name()} "
+          f"({promise}")
+
+
+def _list() -> None:
+    rows = sorted(STATE_DIR.glob("*.json")) if STATE_DIR.exists() else []
+    if not rows:
+        print("no pending reminders")
+        return
+    for row in rows:
+        try:
+            data = json.loads(row.read_text(encoding="utf-8"))
+            print(f"{data['id']}  {data['fire_at']}  {data['message'][:60]}")
+        except (json.JSONDecodeError, KeyError, OSError) as exc:
+            # fail-soft per file: one corrupt payload must never hide the
+            # rest, and the operator needs to SEE it to clean it up
+            print(f"warning: corrupt payload {row} ({exc}) — skipping; "
+                  f"remove it with: trash {row}")
+
+
+def _cancel(rid: str) -> None:
+    # Deregistering FIRST is deliberate here (the inverse of
+    # remind_fire._cleanup): _cancel is not the job's own process, so
+    # bootout cannot SIGTERM us. Unloading before unlinking means a fire
+    # racing this cancel loses the job registration first; leftover files
+    # are harmless visible residue, a loaded job pointing at deleted files
+    # is not.
+    payload_path = STATE_DIR / f"{rid}.json"
+    if not payload_path.exists():
+        raise SystemExit(f"no pending reminder {rid!r}")
+    data = json.loads(payload_path.read_text(encoding="utf-8"))
+    # Cancel with the backend that ARMED it, read from the payload — not
+    # with whatever this machine runs today. Payloads written before the
+    # Windows backend existed carry no "backend" key and are launchd by
+    # construction, so that is the default.
+    backend = data.get("backend", "launchd")
+    if backend not in _BACKENDS:
+        raise SystemExit(
+            f"reminder {rid} was armed by unknown backend {backend!r}; "
+            f"remove {payload_path} by hand after deleting its OS job")
+    _BACKENDS[backend][1](data)
+    payload_path.unlink(missing_ok=True)
+    print(f"cancelled {rid}")
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    if argv[0] == "--list":
+        _list()
+        return 0
+    if argv[0] == "--cancel":
+        _cancel(argv[1])
+        return 0
+    if len(argv) < 2:
+        raise SystemExit('usage: grip-remind "message" "HH:MM | YYYY-MM-DD HH:MM"')
+    recipient = argv[2] if len(argv) > 2 else DEFAULT_RECIPIENT
+    if not recipient:
+        raise SystemExit(f"grip-remind: no recipient given, and {MISSING_HINT}")
+    _schedule(argv[0], argv[1], recipient)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# grip-answer-watch — deliver V>>'s shim replies to the sessions waiting on them.
+#
+# Polls the per-JID mirror the grip-channel daemon already writes, matches a
+# reply's FIRST TOKEN against open question refs, and routes it to the asking
+# session's inbox. A second WhatsApp socket would contend with the daemon's own
+# Baileys session, so this reads the file the daemon writes instead.
+set -euo pipefail
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+INTERVAL="${GRIP_ANSWER_WATCH_INTERVAL:-20}"
+exec "$CLAUDE_DIR/bin/grip-py" - "$INTERVAL" <<'PY'
+import sys, time, pathlib
+sys.path.insert(0, str(pathlib.Path.home() / ".grip"))
+from lib.answer_watcher import scan_for_answers, sweep_overdue, operator_is_afk
+from lib.pending_question import PendingStore, parked_board
+from lib.whatsapp_transport import post
+from lib.answer_watcher import OPERATOR_JID
+
+interval = int(sys.argv[1]) if len(sys.argv) > 1 else 20
+store = PendingStore(pathlib.Path.home() / ".grip" / "state" / "pending-questions.json")
+print(f"[answer-watch] polling every {interval}s", flush=True)
+while True:
+    try:
+        # Park anything past the ceiling, whoever asked it. Parking used to
+        # require the ASKING session to take another turn, so a session that
+        # went idle never parked its question and nothing ever fired.
+        for ref, notified in sweep_overdue(store):
+            state = "notified" if notified else ("held: operator AFK" if operator_is_afk() else "silent: a notice is already outstanding")
+            print(f"[answer-watch] parked {ref} ({state})", flush=True)
+        for ref, delivered, reason in scan_for_answers(store):
+            print(f"[answer-watch] {ref}: {'DELIVERED' if delivered else 'not delivered'} — {reason}", flush=True)
+            if delivered and OPERATOR_JID:  # no operator configured: no acknowledgement to send
+                try:
+                    post(OPERATOR_JID, f"Got it — {ref} answered and routed to the session waiting on it.")
+                except Exception as exc:
+                    print(f"[answer-watch] ack failed: {exc}", flush=True)
+    except Exception as exc:
+        print(f"[answer-watch] scan error (continuing): {exc}", flush=True)
+    time.sleep(interval)
+PY

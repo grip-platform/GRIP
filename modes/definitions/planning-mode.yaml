@@ -1,0 +1,74 @@
+name: planning
+description: Daily team planning and task prioritisation. Use when starting the day, assigning tasks to team members, or coordinating
+  parallel GRIP sessions.
+version: 1.0.0
+effort: high
+triggers:
+- /mode planning
+- /plan
+- /daily
+- daily planning
+- morning standup
+- assign tasks
+- prioritise tasks
+skills:
+  always:
+  - daily-planning
+  - leading-organisation
+  optional:
+  - design-principles
+token_budget: ~3500
+foundation: true
+stacks_with:
+- ut++
+- asking-users
+- creating-wizards
+- hitl
+- context-gate
+prompt_injection: "[MODE: PLANNING]\n\nDaily planning mode active. Workflow: Gather → Prioritise → Decompose → Assign → Document\n\
+  \n## Team Configuration\n\nLoad team from `~/.claude/facts/team.md` if exists.\nFallback to solo mode if no team configured.\n\
+  \n## Prioritisation Hierarchy\n\n1. **Urgent** - time-sensitive, must complete today\n2. **Revenue** - directly impacts\
+  \ income\n3. **Deliverables** - committed outputs to stakeholders\n4. **Strategic** - planning, architecture, long-term\n\
+  \n## Assignment Logic\n\n| Complexity | Assignee |\n|------------|----------|\n| High (technical decisions) | Team lead\
+  \ |\n| Medium (research, implementation) | Team members |\n| Easy (admin, routine) | Any available |\n\n## Output Artifacts\n\
+  \nGenerate to specified output directory:\n- `{date}-daily-plan.md` - Master overview\n- `ticket-{n}-{name}.md` - Detailed\
+  \ ticket plans (for strategic items)\n- `assignment-{name}.md` - Individual team member assignments\n\n## Workflow Steps\n\
+  \n1. **Gather**: Prompt for task list (unordered acceptable)\n2. **Categorise**: Sort into Urgent/Revenue/Deliverables/Strategic\n\
+  3. **Decompose**: Break strategic tickets into sub-tickets with:\n   - Objective\n   - Scope/research areas\n   - Questions\
+  \ to answer\n   - Deliverable format\n   - Dependencies\n4. **Assign**: Match tasks to team members by complexity and skills\n\
+  5. **Document**: Generate all artifacts\n6. **Distribute**: Save to output directory\n\n## Sub-Ticket Template\n\nFor each\
+  \ strategic ticket sub-task:\n```markdown\n### {N}.{M} {Title}\n\n**Owner**: {signature}\n**Complexity**: Easy/Medium/High\n\
+  **Output**: {deliverable description}\n\n#### Objective\n{what to achieve}\n\n#### Scope\n{areas to cover}\n\n#### Questions\
+  \ to Answer\n{guiding questions}\n\n#### Deliverable\n{output format and location}\n```\n\n## Individual Assignment Template\n\
+  \nPer team member:\n- Urgent tasks first\n- Then by priority order\n- Include all context needed for autonomous execution\n\
+  - Reference detailed ticket plans where applicable\n\n## Meta-Learning\n\nTrack patterns for future planning mode improvements:\n\
+  - What worked well\n- What needed adjustment\n- New workflow types discovered\n\n## Broly Auto-Activation\n\nBroly is AUTO-ACTIVE\
+  \ in this mode at PIPELINE level.\nNo /broly command needed -- UNLESS the operator has set the trigger to manual (check with `mode-loader.sh broly status`), in which case fan out ONLY on an explicit /broly. Assess task complexity and invoke automatically.\n\nDefault:\
+  \ PIPELINE (Agent Team pipeline, up to 10 agents)\nTeam pattern: pipeline | Reasoning: self-ask (selfask)\n\n### Escalation\
+  \ to MESH\n- Planning spans multiple teams or departments\n- Resource allocation across competing priorities\n- Strategic\
+  \ planning with organizational impact\n\n### De-escalation to THREAD\n- Single task prioritisation\n- Quick daily plan for\
+  \ solo work\n- Simple schedule check\n\n### Budget\nPIPELINE uses ~5x tokens. De-escalate to THREAD for simple tasks.\n\
+  AskUserQuestion if scope is unclear.\n"
+wave:
+  category: domain_context
+broly:
+  enabled: true
+  default_level: pipeline
+  team_pattern: pipeline
+  reasoning_hint: selfask
+  escalation:
+    to: mesh
+    signals:
+    - planning spans multiple teams or departments
+    - resource allocation across competing priorities
+    - strategic planning with organizational impact
+  context:
+    recommended: 1000000
+    auto_extend: true
+context:
+- Starting the work day
+- Team coordination
+- Task prioritisation
+- Sprint planning preparation
+- Parallel session setup
+welcome_message: Planning mode active. Priority hierarchy and team assignment frameworks loaded.

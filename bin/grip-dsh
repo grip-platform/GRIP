@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# grip-dsh — launch the DeepSeek Harness with GRIP's HAL gateway route live.
+#
+# WHY THIS EXISTS. DSH resolves the `apiKeyEnv: HAL_GATEWAY_KEY` reference in
+# $DSH_HOME/settings.yaml against its credential layers, and the inherited
+# process environment is the layer that "Wins: always"
+# (packages/credentials/credentials-local/README.md). That is the only layer
+# that does not require a secret literal on disk, so the key is read from the
+# macOS keychain here, at RUN time, and handed to dsh in-process.
+#
+# `bin/grip` does export HAL_GATEWAY_KEY, but only for a wireable harness, and
+# `dsh` is not one (`_WIREABLE = ("codex", "aider", "opencode", "agy")` in
+# lib/grip_harness_picker.py:296). A dsh launched through gg++ therefore has the
+# variable unset and every routed request fails to authenticate. This shim
+# closes that gap without touching the shared launch path.
+#
+# The value is grip-hal-gateway-token — GRIP's canonical client-Bearer
+# PLACEHOLDER (lib/grip_harness.py:64), never a provider key and never the
+# Anthropic key. HAL discards the client's Authorization header and substitutes
+# its own per-provider keychain key (lib/hal/gateway_egress.py), so this token
+# only has to exist. Keeping it a non-Anthropic placeholder is deliberate
+# safety: an id HAL's router does not recognise falls through to the verbatim
+# Anthropic relay, and this token makes that path fail loudly with 401 instead
+# of quietly spending the weekly limit. Verified 2026-08-19: an unknown model id
+# returned 401 "invalid x-api-key" using exactly this token.
+#
+# Usage: grip-dsh [<dsh args>...]      default: --profile web
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+KEYCHAIN_SERVICE="grip-hal-gateway-token"
+GATEWAY_BASE="http://127.0.0.1:4010"
+GATEWAY_URL="$GATEWAY_BASE/v1"
+
+# 1. Keep settings.yaml current. Idempotent: rewrites nothing when unchanged,
+#    which is what preserves any comments or routes the web Models page wrote.
+# GRIP's dependencies live in the venv, and system python3 has none of them.
+# The second rung matters when CLAUDE_DIR is a git worktree: worktrees carry no
+# venv of their own, so the shared tree's is the one to use. resolve_venv_python
+# knows both layouts (Windows Scripts/python.exe, POSIX bin/python3) but falls
+# back to the SYSTEM python, so a candidate counts only inside its own venv.
+source "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib/venv-utils.sh"
+for venv in "$CLAUDE_DIR/venv" "$HOME/.grip/venv" "$HOME/.claude/venv"; do
+    candidate="$(resolve_venv_python "$venv" || true)"
+    [[ "$candidate" == "$venv/"* ]] && PY="$candidate" && break
+done
+if [[ -z "${PY:-}" ]]; then
+    >&2 echo "[grip-dsh] no GRIP venv found; system python3 lacks the required deps."
+    >&2 echo "[grip-dsh] looked in: \$CLAUDE_DIR/venv, ~/.grip/venv, ~/.claude/venv"
+    exit 1
+fi
+if [[ -f "$CLAUDE_DIR/lib/dsh_hal_route.py" ]]; then
+    "$PY" "$CLAUDE_DIR/lib/dsh_hal_route.py" || {
+        >&2 echo "[grip-dsh] could not update settings.yaml — refusing to launch with an unknown route"
+        exit 1
+    }
+fi
+
+# 2. Resolve the credential at run time. A missing entry is fatal, not a
+#    warning: launching without it produces an authentication failure at the
+#    first request, far from its cause.
+#
+#    An already-exported HAL_GATEWAY_KEY wins, and that is correctness rather
+#    than convenience. HAL discards the client's Authorization header and
+#    substitutes its own per-provider keychain key, so ANY non-empty value
+#    clears the gateway's check — which is exactly why
+#    docs/grip-inside-dsh.md:35 documents
+#    `HAL_GATEWAY_KEY=<any-non-empty> dsh --profile grip "<task>"` as a working
+#    direct invocation. Before this, that documented value was silently
+#    discarded the moment the same session went through grip-dsh, and a missing
+#    keychain item killed a launch that would otherwise have worked. Honouring
+#    the environment makes the shim agree with the documented contract instead
+#    of quietly overriding it. (AGORA #4936, concern C3.)
+if [[ -n "${HAL_GATEWAY_KEY:-}" ]]; then
+    :   # caller supplied it; nothing to resolve
+elif ! HAL_GATEWAY_KEY="$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null)" \
+   || [[ -z "$HAL_GATEWAY_KEY" ]]; then
+    # Two routes out, and the env one is named FIRST because it is the only one
+    # that exists off macOS. `security` is a macOS binary, so on Linux, WSL or a
+    # CI runner the keychain branch cannot succeed at all — advising
+    # `add-generic-password` there sends the reader after a command they do not
+    # have. HAL substitutes its own upstream key regardless, so any non-empty
+    # value works and the export is a complete answer, not a workaround.
+    # (AGORA #4936 round 2, concern 1.)
+    >&2 echo "[grip-dsh] no HAL gateway credential. Either:"
+    >&2 echo ""
+    >&2 echo "  1. export it (works on every platform — HAL substitutes the real"
+    >&2 echo "     provider key itself, so any non-empty value clears the gateway):"
+    >&2 echo "       export HAL_GATEWAY_KEY=grip-dsh-placeholder"
+    >&2 echo ""
+    >&2 echo "  2. or, on macOS, store it in the keychain once:"
+    >&2 echo "       security add-generic-password -a \"\$USER\" -s $KEYCHAIN_SERVICE -w <placeholder>"
+    >&2 echo ""
+    >&2 echo "[grip-dsh] use a PLACEHOLDER either way, never an Anthropic key — an id"
+    >&2 echo "[grip-dsh] HAL's router does not recognise falls through to the verbatim"
+    >&2 echo "[grip-dsh] Anthropic relay, and a placeholder makes that fail loudly (401)"
+    >&2 echo "[grip-dsh] instead of quietly spending the weekly limit."
+    exit 1
+fi
+export HAL_GATEWAY_KEY
+
+# 3. The gateway being down is a runtime fact, not a config error — say so and
+#    launch anyway, since it can be started while dsh is running.
+#
+#    Probe /health, NOT a real completion. The previous probe POSTed to
+#    /v1/chat/completions through groq/openai/gpt-oss-120b, so it round-tripped
+#    to an UPSTREAM provider on every launch: a provider rate-limit, outage or
+#    slow cold start reported "gateway did not answer" while the gateway was
+#    perfectly healthy. Observed 2026-08-25 — this line claimed the gateway was
+#    down while /health returned ok and the launchd process had been up for
+#    hours. lib/grip_infinite.py retired exactly this probe shape for the same
+#    reason ("its second leg touched the upstream relay per launch"); grip-dsh
+#    was never updated to match.
+#
+#    /health is a local route: no auth, no upstream, and it is read WITHOUT a
+#    pipe. `curl ... | grep -q` lets grep exit on its first match and SIGPIPE
+#    curl mid-body; under `set -o pipefail` that makes the pipeline non-zero and
+#    reports a healthy gateway as absent. Measured 2026-08-25 at 0/50 false
+#    negatives against the live gateway — the body is small enough that curl
+#    finishes first — but that is a property of the body size, not of the code,
+#    and the pipe-free form costs nothing.
+#
+#    What this DOES prove: something on 4010 answers /health identifying as the
+#    gateway. What it does NOT prove — stated plainly, because the comment here
+#    previously over-claimed it — is identity. `service` is a self-declared
+#    string, so a process squatting the port and returning the same body passes.
+#    Nor does it prove the /v1 completion route works — a gateway that answers
+#    /health while /v1 is broken prints nothing here. Probing /v1 is what made
+#    the old check flaky, so liveness is the trade, and the note is worded as
+#    "could not confirm" rather than asserting the route is down.
+#
+#    The VALUE must BE `hal-gateway`, optionally with a `/`-delimited suffix:
+#    `hal-gateway` and `hal-gateway/2` pass; `not-hal-gateway`, `fake-hal-gateway`,
+#    `hal-gateway2` and `hal-gateway-evil` do not. Two earlier attempts were
+#    looser than their own comments claimed — `[^"]*hal-gateway` accepted any
+#    prefix, and leaving the pattern open at the end accepted any non-delimited
+#    suffix. The trailing ["/] closes it at the value boundary.
+#
+#    That is the only anchoring here, and an earlier version of this comment
+#    over-claimed by calling the match "ANCHORED". Bash `=~` is unanchored
+#    against the BODY, so the key-value pair satisfies it wherever it appears —
+#    `{"status":"ok","checks":{"service":"hal-gateway"}}` reads as PRESENT.
+#    That is consistent with, not weaker than, the concession above: the field
+#    is self-declared and this is a liveness check, not an identity proof. It
+#    is written down because a comment claiming more protection than the code
+#    delivers is how the next reader gets misled.
+_gw_health="$(curl -sf --max-time 2 "$GATEWAY_BASE/health" 2>/dev/null || true)"
+if [[ ! "$_gw_health" =~ \"service\"[[:space:]]*:[[:space:]]*\"hal-gateway[\"/] ]]
+then
+    >&2 echo "[grip-dsh] note: could not confirm a HAL gateway on 127.0.0.1:4010 — the hal"
+    >&2 echo "[grip-dsh] route may fail. Start it, then retry in-session."
+fi
+
+# 4. Default to the interactive profile when the caller passed nothing.
+#    NOT `"${@:---profile web}"`: with an empty $@ that expansion yields a SINGLE
+#    word `--profile web`, so dsh receives one unrecognised argument and exits 1
+#    with "error: --profile <name> is required" — the launch fails at the very
+#    step the default was meant to satisfy. Verified 2026-08-19 under bash 3.2
+#    and 5.x: argc=1, [1]=<--profile web>. `set --` sets two real words.
+if [[ $# -eq 0 ]]; then
+    set -- --profile web
+fi
+
+exec dsh "$@"

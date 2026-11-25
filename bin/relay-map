@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# relay-map — Relay Node Constellation card
+#
+# Renders all relay nodes as a live ANSI constellation:
+#   health glyph · platform glyph · channels · latency · failover ladder
+#
+# Usage:
+#   relay-map          — live health probe + render
+#   relay-map --plain  — strip ANSI (pipe-friendly)
+#
+# Exit codes: 0 always (fail-soft; a down node is shown as ○, never a crash)
+
+set -euo pipefail
+
+GRIP_DIR="${CLAUDE_DIR:-$HOME/.grip}"
+# Resolve real python: prefer repo venv, fall back to system python3
+source "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib/venv-utils.sh"
+if ! VENV_PY="$(resolve_venv_python "$GRIP_DIR/venv")"; then
+  echo "[relay-map] no Python interpreter found (searched $GRIP_DIR/venv, then PATH)" >&2
+  exit 1
+fi
+
+PLAIN=0
+for arg in "$@"; do
+  case "$arg" in
+    --plain) PLAIN=1 ;;
+  esac
+done
+
+export RELAY_MAP_PLAIN="$PLAIN"
+export RELAY_MAP_GRIP_DIR="$GRIP_DIR"
+
+"$VENV_PY" - <<'PY'
+import os
+import sys
+from pathlib import Path
+
+grip_dir = Path(os.environ.get("RELAY_MAP_GRIP_DIR", Path.home() / ".grip"))
+plain    = os.environ.get("RELAY_MAP_PLAIN") == "1"
+
+# Make repo lib/ importable regardless of cwd
+lib_dir = grip_dir / "lib"
+if str(lib_dir) not in sys.path:
+    sys.path.insert(0, str(lib_dir.parent))  # repo root -> lib/ importable as lib.*
+
+from lib.relay_host import RelayHost
+from lib.relay_constellation import render_constellation
+
+host           = RelayHost()
+nodes_health   = host.health_all()
+registry_nodes = host.nodes()
+
+card = render_constellation(nodes_health, registry_nodes)
+
+if plain:
+    import re
+    card = re.sub(r"\033\[[0-9;]*m", "", card)
+
+print(card)
+PY

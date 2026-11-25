@@ -1,0 +1,142 @@
+name: business
+description: Founder operations, team leadership, and business decisions
+version: 1.0.0
+effort: high
+triggers:
+- /mode business
+- founder decision
+- team leadership
+- /founder
+- hiring
+- business model
+skills:
+  always:
+  - leading-organisation
+  - business-mode
+  optional:
+  - strat-ops
+  - legal-ops
+token_budget: ~2500
+foundation: true
+stacks_with:
+- ut++
+- asking-users
+- creating-wizards
+- hitl
+- hitl-decision-matrix
+- context-gate
+prompt_injection: '[MODE: BUSINESS]
+
+
+  Founder operating system active.
+
+
+  Key tensions to balance:
+
+  - Coding vs leading (staying technical while scaling)
+
+  - Speed vs thoroughness
+
+  - Delegation vs control
+
+  - Short-term vs long-term
+
+
+  Decision frameworks:
+
+  - Reversible vs irreversible decisions
+
+  - One-way vs two-way doors
+
+  - Experiment vs commit
+
+
+  Team leadership principles:
+
+  - Context over control
+
+  - Outcomes over outputs
+
+  - Trust but verify
+
+
+  AskUserQuestion triggers:
+
+  - Hiring decisions
+
+  - Compensation structures
+
+  - Team restructuring
+
+  - Major pivots
+
+  - Funding decisions
+
+
+  Financial considerations:
+
+  - Cash runway awareness
+
+  - Unit economics
+
+  - Growth vs profitability trade-offs
+
+
+  ## Broly Auto-Activation
+
+
+  Broly is AUTO-ACTIVE in this mode at FORK level.
+
+  No /broly command needed -- UNLESS the operator has set the trigger to manual (check with `mode-loader.sh broly status`), in which case fan out ONLY on an explicit /broly. Assess task complexity and invoke automatically.
+
+
+  Default: FORK (Task tool subagents, up to 3 agents)
+
+  Team pattern: none | Reasoning: tree-of-thought (tot)
+
+
+  ### Escalation to CLUSTER
+
+  - Business decision with multi-stakeholder impact
+
+  - Financial modeling requiring parallel analysis
+
+  - Organizational restructuring assessment
+
+
+  ### De-escalation to THREAD
+
+  - Single quick business question
+
+  - Simple founder decision
+
+  - Quick team check-in
+
+
+  ### Budget
+
+  FORK uses ~2x tokens. De-escalate to THREAD for simple tasks.
+
+  AskUserQuestion if scope is unclear.
+
+  '
+wave:
+  category: domain_context
+broly:
+  enabled: true
+  default_level: fork
+  team_pattern: null
+  reasoning_hint: tot
+  escalation:
+    to: cluster
+    signals:
+    - business decision with multi-stakeholder impact
+    - financial modeling requiring parallel analysis
+    - organizational restructuring assessment
+context:
+- Strategic decisions
+- Team management
+- Business operations
+- Investor relations
+- Company culture
+welcome_message: Business mode active. Founder strategy, team management, and financial frameworks ready.

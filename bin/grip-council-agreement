@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Measure inter-speaker agreement on GRIP's sealed sovereign councils.
+
+Read-only. Reports the measurable population, the pooled pairwise agreement
+with a council-level bootstrap interval, and whether the error-correlation rho
+can be computed from the records that exist.
+
+  bin/grip-council-agreement [--seals DIR] [--idr FILE] [--reps N] [--json]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import statistics
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+from claude_dir import get_claude_dir  # noqa: E402
+from council_agreement import analyse, load_seals, rho_measurable  # noqa: E402
+
+DEFAULT_SEALS = "state/sovereign-council"
+DEFAULT_IDR = "state/precog/idr.jsonl"
+SEED = 20260812
+
+
+def _bootstrap(units: list[tuple[int, int]], reps: int) -> tuple[float, float] | None:
+    """95% interval, resampling COUNCILS — pairs inside one council correlate."""
+    if not units:
+        return None
+    rng = random.Random(SEED)
+    draws: list[float] = []
+    for _ in range(reps):
+        sample = [units[rng.randrange(len(units))] for _ in units]
+        total = sum(t for _, t in sample)
+        if total:
+            draws.append(sum(a for a, _ in sample) / total)
+    if not draws:
+        return None
+    draws.sort()
+    return draws[int(0.025 * len(draws))], draws[int(0.975 * len(draws))]
+
+
+def _read_idr(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    records = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records
+
+
+def build_result(seals_dir: Path, idr_path: Path, reps: int) -> dict:
+    seals = load_seals(seals_dir)
+    report = analyse(seals)
+    idr = _read_idr(idr_path)
+    seal_ok, seal_why = rho_measurable(seals)
+    idr_ok, idr_why = rho_measurable(idr)
+    per = [a / t for _, a, t, _ in report.per_council]
+    interval = _bootstrap([(a, t) for _, a, t, _ in report.per_council], reps)
+    return {
+        "seals_total": report.seals_total,
+        "seals_multi_speaker": report.seals_multi_speaker,
+        "seals_measurable": report.seals_measurable,
+        "pairs": report.total_pairs,
+        "agreeing_pairs": report.agreeing_pairs,
+        "agreement_rate": report.agreement_rate,
+        "agreement_ci95": list(interval) if interval else None,
+        "per_council_mean": statistics.mean(per) if per else None,
+        "unanimous": report.unanimous,
+        "unanimity_rate": report.unanimity_rate,
+        "idr_records": len(idr),
+        "rho_measurable": bool(seal_ok or idr_ok),
+        "rho_reason_seals": seal_why,
+        "rho_reason_idr": idr_why,
+        "councils": [
+            {"sha": sha, "agree": a, "pairs": t, "verdicts": v}
+            for sha, a, t, v in report.per_council
+        ],
+    }
+
+
+def render(result: dict) -> str:
+    lines = ["GRIP sealed-council agreement", "=" * 60]
+    lines.append(f"sealed councils on disk     : {result['seals_total']}")
+    lines.append(f"multi-speaker councils      : {result['seals_multi_speaker']}")
+    lines.append(f"with >=2 parseable verdicts : {result['seals_measurable']}  (measurable population)")
+    rate = result["agreement_rate"]
+    if rate is None:
+        lines.append("agreement                   : NOT MEASURABLE (no council recorded 2+ verdicts)")
+    else:
+        ci = result["agreement_ci95"]
+        lines.append(
+            f"pairwise agreement          : {result['agreeing_pairs']}/{result['pairs']} = {rate:.3f}"
+        )
+        if ci:
+            lines.append(f"  95% interval (bootstrap)  : [{ci[0]:.3f}, {ci[1]:.3f}]")
+        lines.append(
+            f"unanimous councils          : {result['unanimous']}/{result['seals_measurable']}"
+            f" = {result['unanimity_rate']:.3f}"
+        )
+    lines.append("")
+    lines.append(f"rho (error correlation)     : {'MEASURABLE' if result['rho_measurable'] else 'NOT MEASURABLE'}")
+    lines.append(f"  seals : {result['rho_reason_seals']}")
+    lines.append(f"  idr   : {result['rho_reason_idr']}")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    grip = get_claude_dir()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--seals", type=Path, default=grip / DEFAULT_SEALS)
+    parser.add_argument("--idr", type=Path, default=grip / DEFAULT_IDR)
+    parser.add_argument("--reps", type=int, default=20000)
+    parser.add_argument("--json", action="store_true", dest="as_json")
+    args = parser.parse_args(argv)
+
+    if not args.seals.is_dir():
+        print(f"no seal directory at {args.seals}", file=sys.stderr)
+        return 2
+    result = build_result(args.seals, args.idr, args.reps)
+    print(json.dumps(result, indent=2) if args.as_json else render(result))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

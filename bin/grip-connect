@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# grip-connect -- /connect from the command line: a planner, a coder and a reviewer
+# from three vendors, relayed by a deterministic conductor.
+#
+# Thin wrapper: lib/connect.py does the work, and skills/connect/SKILL.md is the
+# procedure. The planner writes a plan in one text-only call, Codex makes the change
+# in a sandboxed worktree on the ChatGPT subscription, the conductor checks it with
+# no model, and a reviewer from a third vendor reads the diff. Every step is sealed
+# into a linked IDR leaf and said in the mesh room connect-<run>. It never pushes.
+#
+# Usage:
+#   grip-connect run "<task>" [--repo PATH] [--base REF] [--file PATH ...] [--roots lib/,tests/]
+#   grip-connect plan "<task>" ...        admit and plan only; nothing is changed
+#   grip-connect roster [--limit N]       the seats the role rule picks, and why others lost
+#   grip-connect status [RUN_ID]
+#   grip-connect stop [RUN_ID] [--clear]  a running /connect stops within its poll interval
+#   grip-connect verify RUN_ID            every artefact against its signed leaf
+#
+# Exit codes: 0 PASS or PLANNED; 1 another outcome, or verify found a problem;
+# 2 refused before anything ran.
+#
+# -P keeps the current directory off sys.path, so every module comes from THIS
+# checkout (PYTHONPATH below), as bin/grip-ultrathink does.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="$here${PYTHONPATH:+:$PYTHONPATH}"
+exec "$here/bin/grip-py" -P -m lib.connect "$@"

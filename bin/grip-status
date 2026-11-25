@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# grip-status — GRIP Status Line v6 (any-harness terminal status).
+#
+# Thin wrapper over lib/statusline_core.py (single source of truth). Reads the
+# SAME state files the Claude Code statusline reads — the active-LLM marker,
+# active modes, wave position, git — plus optional harness-supplied values, and
+# emits a two-row human status, or normalised JSON with --json (for the OpenCode
+# plugin and any other harness that renders natively).
+#
+#   grip-status                 # human, two rows
+#   grip-status --json          # normalised JSON (machine/plugin)
+#   grip-status --model deepseek/reasoner --cost-usd 0.42   # harness values
+#
+# CWD-independent: the core resolves the GRIP repo root from its own location,
+# so this wrapper can run from any working directory.
+
+# Resolve the GRIP repo root from this script's location (honours $GRIP_DIR).
+GRIP_DIR="${GRIP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+
+exec python3 "$GRIP_DIR/lib/statusline_core.py" "$@"

@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""Run this checkout's manual handoff through the GRIP venv."""
+import os
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT / 'lib'), str(ROOT)]
+from _compat import grip_python  # noqa: E402  (standard library only)
+
+roots = (ROOT, Path(os.environ.get('CLAUDE_DIR') or Path.home() / '.grip'),
+         Path.home() / '.grip')
+for root in roots:
+    # grip_python knows both venv layouts and falls back to the running
+    # interpreter, so a candidate counts only when it is inside this root's venv.
+    candidate = Path(grip_python(root))
+    if (root / 'venv') in candidate.parents:
+        if Path(sys.prefix).resolve() != candidate.parent.parent.resolve():
+            os.execv(str(candidate), [str(candidate), str(Path(__file__).resolve()), *sys.argv[1:]])
+        break
+else:
+    raise SystemExit('GRIP venv unavailable')
+from codex_handoff import main  # noqa: E402
+raise SystemExit(main())

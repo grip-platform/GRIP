@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# grip-guard-serve — run the keyed GRIP guard + analyse endpoint (task #256).
+#
+# The endpoint exposes two shipped GRIP checks (guardrail-evasion + a
+# sensitive-data scan) as `POST /guard`, and a provider-agnostic analysis path
+# as `POST /analyse`. Every reply carries a tamper-evident HMAC receipt.
+#
+# Usage:
+#   grip-guard-serve                                  # loopback:8642, no auth (dev)
+#   grip-guard-serve --token-file ~/.grip-guard.token # require Bearer on every POST
+#   grip-guard-serve --host 127.0.0.1 --port 8642 --token-file PATH
+#
+# One-shot (no server), handy for a quick demo:
+#   grip-guard-serve  -> serves; use `python3 lib/guard_endpoint.py guard "text"`
+#
+# For an external caller to reach it, front it with the cloudflared tunnel
+# (`/tunnel`) rather than binding 0.0.0.0, and ALWAYS set --token-file.
+set -euo pipefail
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+exec python3 "$CLAUDE_DIR/lib/guard_endpoint.py" serve "$@"

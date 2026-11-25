@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""grip-happiverse-join — register a node on the public HAPPIverse star-map.
+
+    grip-happiverse-join <gh-username> [display] [--proof-url URL] [--status S]
+    grip-happiverse-join <gh-username> <nickname> --machine        # one star per machine
+
+Appends (or idempotently updates, keyed by GitHub username) a leak-safe node in
+``apps/happiverse-proof/nodes.json`` — ``node_id`` auto-assigned ``node-NNN``,
+``status`` "joining" by default — then re-renders the self-contained star-map to
+``apps/happiverse-proof/index.html``.
+
+Writes ONLY the six public-safe fields (node_id, gh, display, joined, proof_url,
+status). It NEVER writes a tailnet IP, hostname, MagicDNS name, email, or phone —
+the star-map is published publicly, so private infrastructure must never touch
+this registry (the underlying ``add_node``/``save_registry`` re-project onto the
+whitelist, so a stray field cannot persist even if passed).
+
+Options:
+    --machine         register a MACHINE star: keyed by (username, nickname), so one
+                      user owns one star per machine; the nickname is display text
+                      only and must never be a hostname, address or MagicDNS name
+    --proof-url URL   your node's public proof page (blank until you publish one)
+    --status S        joining (default) | live
+    --registry PATH   registry file (default apps/happiverse-proof/nodes.json)
+    --out PATH        rendered HTML (default apps/happiverse-proof/index.html)
+    --joined DATE     ISO join date (default today)
+    --date DATE       'as of' date stamped on the render (default today)
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import os
+import sys
+from pathlib import Path
+
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR") or (Path.home() / ".claude"))
+# Find our OWN library first. CLAUDE_DIR defaults to $HOME/.claude — the SHARED
+# tree — so resolving imports through it means a copy of this script running from
+# a worktree imports a DIFFERENT checkout's modules, or fails outright when the
+# shared tree does not carry them yet. The script's own parent always holds the
+# lib/ it was written against; CLAUDE_DIR stays as a fallback so an installed
+# layout that separates bin/ from lib/ still resolves.
+for _root in (Path(__file__).resolve().parent.parent, CLAUDE_DIR):
+    if (_root / "lib").is_dir() and str(_root) not in sys.path:
+        sys.path.insert(0, str(_root))
+
+from lib.happiverse_constellation import join  # noqa: E402
+
+_DEFAULT_REGISTRY = CLAUDE_DIR / "apps" / "happiverse-proof" / "nodes.json"
+_DEFAULT_OUT = CLAUDE_DIR / "apps" / "happiverse-proof" / "index.html"
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="grip-happiverse-join",
+        description="Register a node on the public HAPPIverse star-map.",
+    )
+    ap.add_argument("gh", help="your public GitHub username (the only handle a star shows)")
+    ap.add_argument("display", nargs="?", default="", help="display name (defaults to the username)")
+    ap.add_argument("--proof-url", default="", help="URL of your node's public proof page")
+    ap.add_argument("--status", default="joining", choices=["joining", "live"])
+    ap.add_argument(
+        "--machine", action="store_true",
+        help="register a machine star keyed by (username, nickname); the nickname "
+             "is display text only — never a hostname, address or MagicDNS name",
+    )
+    ap.add_argument("--registry", type=Path, default=_DEFAULT_REGISTRY)
+    ap.add_argument("--out", type=Path, default=_DEFAULT_OUT)
+    ap.add_argument("--joined", default="", help="ISO join date (default: today)")
+    ap.add_argument("--date", default="", help="'as of' date for the render (default: today)")
+    ns = ap.parse_args(argv)
+
+    today = _dt.date.today().isoformat()
+    node_id, added = join(
+        registry_path=ns.registry,
+        out_path=ns.out,
+        gh=ns.gh,
+        as_of=ns.date or today,
+        display=ns.display,
+        proof_url=ns.proof_url,
+        status=ns.status,
+        joined=ns.joined or today,
+        machine=ns.machine,
+    )
+    verb = "registered" if added else "updated"
+    who = f"@{ns.gh} / {ns.display}" if ns.machine else f"@{ns.gh}"
+    print(f"{verb} {node_id or '?'} ({who}) [{ns.status}] -> {ns.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

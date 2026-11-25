@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""grip-unlock — GRIP Suite creator-approval admin-unlock CLI.
+
+Suite admin-unlock subcommands (machine scope, lib/license_handshake.py):
+  request   Requester: create an unlock challenge + notify the creator (V>>).
+  issue     Creator: mint a dynamic, signed, time/nonce/machine-bound code.
+  verify    Requester: redeem a code -> write admin-unlock marker + IDR leaf.
+  status    Show current unlock state (live vs expired) for this machine.
+
+Membership-approval subcommands (governance scope, lib/grip_unlock_approval.py,
+per docs/access/VETTING.md — the GitHub access-request issue is the state store):
+  request-list  List open access requests with state, age, and staleness.
+  notify        WhatsApp-DM the approver roster about undecided requests.
+  approve       Record one attributed approval (--as <approver>); dual quorum
+                for private-overlay finalises the grant and EMITS provisioning.
+  deny          Deny with a reason (--as <approver>); closes courteously.
+  sweep         Auto-deny requests with zero approver responses after 72h.
+
+Thin dispatch over the two lib modules. No static secret is ever embedded;
+the signing key is per-machine (state/grip-suite/unlock-signing.key or
+$GRIP_SUITE_UNLOCK_KEY). Use --json on any subcommand for machine-readable
+output.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+_BIN = Path(__file__).resolve().parent
+_ROOT = _BIN.parent
+for _p in (str(_ROOT), str(_ROOT / "lib")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import grip_unlock_approval as ga  # noqa: E402
+import license_handshake as lh  # noqa: E402
+
+
+def _emit(payload: dict, as_json: bool, lines: list[str]) -> int:
+    if as_json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print("\n".join(lines))
+    return 0
+
+
+def cmd_request(args: argparse.Namespace) -> int:
+    res = lh.request(args.requester, suite_version=args.suite_version, recipient=args.recipient)
+    delivered = bool(res.get("delivery", {}).get("ok"))
+    lines = [
+        "GRIP Suite unlock request created.",
+        f"  request_id : {res['request_id']}",
+        f"  machine    : {res['machine_fp']}",
+        f"  notified   : {'yes' if delivered else 'NO (deliver the challenge manually)'} -> {res['recipient']}",
+        "",
+        "Portable challenge (send to the creator if not auto-delivered):",
+        f"  {res['challenge']}",
+    ]
+    return _emit(res, args.json, lines)
+
+
+def cmd_issue(args: argparse.Namespace) -> int:
+    try:
+        code = lh.issue(args.challenge, ttl_seconds=args.ttl, note=args.note)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    lines = ["Unlock code minted — send to the requester:", "", f"  {code}", "",
+             f"Valid for {args.ttl}s, single-use, bound to the requesting machine."]
+    return _emit({"code": code, "ttl_seconds": args.ttl, "note": args.note}, args.json, lines)
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    res = lh.verify(args.code)
+    if res["ok"]:
+        lines = [
+            "Admin-unlock GRANTED.",
+            f"  scope      : {res['scope']}",
+            f"  expires_ts : {res['expires_ts']}",
+            f"  marker     : {res['marker']}",
+            f"  idr_leaf   : {res.get('idr_leaf') or '(emit failed: ' + res.get('idr_error', 'unknown') + ')'}",
+        ]
+        _emit(res, args.json, lines)
+        return 0
+    lines = [f"Admin-unlock REJECTED — {res['reason']}."]
+    _emit(res, args.json, lines)
+    return 1
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    res = lh.status()
+    if res["unlocked"]:
+        state = f"UNLOCKED (scope={res['scope']}, {res['seconds_remaining']}s remaining)"
+    elif res["expired"]:
+        state = "LOCKED (previous unlock EXPIRED)"
+    else:
+        state = "LOCKED"
+    lines = [
+        f"GRIP Suite admin: {state}",
+        f"  machine          : {res['machine_fp']}",
+        f"  signing key set  : {'yes' if res['key_present'] else 'no'}",
+        f"  pending requests : {res['pending_requests']}",
+    ]
+    return _emit(res, args.json, lines)
+
+
+# ---------------------------------------------------------------------------
+# Membership-approval subcommands (thin argv shims over grip_unlock_approval)
+# ---------------------------------------------------------------------------
+
+def cmd_request_list(args: argparse.Namespace) -> int:
+    rows = ga.list_requests(gateway=ga.GhIssueGateway())
+    lines = [f"{len(rows)} open access request(s):" if rows else "No open access requests."]
+    for row in rows:
+        flag = "  STALE" if row["stale"] else ""
+        lines.append(
+            f"  #{row['number']:<5} {row['state']:<8} {row['scope']:<15} "
+            f"{(row['handle'] or '?'):<20} {row['age_hours']:>7.1f}h{flag}  {row['title']}"
+        )
+    return _emit({"requests": rows}, args.json, lines)
+
+
+def cmd_notify(args: argparse.Namespace) -> int:
+    roster = ga.load_roster()
+    rows = ga.list_requests(gateway=ga.GhIssueGateway())
+    targets = [r for r in rows if r["state"] in ("pending", "1of2")]
+    if args.number is not None:
+        targets = [r for r in targets if r["number"] == args.number]
+    results = [
+        {"number": r["number"], "deliveries": ga.notify_approvers(r, roster=roster)}
+        for r in targets
+    ]
+    lines = [f"Notified approvers about {len(results)} request(s)."]
+    for item in results:
+        sent = sum(1 for d in item["deliveries"] if d["delivery"].get("ok"))
+        lines.append(f"  #{item['number']}: {sent}/{len(item['deliveries'])} deliveries ok")
+    return _emit({"notified": results}, args.json, lines)
+
+
+def _decision_lines(res: dict) -> list[str]:
+    lines = [f"Request #{res['number']}: {res['verdict'].upper()} "
+             f"(scope={res['scope']}, idr_leaf={res.get('idr_leaf') or 'EMIT FAILED'})"]
+    if res.get("idr_error"):
+        lines.append(f"  idr_error : {res['idr_error']}")
+    if res["verdict"] == "pending":
+        lines.append(f"  approvals : {len(res['approvals'])}/{res['needed']} "
+                     f"({', '.join(res['approvals'])}) — awaiting quorum")
+    for command in res.get("provisioning", []):
+        lines.append(f"  provision : {command}")
+    return lines
+
+
+def cmd_approve(args: argparse.Namespace) -> int:
+    try:
+        res = ga.approve(args.number, args.approver,
+                         gateway=ga.GhIssueGateway(), roster=ga.load_roster())
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    _emit(res, args.json, _decision_lines(res))
+    return 0
+
+
+def cmd_deny(args: argparse.Namespace) -> int:
+    try:
+        res = ga.deny(args.number, args.approver, args.reason,
+                      gateway=ga.GhIssueGateway(), roster=ga.load_roster())
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    _emit(res, args.json, _decision_lines(res))
+    return 0
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    results = ga.sweep(gateway=ga.GhIssueGateway(), roster=ga.load_roster())
+    lines = [f"Auto-denied {len(results)} stale request(s) (72h no approver response)."]
+    for res in results:
+        lines.extend(_decision_lines(res))
+    return _emit({"swept": results}, args.json, lines)
+
+
+def _add_approval_parsers(sub, common: argparse.ArgumentParser) -> None:
+    p_list = sub.add_parser("request-list", parents=[common],
+                            help="list open membership access requests")
+    p_list.set_defaults(func=cmd_request_list)
+
+    p_not = sub.add_parser("notify", parents=[common],
+                           help="WhatsApp-DM the approver roster about undecided requests")
+    p_not.add_argument("--number", type=int, default=None, help="only this issue number")
+    p_not.set_defaults(func=cmd_notify)
+
+    p_app = sub.add_parser("approve", parents=[common],
+                           help="record one attributed approval for an access request")
+    p_app.add_argument("number", type=int, help="access-request issue number")
+    p_app.add_argument("--as", dest="approver", required=True,
+                       help="your approver name as it appears on the roster")
+    p_app.set_defaults(func=cmd_approve)
+
+    p_den = sub.add_parser("deny", parents=[common],
+                           help="deny an access request with a reason (courteous close)")
+    p_den.add_argument("number", type=int, help="access-request issue number")
+    p_den.add_argument("--reason", required=True, help="explainable deny reason (VETTING.md)")
+    p_den.add_argument("--as", dest="approver", required=True,
+                       help="your approver name as it appears on the roster")
+    p_den.set_defaults(func=cmd_deny)
+
+    p_swp = sub.add_parser("sweep", parents=[common],
+                           help="auto-deny requests with no approver response after 72h")
+    p_swp.set_defaults(func=cmd_sweep)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    # --json lives on a shared parent so it is accepted in BOTH positions:
+    # `grip-unlock --json <cmd>` and `grip-unlock <cmd> --json`.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="machine-readable JSON output")
+
+    parser = argparse.ArgumentParser(
+        prog="grip-unlock", description=__doc__.splitlines()[0], parents=[common]
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_req = sub.add_parser("request", parents=[common],
+                           help="requester: create challenge + notify creator")
+    p_req.add_argument("requester", help="who is requesting (name / email / handle)")
+    p_req.add_argument("--suite-version", default="unknown")
+    p_req.add_argument("--recipient", default=lh.V_OPERATOR_JID, help="creator JID to notify")
+    p_req.set_defaults(func=cmd_request)
+
+    p_iss = sub.add_parser("issue", parents=[common], help="creator: mint a dynamic unlock code")
+    p_iss.add_argument("challenge", help="portable challenge string from `request`")
+    p_iss.add_argument("--ttl", type=int, default=lh.DEFAULT_GRANT_TTL_S, help="grant TTL seconds")
+    p_iss.add_argument("--note", default="", help="optional note recorded in the grant")
+    p_iss.set_defaults(func=cmd_issue)
+
+    p_ver = sub.add_parser("verify", parents=[common], help="requester: redeem an unlock code")
+    p_ver.add_argument("code", help="unlock code from the creator")
+    p_ver.set_defaults(func=cmd_verify)
+
+    p_stat = sub.add_parser("status", parents=[common], help="show current unlock state")
+    p_stat.set_defaults(func=cmd_status)
+
+    _add_approval_parsers(sub, common)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    # This shebang is `/usr/bin/env python3`, which need not be an interpreter
+    # that can dual-sign. Without this the tool still runs and still records --
+    # it just writes a forgeable demo-sealed record when a real seal was one
+    # interpreter away (lib/pq_reexec.py).
+    #
+    # Imported as top-level `pq_reexec` off THIS checkout, never as
+    # `lib.pq_reexec`: by now `lib` may already be bound to another tree's
+    # package, and the import would miss the file or read another branch's copy.
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "lib"))
+    from pq_reexec import reexec_if_incapable as _reexec
+
+    _reexec(_Path(__file__))
+    raise SystemExit(main())

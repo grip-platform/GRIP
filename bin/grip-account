@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""grip-account — run different Claude Code accounts in different terminals.
+
+`claude` keeps ONE login per config directory, and every terminal shares the
+default one. So logging in as a second account logs the first out everywhere --
+unusable with many sessions running, and a chicken-and-egg for
+`claude setup-token`, which needs a login to mint a token for an account you
+cannot log into without disrupting everything.
+
+Claude Code already solves this and does not advertise it: CLAUDE_CONFIG_DIR
+isolates the login, and credentials are namespaced in the keychain by
+sha256(config_dir)[:8]. Measured, not assumed -- see lib/claude_account.py.
+
+    grip-account list                 slots, and which are logged in
+    grip-account login <name>         log in to a slot (interactive, isolated)
+    grip-account mint <name>          mint a one-year token and store it, never shown
+    grip-account token <name>         print that slot's sk-ant-oat on STDOUT
+    grip-account env <name>           export lines to pin a shell to a slot
+    grip-account add <name>           join a new account: sign in, mint, pool, fleet, copy
+    grip-account ladder               where a capped account's work would go next,
+                                      and how long each account lasts
+    grip-account blackbox             what led up to each recent usage cap, from
+                                      HAL's request history
+
+The whole point:
+
+    grip-account login laurie          # other sessions unaffected
+    grip-account mint laurie           # approve in the browser; the token goes
+                                       # straight into the token store
+
+`mint` runs `claude setup-token` behind a pseudo-terminal, shows only the
+approval link and the prompts, and keeps the token only if a tiny live call
+made with it matches the slot's own login (see lib/claude_token_mint.py). Use
+`--as <label>` when the slot's name is not the name the token should be stored
+under.
+
+`token` is the older way and prints the token IN YOUR TERMINAL, to be pasted
+into `grip-relay-bill store <name>`. That leaves it in the scrollback and on
+the clipboard, which is what `mint` exists to avoid.
+
+Both need a real terminal. `claude setup-token` is interactive: it prints an
+authorisation URL and waits, so capturing its stdout swallows the URL and
+redirecting its stdin ends it before it reads anything. Observed: under
+`< /dev/null` it produced zero bytes and sat alive indefinitely.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+import claude_token_store  # noqa: E402
+from claude_account import (  # noqa: E402
+    ACCOUNTS_ROOT, UnsafeAccount, assert_safe, config_dir, env_for, keychain_service,
+    link_shared_projects, link_shared_settings,
+)
+
+_BILL = Path(__file__).resolve().parent / "grip-relay-bill"
+# Overridable so a test never reaches the real fleet over the network.
+_FLEET = Path(os.environ.get("GRIP_CLAUDE_FLEET_BIN")
+              or Path(__file__).resolve().parent / "grip-claude-fleet")
+
+# The token store's own rule for a label. It is checked here BEFORE minting,
+# because a label the store refuses after the browser approval would waste the
+# token. The rule is written once, in lib/claude_token_store.py.
+_LABEL_RE = claude_token_store.LABEL_SHAPE
+_RESERVED_LABELS = claude_token_store.RESERVED_LABELS
+_NO_PTY = ("mint runs `claude setup-token` behind a pseudo-terminal, and this platform "
+           "does not have one. Run it on macOS or Linux.")
+
+
+def _has_credentials(path: Path) -> bool:
+    """True iff the keychain holds a login for this config dir. Never reads it."""
+    return subprocess.run(
+        ["security", "find-generic-password", "-s", keychain_service(path)],
+        capture_output=True,
+    ).returncode == 0
+
+
+def _spawn(name: str, argv: list) -> int:
+    """Run `claude` pinned to one account slot, inheriting the terminal."""
+    path = _prepare(name)
+    env = {**os.environ, **env_for(name)}
+    return subprocess.run(["claude", *argv], env=env).returncode
+
+
+def _prepare(name: str) -> Path:
+    """Create the slot and point its settings.json at GRIP's (GRIP#8299)."""
+    path = assert_safe(config_dir(name))
+    path.mkdir(parents=True, exist_ok=True)
+    outcome = link_shared_settings(path)
+    if outcome in ("linked", "replaced"):
+        print(f"[grip-account] slot {name!r}: settings.json now links to "
+              f"GRIP's ({outcome}).", file=sys.stderr)
+    elif outcome == "absent":
+        print(f"[grip-account] WARNING: no GRIP settings.json to share; slot "
+              f"{name!r} runs without GRIP's hooks and rule excludes.",
+              file=sys.stderr)
+    _report_projects(name, link_shared_projects(path))
+    return path
+
+
+def _report_projects(name: str, outcome: str) -> None:
+    """One stderr line per projects/ change (GRIP#8313); silence when kept."""
+    notes = {
+        "linked": "projects/ now links to GRIP's (memory and history shared).",
+        "migrated": "projects/ moved into GRIP's and linked; name clashes kept "
+                    "under projects/.slot-merge-<slot>/, nothing deleted.",
+        "in-use": "projects/ left alone: a session is using this slot. It is "
+                  "linked on the next login or env with none running.",
+        "cross-device": "projects/ left alone: GRIP's projects/ is on another "
+                        "filesystem, so moving it would mean copying. Move the "
+                        "slot's files across by hand, then run env again.",
+        "absent": "WARNING: GRIP has no projects/ folder to share.",
+    }
+    if outcome in notes:
+        print(f"[grip-account] slot {name!r}: {notes[outcome]}", file=sys.stderr)
+
+
+def cmd_list(_ns) -> int:
+    root = ACCOUNTS_ROOT
+    slots = sorted(p for p in root.iterdir() if p.is_dir()) if root.exists() else []
+    print(f"account slots under {root}:")
+    if not slots:
+        print("  (none yet — create one with: grip-account login <name>)")
+    for p in slots:
+        state = "logged in" if _has_credentials(p) else "not logged in"
+        print(f"  {p.name:20s} {state:14s} {keychain_service(p)}")
+    print("\nthe default (shared) login is untouched by every command here.")
+    return 0
+
+
+def cmd_login(ns) -> int:
+    print(f"[grip-account] launching claude isolated to slot {ns.name!r}.",
+          file=sys.stderr)
+    print("[grip-account] run /login inside it. Other sessions are unaffected.",
+          file=sys.stderr)
+    return _spawn(ns.name, [])
+
+
+def cmd_token(ns) -> int:
+    """Run `claude setup-token` for one slot, ATTACHED TO THE TERMINAL.
+
+    It deliberately does NOT capture stdout, and this command is deliberately
+    NOT pipeable. `setup-token` is INTERACTIVE: it prints an authorisation URL
+    and waits. Capturing its output swallows that URL, and redirecting its
+    stdin ends it before it can read anything.
+
+    Observed 2026-09-18, which is why this function was rewritten: run through a
+    harness that supplies `< /dev/null`, `claude setup-token` produced ZERO
+    bytes and sat alive indefinitely — no token, no error, no clue. An earlier
+    version of this command used capture_output=True and would have failed the
+    same way while looking like a tool bug rather than a missing terminal.
+
+    So the token is printed to the operator's own terminal by claude itself,
+    and storing it is a second, separate command that reads stdin:
+
+        grip-account token laurie          # prints the token here
+        grip-relay-bill store laurie       # paste it, then Ctrl-D
+
+    Pasting into stdin keeps the credential out of shell history, which the
+    pipeline this replaces was also trying to do — the difference is that this
+    one works. `grip-account mint` does both steps without showing the token.
+    """
+    path = config_dir(ns.name)
+    if not _has_credentials(path):
+        print(f"[grip-account] slot {ns.name!r} is not logged in. Run: "
+              f"grip-account login {ns.name}", file=sys.stderr)
+        return 2
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print("[grip-account] REFUSING: `claude setup-token` is interactive and "
+              "needs a real terminal.\n"
+              "[grip-account] Piping or backgrounding it makes it hang forever "
+              "with no output.\n"
+              f"[grip-account] Run this directly in a terminal window:\n"
+              f"    grip-account token {ns.name}\n"
+              f"[grip-account] then paste the token into:\n"
+              f"    grip-relay-bill store {ns.name}", file=sys.stderr)
+        return 2
+    env = {**os.environ, **env_for(ns.name)}
+    rc = subprocess.run(["claude", "setup-token"], env=env).returncode
+    if rc == 0:
+        print(f"\n[grip-account] now store it without touching shell history:\n"
+              f"    grip-relay-bill store {ns.name}\n"
+              f"[grip-account] paste the token, then press Ctrl-D.",
+              file=sys.stderr)
+    return rc
+
+
+def _store_blocker() -> str | None:
+    """Why the token store cannot take a token right now, or None."""
+    done = subprocess.run([sys.executable, str(_BILL), "list"],
+                          capture_output=True, text=True)
+    return None if done.returncode == 0 else (done.stderr or done.stdout).strip()[:300]
+
+
+def _mint_blocker(label: str, claude: str | None) -> str | None:
+    """The first reason a mint cannot start, in plain words, or None."""
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return ("mint needs a real terminal: you approve in the browser and may be "
+                "asked to paste a code. Run it directly in a terminal window.")
+    if not claude:
+        return "the `claude` command was not found on PATH."
+    if not _LABEL_RE.match(label) or label in _RESERVED_LABELS:
+        return (f"{label!r} cannot be a token label: use letters, digits, dash or "
+                "underscore, and not 'pool' or 'migrate'. Pick one with --as <label>.")
+    return _store_blocker()
+
+
+def _confirmed(account: str, label: str) -> bool:
+    """Say exactly what is about to happen, and ask."""
+    print(f"This mints a one-year token for {account} and stores it as {label!r}.\n"
+          "The account is decided by who is signed in to the browser that opens, "
+          f"so check that it is {account}.\nThe token itself is never shown.")
+    if label.lower() not in account.lower():
+        print(f"Note: the label {label!r} does not appear in {account}.")
+    return input("Continue? [y/N] ").strip().lower() in ("y", "yes")
+
+
+def _claude_version(claude: str) -> str:
+    done = subprocess.run([claude, "--version"], capture_output=True, text=True)
+    return (done.stdout.strip().splitlines() or ["unknown"])[0]
+
+
+def cmd_mint(ns) -> int:
+    """Mint a one-year token for one slot and store it without showing it.
+
+    Exit code: 0 stored; 1 minted but not kept (the service refused it, it
+    belongs to another account, or the check could not be made); 2 could not
+    start; 3 no token was captured.
+    """
+    import claude_token_mint as mint
+    import claude_token_store as store
+
+    label, claude = ns.label or ns.name, shutil.which("claude")
+    slot = assert_safe(config_dir(ns.name))
+    blocker = _mint_blocker(label, claude) if mint.PTY_AVAILABLE else _NO_PTY
+    account = None if blocker else mint.who_is(slot, claude).get("email")
+    if blocker or not account:
+        print(f"[grip-account] {blocker or _not_logged_in(ns.name)}", file=sys.stderr)
+        return 2
+    if not (ns.yes or _confirmed(account, label)):
+        print("[grip-account] stopped; nothing was minted.", file=sys.stderr)
+        return 2
+    job = mint.MintJob(slot_dir=slot, label=label, account=account, claude=claude,
+                       cli=_claude_version(claude), bill=_BILL,
+                       store_dir=store.ensure_store_dir(), say=print,
+                       keyboard_fd=sys.stdin.fileno(),
+                       allow_unverified=ns.allow_unverified)
+    return mint.mint(job)
+
+
+def _not_logged_in(name: str) -> str:
+    return (f"slot {name!r} is not logged in, or its login reports no email. "
+            f"Run: grip-account login {name}")
+
+
+def cmd_env(ns) -> int:
+    _prepare(ns.name)
+    for k, v in env_for(ns.name).items():
+        print(f'export {k}="{v}"')
+    return 0
+
+
+def cmd_add(ns) -> int:
+    """Join a new Max account in one command: sign in its slot, mint its one-year
+    token, add it to this machine's pool and the fleet, and copy it to every fleet
+    machine (lib/claude_account_add.py). Each step already done is skipped."""
+    import claude_account_add as add
+
+    label = ns.name
+    # Checked before the sign-in, which a refused label would waste. A slot name
+    # may hold a dot and a token label may not, and `pool` names the pool file.
+    problem = claude_token_store.label_problem(label)
+    if problem:
+        print(f"[grip-account] {label!r} cannot name a stored token: {problem}.",
+              file=sys.stderr)
+        return 2
+    if not _has_credentials(config_dir(label)) and _sign_in(ns) != 0:
+        return 2
+    if not claude_token_store.labelled_path(label).exists():
+        minted = cmd_mint(argparse.Namespace(name=label, label=label, yes=ns.yes,
+                                             allow_unverified=False))
+        if minted != 0:
+            return minted
+    steps = [lambda: add.join_pool(label, _BILL), lambda: add.join_fleet(label)]
+    if not ns.no_converge:
+        steps.append(lambda: add.converge(_FLEET))
+    for step in steps:
+        ok, said = step()
+        print(f"[grip-account] {said}")
+        if not ok:
+            return 1
+    print(f"[grip-account] {label} is joined here. Each other machine keeps its own pool "
+          f"order: add it there with grip-relay-bill pool <that machine's order> {label}")
+    return 0
+
+
+def _sign_in(ns) -> int:
+    """Sign the slot in, which needs a person at a terminal; 0 once it holds a login."""
+    if not sys.stdin.isatty():
+        print(f"[grip-account] slot {ns.name!r} is not signed in, and signing in needs a "
+              f"terminal. Run in one: grip-account add {ns.name}", file=sys.stderr)
+        return 2
+    cmd_login(ns)
+    if _has_credentials(config_dir(ns.name)):
+        return 0
+    print(f"[grip-account] slot {ns.name!r} is still not signed in; nothing was added.",
+          file=sys.stderr)
+    return 2
+
+
+def cmd_ladder(ns) -> int:
+    """Show where a capped account's work would go next, in order, and how long
+    each account lasts at the pace HAL last read. Read-only: it reads the pool,
+    the stored tokens, HAL's ledger and two HAL files, asks the keychain only
+    whether the paid key is there, and reaches no network
+    (lib/claude_account_ladder.py)."""
+    import json
+
+    import claude_account_ladder as ladder
+
+    view = ladder.ladder()
+    print(json.dumps(view, indent=2) if ns.json else "\n".join(ladder.render(view)))
+    return 0
+
+
+def cmd_blackbox(ns) -> int:
+    """Show what led up to each recent usage cap: the sessions that used the account
+    in the window's length before it. Read-only: it reads HAL's request history and
+    reaches no network (lib/claude_cap_blackbox.py)."""
+    import json
+
+    import claude_cap_blackbox as box
+
+    view = box.blackbox(box.read_rows(), last=ns.last)
+    print(json.dumps(view, indent=2) if ns.json else "\n".join(box.render(view)))
+    return 0
+
+
+def _at_least_one(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
+    return value
+
+
+def _add_blackbox_parser(sub) -> None:
+    box = sub.add_parser("blackbox", help="show what led up to each recent usage cap, "
+                                          "from HAL's request history")
+    box.add_argument("--last", type=_at_least_one, default=5,
+                     help="how many of the newest caps to show (default 5)")
+    box.add_argument("--json", action="store_true", help="print the record as JSON")
+    box.set_defaults(fn=cmd_blackbox)
+
+
+def _add_mint_parser(sub) -> None:
+    minter = sub.add_parser("mint", help="mint a one-year token and store it, never shown")
+    minter.add_argument("name", help="the account slot to mint from")
+    minter.add_argument("--as", dest="label", default=None,
+                        help="store the token under this label instead of the slot's name")
+    minter.add_argument("--allow-unverified", action="store_true",
+                        help="keep the token even when the account check could not be "
+                             "completed, for instance at a usage limit or during an outage "
+                             "(a token the service refuses, or another account's, is never kept)")
+    minter.add_argument("--yes", action="store_true", help="do not ask before starting")
+    minter.set_defaults(fn=cmd_mint)
+
+
+def main() -> int:
+    if claude_token_store.token_among(sys.argv[1:]):
+        # A token typed where a slot or label goes would be quoted back below.
+        print(f"[grip-account] {claude_token_store.TOKEN_AS_ARGUMENT}", file=sys.stderr)
+        return 2
+    ap = argparse.ArgumentParser(description="Side-by-side Claude Code accounts")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list").set_defaults(fn=cmd_list)
+    for verb, fn in (("login", cmd_login), ("token", cmd_token), ("env", cmd_env)):
+        p = sub.add_parser(verb)
+        p.add_argument("name")
+        p.set_defaults(fn=fn)
+    _add_mint_parser(sub)
+    adder = sub.add_parser("add", help="join a new account: sign in, mint, pool, fleet, copy")
+    adder.add_argument("name", help="the account's slot and label, for example laurdev")
+    adder.add_argument("--yes", action="store_true", help="do not ask before minting")
+    adder.add_argument("--no-converge", action="store_true",
+                       help="do not copy the token to the other fleet machines")
+    adder.set_defaults(fn=cmd_add)
+    preview = sub.add_parser("ladder", help="show where a capped account's work would go next, "
+                                            "and how long each account lasts")
+    preview.add_argument("--json", action="store_true", help="print the preview as JSON")
+    preview.set_defaults(fn=cmd_ladder)
+    _add_blackbox_parser(sub)
+    ns = ap.parse_args()
+    try:
+        return ns.fn(ns)
+    except UnsafeAccount as exc:
+        print(f"[grip-account] {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"[grip-account] {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("\n[grip-account] stopped; nothing was stored.", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

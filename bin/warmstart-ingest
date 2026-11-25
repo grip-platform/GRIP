@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""warmstart-ingest — land a pasted Warm Start questionnaire reply in Slack.
+
+Reads the reply text from --file or stdin, parses numbered answers (1., 1),
+Q1:, WhatsApp-bold variants), and POSTs to the ultralead funnel
+(firm_slug=warmstart) so the structured Q&A lands in #warmstart-leads.
+Falls back to a direct Slack post when the funnel is unreachable.
+
+Examples:
+  pbpaste | warmstart-ingest --email founder@example.com
+  warmstart-ingest --file reply.txt --email founder@example.com --dry-run
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from lib.warmstart_ingest import DEFAULT_FUNNEL_BASE, run_ingest  # noqa: E402
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="warmstart-ingest", description=__doc__)
+    parser.add_argument("--email", required=True, help="the founder's email (funnel requires a verifiable address)")
+    parser.add_argument("--file", default=None, help="reply text file; omit to read stdin")
+    parser.add_argument("--rating", type=int, default=None)
+    parser.add_argument("--base-url", default=DEFAULT_FUNNEL_BASE)
+    parser.add_argument("--dry-run", action="store_true", help="print the parsed payload, send nothing")
+    parser.add_argument("--direct-slack", action="store_true", help="skip the funnel, post straight to the channel")
+    args = parser.parse_args(argv)
+
+    text = Path(args.file).read_text(encoding="utf-8") if args.file else sys.stdin.read()
+    outcome = run_ingest(
+        text,
+        args.email,
+        rating=args.rating,
+        base_url=args.base_url,
+        dry_run=args.dry_run,
+        force_direct_slack=args.direct_slack,
+    )
+    answered = sorted(outcome["payload"]["answers"], key=lambda q: int(q[1:]))
+    print(f"path: {outcome['path']} · answered: {', '.join(answered) or 'none'}")
+    if outcome["path"] == "dry_run":
+        print(json.dumps(outcome["payload"], indent=2))
+        return 0
+    result = outcome["result"] or {}
+    print(json.dumps({k: result.get(k) for k in ("ok", "root_id", "ts", "channel", "reason", "fallback_reason", "spooled") if k in result}, indent=2))
+    if outcome["path"] == "spooled":
+        print("both transports failed — reply SAVED locally; re-run once the funnel or Slack recovers")
+    return 0 if result.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

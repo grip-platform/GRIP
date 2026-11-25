@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""grip-wa-chats — read WhatsApp history captured by the per-JID store.
+
+    grip-wa-chats v                     # known-name resolve
+    grip-wa-chats 27000000000 -n 50
+    grip-wa-chats group --since 2026-06-09
+    grip-wa-chats --list                # all captured chats
+    grip-wa-chats v --history-dir /backups/whatsapp-history
+
+History starts the moment the store shipped (2026-06-10) — earlier
+messages live only on the phone.
+
+Exit codes: 0 ok · 2 bad input (unresolvable contact or invalid --since).
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+
+def _claude_dir() -> Path:
+    """``${CLAUDE_DIR:-$HOME/.claude}`` — mirrors lib/claude_dir.py::get_claude_dir.
+
+    Mirrored rather than imported because lib/ only becomes importable after
+    this resolves (rules/path-portability.md names this exact fallback form).
+    """
+    env = os.environ.get("CLAUDE_DIR", "").strip()
+    if env:
+        return Path(env).expanduser().resolve()
+    return Path.home() / ".claude"
+
+
+sys.path.insert(0, str(_claude_dir()))
+
+from lib.wa_history import list_chats, read_chat, render  # noqa: E402
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="grip-wa-chats", description=__doc__.splitlines()[0])
+    ap.add_argument("who", nargs="?", help="name (v/group), digits, or full JID")
+    ap.add_argument("-n", "--limit", type=int, default=40)
+    ap.add_argument("--since", default=None,
+                    help="ISO date or datetime, e.g. 2026-06-09 (local time assumed)")
+    ap.add_argument("--history-dir", type=Path, default=None,
+                    help="read an alternate history store "
+                         "(default: <CLAUDE_DIR>/state/whatsapp-history)")
+    ap.add_argument("--list", action="store_true", dest="list_all")
+    args = ap.parse_args(argv)
+
+    if args.list_all or not args.who:
+        chats = list_chats(history_dir=args.history_dir)
+        if not chats:
+            print("(no chats captured yet — store began 2026-06-10)")
+            return 0
+        for c in chats:
+            print(f"{c['chat']:<40} {c['rows']:>4} rows   last: {c['last_text']}")
+        return 0
+
+    try:
+        rows = read_chat(args.who, limit=args.limit, since=args.since,
+                         history_dir=args.history_dir)
+    except ValueError as exc:
+        print(f"grip-wa-chats: {exc}", file=sys.stderr)
+        return 2
+    print(render(rows))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

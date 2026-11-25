@@ -1,0 +1,225 @@
+{
+  "_comment": "GENERATED from config/hooks.registry.json. This compatibility projection retains only policies used by the legacy HAL dispatcher.",
+  "version": "2.0.0",
+  "hard": {
+    "description": "Blocking/security policies consumed by legacy HAL dispatch.",
+    "hooks": {
+      "cc-gate-hook.py": {
+        "event": "PreToolUse",
+        "gates": [
+          "cyclomatic-complexity"
+        ],
+        "action": "deny/warn",
+        "policy_id": "policy.cc-gate-hook-py",
+        "failure_mode": "closed",
+        "owner": "GRIP"
+      },
+      "context-gate-hook.py": {
+        "event": "PreToolUse",
+        "gates": [
+          "dependency-guardian",
+          "destructive-git",
+          "secrets",
+          "env-protection",
+          "ssh-block",
+          "deploy-gate",
+          "context-gate"
+        ],
+        "action": "deny",
+        "policy_id": "policy.context-gate-hook-py",
+        "failure_mode": "closed",
+        "owner": "GRIP"
+      },
+      "elicitation-hook.py": {
+        "event": "Elicitation",
+        "gates": [
+          "mcp-input-security"
+        ],
+        "action": "log+warn",
+        "policy_id": "policy.elicitation-hook-py",
+        "failure_mode": "closed",
+        "owner": "GRIP"
+      },
+      "elicitation-result-hook.py": {
+        "event": "ElicitationResult",
+        "gates": [
+          "mcp-response-secrets"
+        ],
+        "action": "block",
+        "policy_id": "policy.elicitation-result-hook-py",
+        "failure_mode": "closed",
+        "owner": "GRIP"
+      },
+      "grip-first-retrieval-hook.py": {
+        "event": "PreToolUse",
+        "gates": [
+          "efficiency-retrieval"
+        ],
+        "action": "deny",
+        "policy_id": "policy.grip-first-retrieval-hook-py",
+        "failure_mode": "closed",
+        "owner": "GRIP"
+      },
+      "grip-first-web-hook.py": {
+        "event": "PreToolUse",
+        "gates": [
+          "efficiency-web"
+        ],
+        "action": "deny",
+        "policy_id": "policy.grip-first-web-hook-py",
+        "failure_mode": "closed",
+        "owner": "GRIP"
+      },
+      "memory-guard.sh": {
+        "event": "PreToolUse",
+        "gates": [
+          "memory-protection"
+        ],
+        "action": "deny",
+        "policy_id": "policy.memory-guard-sh",
+        "failure_mode": "closed",
+        "owner": "GRIP"
+      },
+      "secrets-output-hook.py": {
+        "event": "PostToolUse",
+        "gates": [
+          "secrets-in-output"
+        ],
+        "action": "warn",
+        "policy_id": "policy.secrets-output-hook-py",
+        "failure_mode": "closed",
+        "owner": "GRIP"
+      },
+      "user-prompt-secrets-hook.py": {
+        "event": "UserPromptSubmit",
+        "gates": [
+          "secrets-in-user-input"
+        ],
+        "action": "block",
+        "policy_id": "policy.user-prompt-secrets-hook-py",
+        "failure_mode": "closed",
+        "owner": "GRIP"
+      }
+    }
+  },
+  "soft": {
+    "description": "Advisory policies consumed by legacy HAL dispatch.",
+    "hooks": {
+      "anti-drift-hook.py": {
+        "event": [
+          "PostToolUse",
+          "TaskCompleted"
+        ],
+        "purpose": "drift-prevention",
+        "policy_id": "policy.anti-drift-hook-py",
+        "failure_mode": "open",
+        "owner": "GRIP"
+      },
+      "askuserquestion-approval-hook.py": {
+        "event": "PostToolUse",
+        "gates": [
+          "approval-grant"
+        ],
+        "action": "warn",
+        "policy_id": "policy.askuserquestion-approval-hook-py",
+        "failure_mode": "open",
+        "owner": "GRIP"
+      },
+      "auto-pull-after-merge-hook.py": {
+        "event": "PostToolUse",
+        "purpose": "git-sync",
+        "policy_id": "policy.auto-pull-after-merge-hook-py",
+        "failure_mode": "open",
+        "owner": "GRIP"
+      },
+      "cc-handover-hook.py": {
+        "event": "SessionEnd",
+        "purpose": "handover",
+        "policy_id": "policy.cc-handover-hook",
+        "failure_mode": "closed",
+        "owner": "GRIP"
+      },
+      "focus-cards-hook.py": {
+        "event": [
+          "PostToolUse",
+          "SessionStart",
+          "SessionEnd"
+        ],
+        "purpose": "kanban-tracking",
+        "policy_id": "policy.focus-cards-hook-py",
+        "failure_mode": "open",
+        "owner": "GRIP"
+      },
+      "grind-guard.py": {
+        "event": "PostToolUse",
+        "purpose": "grind-guard",
+        "policy_id": "policy.grind-guard-py",
+        "failure_mode": "open",
+        "owner": "GRIP"
+      },
+      "insight-action-verifier.py": {
+        "event": "PostToolUse",
+        "purpose": "insight-reminders",
+        "policy_id": "policy.insight-action-verifier-py",
+        "failure_mode": "open",
+        "owner": "GRIP"
+      },
+      "post-compact-hook.py": {
+        "event": "PostCompact",
+        "purpose": "state-recovery",
+        "policy_id": "policy.post-compact-hook-py",
+        "failure_mode": "open",
+        "owner": "GRIP"
+      },
+      "pre-compact-hook.py": {
+        "event": "PreCompact",
+        "purpose": "state-capture",
+        "policy_id": "policy.pre-compact-hook-py",
+        "failure_mode": "open",
+        "owner": "GRIP"
+      },
+      "quality-posttool-hook.py": {
+        "event": "PostToolUse",
+        "purpose": "advisory-quality",
+        "policy_id": "policy.quality-posttool-hook-py",
+        "failure_mode": "open",
+        "owner": "GRIP"
+      },
+      "rsi-posttool-hook.py": {
+        "event": "PostToolUse",
+        "purpose": "rsi-tracking",
+        "policy_id": "policy.rsi-posttool-hook-py",
+        "failure_mode": "open",
+        "owner": "GRIP"
+      },
+      "sentinel-hook.py": {
+        "event": "ALL",
+        "purpose": "observability",
+        "policy_id": "policy.sentinel-hook-py",
+        "failure_mode": "open",
+        "owner": "GRIP"
+      },
+      "session-broadcast.py": {
+        "event": "PostToolUse",
+        "purpose": "pair-mode",
+        "policy_id": "policy.session-broadcast-py",
+        "failure_mode": "open",
+        "owner": "GRIP"
+      },
+      "skill-usage-tracker.py": {
+        "event": "PreToolUse",
+        "purpose": "analytics",
+        "policy_id": "policy.skill-usage-tracker-py",
+        "failure_mode": "open",
+        "owner": "GRIP"
+      },
+      "stop-failure-handler.py": {
+        "event": "Stop",
+        "purpose": "rsi-auto-recovery",
+        "policy_id": "policy.stop-failure-handler-py",
+        "failure_mode": "open",
+        "owner": "GRIP"
+      }
+    }
+  }
+}

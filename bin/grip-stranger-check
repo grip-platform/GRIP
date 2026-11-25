@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# grip-stranger-check -- install and test a public repository the way its README says.
+# Thin wrapper: lib/stranger_check.py clones anonymously, runs the README's own lines
+# in order with input closed, and reports what failed. Exit 0 green, 1 red, 2 could not run.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec "$here/bin/grip-py" "$here/lib/stranger_check.py" "$@"

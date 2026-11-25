@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Declare which model is driving THIS session. The session is the only thing
+# that knows, so it is the only thing that can say.
+#   grip-session-model "Claude Opus 5"   -> record it
+#   grip-session-model                   -> show what is currently resolved
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../scripts/lib/venv-utils.sh
+source "$ROOT/scripts/lib/venv-utils.sh"
+# GRIP_PY still wins. Otherwise the shared GRIP venv, in either platform's layout;
+# resolve_venv_python's system-python fallback is refused, because the old fixed
+# path never reached a system interpreter either.
+if [[ -z "${GRIP_PY:-}" ]]; then
+    GRIP_PY="$(resolve_venv_python "$HOME/.grip/venv" || true)"
+    if [[ "$GRIP_PY" != "$HOME/.grip/venv/"* ]]; then
+        echo "[grip-session-model] no GRIP venv Python at $HOME/.grip/venv (looked for Scripts/python.exe, bin/python3, bin/python)" >&2
+        exit 1
+    fi
+fi
+exec "$GRIP_PY" "$ROOT/lib/session_identity_cli.py" "$@"

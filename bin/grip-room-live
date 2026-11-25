@@ -1,0 +1,512 @@
+#!/usr/bin/env python3
+"""grip-room-live — watch the GRIP peer room in real time, in a browser.
+
+`mesh room tail` shows you the transcript when you ask. This pushes it as it
+happens, so several models correcting each other is something you WATCH rather
+than poll for.
+
+    grip-room-live                 # http://127.0.0.1:7420
+    grip-room-live --port 7421
+    grip-room-live --room main
+
+Loopback only, read-only, and every rendered field is escaped — the reasons are
+in lib/room_live.py and each one is pinned by a test. There is deliberately no
+flag to bind elsewhere: use an SSH tunnel, which authenticates.
+
+Stop it with Ctrl-C. It holds no lock and writes nothing, so leaving it running
+cannot affect a session or the transcript.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+# The page and the startup lines carry glyphs cp1252 cannot encode, so a
+# default Windows console would crash on the first print. Called before any
+# output, as bin/_grip_console.py requires.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _grip_console import ensure_utf8_stdio  # noqa: E402
+
+ensure_utf8_stdio()
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+import mesh_room  # noqa: E402
+from room_live import (  # noqa: E402
+    DEFAULT_PORT, UnsafeBind, as_event, open_readonly, resolve_bind, rows_since,
+)
+
+PAGE = """<!doctype html><html lang=en><meta charset=utf-8>
+<title>The Room</title>
+<meta name=description content="Live read-only view of the GRIP peer room transcript.">
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>
+/* Swiss nihilism. Black on white. Space is the only device.
+   8px baseline. Type scale 1.25. No colour, no radius, no shadow, no accent.
+   Two rules exist on this page and both are structural. */
+:root{
+  --u:8px;                 /* baseline unit; every vertical value is a multiple */
+  --ink:#000;
+  --ground:#fff;
+  --quiet:#767676;         /* 4.54:1 on white — AA for the small metadata */
+  --hair:#000;
+  --measure:68ch;          /* dense technical prose reads badly past ~70 */
+  --sans:-apple-system,BlinkMacSystemFont,"Helvetica Neue",Helvetica,Arial,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0;background:var(--ground);color:var(--ink);
+  font:400 17px/1.65 var(--sans);
+  -webkit-font-smoothing:antialiased;
+  padding:calc(var(--u)*5) calc(var(--u)*4) calc(var(--u)*20);
+}
+
+/* ---- masthead: one line, one rule, nothing else -------------------------- */
+header{
+  display:flex;align-items:baseline;gap:calc(var(--u)*3);
+  border-bottom:1px solid var(--hair);
+  padding-bottom:calc(var(--u)*2);
+  margin-bottom:calc(var(--u)*10);   /* 80px. The breathing space is the design. */
+  max-width:1100px;
+}
+h1{
+  margin:0;font-size:13px;font-weight:700;
+  letter-spacing:.18em;text-transform:uppercase;
+}
+#state,#count{
+  font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--quiet);
+  font-variant-numeric:tabular-nums;
+}
+/* Connection state is typographic, not chromatic: live is simply not marked. */
+/* The reconnecting text is set in the DOM (see es.onerror), not here: CSS
+   generated content is not reliably exposed to assistive tech, and this
+   rule ALSO served a control character: a CSS unicode escape written as a
+   backslash then 2014 is read by PYTHON first, inside this non-raw string,
+   as the octal escape for U+0081 followed by the digit 4. The sequence is
+   deliberately not spelled out here -- writing it in this comment would
+   reproduce the very bug, which is how it survived its own fix once. */
+
+/* ---- the entry: asymmetric two-column, left rail is the fixed anchor ------ */
+main{max-width:1100px}
+article{
+  display:grid;
+  grid-template-columns:14ch minmax(0,var(--measure));
+  gap:calc(var(--u)*4);
+  padding-top:calc(var(--u)*4);
+  margin-top:calc(var(--u)*8);       /* 64px BETWEEN entries … */
+  border-top:1px solid var(--hair);
+}
+article:first-child{margin-top:0;border-top:0;padding-top:0}
+
+.meta{
+  font-size:11px;line-height:1.5;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--quiet);
+  display:flex;flex-direction:column;gap:calc(var(--u)*.5);
+  font-variant-numeric:tabular-nums;
+}
+.meta .seq{color:var(--ink);font-weight:700}
+.meta .name{color:var(--ink);text-transform:none;letter-spacing:0;
+  font-size:13px;font-weight:700;line-height:1.35;overflow-wrap:anywhere}
+/* Author kind carried by WEIGHT and CASE, never by hue. */
+.meta .kind{font-weight:400}
+.meta .kind:empty{display:none}
+/* A held entry is a HOLE, not an error. Same grid, same type, no colour and no
+   icon — it reads as an absence because it IS one. The only difference is that
+   the body drops to the metadata register, so the eye passes over it. */
+article.held .body{
+  font-size:11px;line-height:1.5;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--quiet);max-width:48ch;
+}
+
+/* THE HEADING. This is what a reader skims, so it is the largest type in the
+   record and the body steps down beneath it. The hierarchy inverted on purpose:
+   before, the wall of prose was the only thing on offer. */
+.tldr{
+  font-size:19px;line-height:1.45;font-weight:600;
+  margin:0 0 calc(var(--u)*2);letter-spacing:-.005em;
+  overflow-wrap:anywhere;
+}
+/* A DERIVED heading is marked with a leading "~" by the writer and set lighter,
+   so a machine-cut summary never reads as one somebody wrote. */
+.tldr.derived{font-weight:400;color:var(--dim)}
+/* WHICH MODEL SPOKE — the half the operator asked for first. Given as type,
+   never a coloured chip: black, uppercase, letterspaced, and the only
+   non-numeric thing in the rail set at full ink. */
+.meta .model{
+  color:var(--ink);font-weight:700;letter-spacing:.08em;
+  text-transform:uppercase;font-size:10px;line-height:1.4;
+}
+/* An entry whose model was never recorded says so, at low contrast. Hiding it
+   would make missing provenance look identical to no provenance being needed,
+   which is the one thing a page about WHO SPOKE must never do. */
+.meta .model.unknown{
+  color:var(--quiet);font-weight:400;letter-spacing:.04em;text-transform:none;
+}
+/* A model the writer never declared, read instead from that session's own
+   transcript. It carries the same "~" the derived heading uses, and sits at
+   mid contrast: more than unrecorded, less than a writer's own word. The
+   distinction is load-bearing — the transcript names the model the SESSION
+   ran on, which is not a claim about which model wrote this one entry. */
+.meta .model.derived{
+  color:var(--dim);font-weight:600;
+}
+.body{
+  font-size:17px;line-height:1.65;
+  white-space:pre-wrap;overflow-wrap:anywhere;
+  margin:0;
+}
+/* Paragraph separation inside an entry comes from the source newlines via
+   pre-wrap — roughly one line — against 64px BETWEEN entries. That ~8x ratio is
+   the whole readability argument: the eye never has to guess where one speaker
+   stops, and it costs no rule, no card and no colour to say so. */
+
+/* Technical tokens get monospace; the page does not. */
+
+@media (max-width:760px){
+  body{padding:calc(var(--u)*3) calc(var(--u)*2.5) calc(var(--u)*14)}
+  header{margin-bottom:calc(var(--u)*6)}
+  article{
+    grid-template-columns:minmax(0,1fr);
+    gap:calc(var(--u)*2);
+    margin-top:calc(var(--u)*6);
+    padding-top:calc(var(--u)*3);
+  }
+  /* The rail becomes a single line above the body — same information, one axis. */
+  .meta{flex-direction:row;flex-wrap:wrap;gap:calc(var(--u)*1.5);align-items:baseline}
+  .body{font-size:16px}
+}
+@media (min-width:1800px){
+  /* Wide screens: the margin grows, the measure does NOT. */
+  body{padding-left:calc(var(--u)*12);padding-right:calc(var(--u)*12)}
+}
+@media (prefers-color-scheme:dark){
+  /* Honour the system without abandoning the brief: still one ink, one ground. */
+  :root{--ink:#fff;--ground:#000;--hair:#fff;--quiet:#8f8f8f;--dim:#c9c9c9}
+}
+@media (prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+.vh{position:absolute;width:1px;height:1px;margin:-1px;padding:0;
+    overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+#pause{font:inherit;font-size:11px;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--ink);background:var(--ground);border:1px solid var(--hair);
+  padding:calc(var(--u)*.5) calc(var(--u)*1.5);cursor:pointer;margin-top:calc(var(--u)*2)}
+article:focus{outline:none}
+article:focus-visible{outline:2px solid var(--ink);outline-offset:6px}
+:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
+</style>
+
+<header>
+  <h1>The Room</h1>
+  <!-- A STATUS region, not a live feed. aria-live on the ENTRIES would
+       serially read every model's full message body aloud; announcing the
+       SUMMARY gives a screen-reader user the same glance a sighted reader
+       takes from the masthead. WCAG 4.1.3. -->
+  <p id=status role=status aria-live=polite aria-atomic=true>
+    <span id=count></span><span id=state data-on="0"></span>
+  </p>
+  <button id=pause type=button aria-pressed=false>Pause</button>
+</header>
+<!-- Three elements, because each role has a legal host and they are not the
+     same element. <main> is the landmark. The heading names the feed and sits
+     OUTSIDE it: role=feed permits only role=article children, so a heading
+     inside it is an aria-required-children violation. And role=feed is not an
+     allowed role on <main> at all -- both were real Lighthouse failures
+     (aria-allowed-role, aria-required-children) introduced by putting all
+     three jobs on one tag. The feed is deliberately NOT a live region: it
+     marks a navigable stream a reader moves through at their own pace. -->
+<main>
+  <h2 id=feedlabel class=vh>Room transcript</h2>
+  <div id=feed role=feed aria-labelledby=feedlabel aria-busy=true></div>
+</main>
+
+<script>
+const feed  = document.getElementById('feed');
+const state = document.getElementById('state');
+const count = document.getElementById('count');
+const pause = document.getElementById('pause');
+let n = 0, held = 0, paused = false;
+const queue = [];
+
+/* WCAG 2.2.2. A reader can stop the stream, catch up, and resume; nothing is
+   dropped while paused, it queues. This is also the page's FIRST focusable
+   element, which is what finally makes the :focus-visible rule reachable. */
+/* role=feed carries a KEYBOARD CONTRACT, and declaring the role without it is
+   a promise the page does not keep: Page Down / Page Up move between articles,
+   Control+End reaches the newest, Control+Home the first. Implemented here
+   because a live transcript is something you READ -- moving entry by entry is
+   how you follow an argument between two models without losing your place, and
+   it costs a mouse-less reader nothing to learn. */
+function articles(){ return Array.from(feed.querySelectorAll('article')); }
+function step(dir){
+  const all = articles();
+  if (!all.length) return;
+  const here = document.activeElement && document.activeElement.closest('article');
+  let i = here ? all.indexOf(here) + dir : (dir > 0 ? 0 : all.length - 1);
+  i = Math.max(0, Math.min(all.length - 1, i));
+  all[i].focus();
+  all[i].scrollIntoView({block:'nearest'});
+}
+document.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'BUTTON') return;
+  const all = articles();
+  if (e.key === 'PageDown')      { e.preventDefault(); step(+1); }
+  else if (e.key === 'PageUp')   { e.preventDefault(); step(-1); }
+  else if (e.key === 'End'  && e.ctrlKey && all.length) { e.preventDefault(); all[all.length-1].focus(); }
+  else if (e.key === 'Home' && e.ctrlKey && all.length) { e.preventDefault(); all[0].focus(); }
+});
+
+pause.addEventListener('click', () => {
+  paused = !paused;
+  pause.setAttribute('aria-pressed', String(paused));
+  pause.textContent = paused ? 'Resume' : 'Pause';
+  if (!paused) queue.splice(0).forEach(render);
+});
+
+/* Auto-scroll ONLY when the reader is already at the bottom. Yanking the page
+   away from someone reading history is hostile, and a live feed that fights you
+   is worse than one you refresh. */
+function atBottom(){
+  return (window.innerHeight + window.scrollY) >= (document.body.offsetHeight - 120);
+}
+
+const es = new EventSource('/events');
+es.onopen  = () => {
+  state.dataset.on = '1'; state.textContent = '';
+  feed.setAttribute('aria-busy', 'false');
+};
+es.onerror = () => { state.dataset.on = '0'; state.textContent = ' \u2014 reconnecting'; };
+
+/* The server emits `event: error` when the stream stops. onmessage fires ONLY
+   for UNNAMED frames, and es.onerror is the TRANSPORT handler -- so without
+   this listener the server's own explanation was parsed, discarded, and the
+   masthead went on saying connected while the feed had quietly stopped. */
+es.addEventListener('error', (e) => {
+  if (e && e.data) { state.dataset.on = '0'; state.textContent = ' \u2014 ' + e.data; }
+});
+
+es.onmessage = (e) => {
+  const m = JSON.parse(e.data);
+  paused ? queue.push(m) : render(m);
+};
+
+function render(m){
+  const stick = atBottom();
+  n += 1;
+  // Counted BEFORE the masthead is written. It used to be incremented 45 lines
+  // below, so the frame carrying a held entry rendered without it -- and if a
+  // held entry was the most recent, the page under-reported the very blind
+  // spot the held design exists to advertise.
+  if (m.body.startsWith('[HELD')) held += 1;
+  count.textContent = n + (n === 1 ? ' entry' : ' entries')
+                    + (held ? ', ' + held + ' held' : '');
+
+  const art = document.createElement('article');
+  art.setAttribute('role', 'article');
+  art.setAttribute('aria-posinset', String(n));
+  art.setAttribute('aria-setsize', '-1');   /* open-ended stream */
+  art.tabIndex = -1;
+
+  const bodyWrap = document.createElement('div');
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+  const seq = document.createElement('span'); seq.className='seq'; seq.textContent = m.seq;
+  seq.setAttribute('aria-label', 'Entry ' + m.seq);   /* a bare number names nothing */
+  const nm  = document.createElement('span'); nm.className='name';  nm.textContent  = m.name;
+  // Kind by SUBTRACTION. 'session' and 'say' are the overwhelming defaults, so
+  // they are not printed at all — an absent label MEANS them. Only the
+  // exceptions (agent, human; ask, verdict, veto, join) cost a reader any
+  // attention, which is what 'minimal to the max' actually buys.
+  const marks = [];
+  if (m.who && m.who !== 'session') marks.push(m.who);
+  if (m.kind && m.kind !== 'say')   marks.push(m.kind);
+  const kd  = document.createElement('span'); kd.className='kind';
+  kd.textContent = marks.join(' / ');
+  const md  = document.createElement('span');
+  const derived = m.model && m.model_source === 'derived';
+  md.className = m.model ? (derived ? 'model derived' : 'model') : 'model unknown';
+  md.textContent = m.model ? (derived ? '~' + m.model : m.model) : 'model unrecorded';
+  // OCCAM. The timestamp is gone. Order is already carried twice — by the
+  // sequence number and by position on the page — and a third encoding of the
+  // same fact is the thing a razor removes. The sequence number STAYS because
+  // it does work nothing else does: a reply points at it.
+  meta.append(seq, nm, md, kd);
+  if (m.reply_to) {
+    const r = document.createElement('span');
+    r.textContent = 're ' + m.reply_to;
+    r.setAttribute('aria-label', 'In reply to entry ' + m.reply_to);
+    meta.append(r);
+  }
+
+  // The heading goes ABOVE the body, and is the first thing rendered.
+  if (m.tldr) {
+    const derived = m.tldr.charAt(0) === '~';
+    /* A HEADING, not a div. It is the largest type on the record and what a
+       reader skims, so it belongs in the heading list too -- h3 under the
+       visually-hidden h2 keeps the order legal. It also NAMES the article. */
+    const h = document.createElement('h3');
+    h.className = derived ? 'tldr derived' : 'tldr';
+    h.id = 'tldr-' + m.seq;
+    // No regex: the marker is a single known character, so slice says exactly
+    // what it does. A backslash class here would also have to survive a Python
+    // string on the way out, which is how a NUL byte reached this page once.
+    h.textContent = derived ? m.tldr.slice(1).trim() : m.tldr;
+    art.setAttribute('aria-labelledby', h.id);
+    bodyWrap.append(h);
+  } else {
+    meta.id = 'meta-' + m.seq;          /* an unnamed article announces "article" */
+    art.setAttribute('aria-labelledby', meta.id);
+  }
+  const body = document.createElement('div');
+  body.className = 'body';
+  body.textContent = m.body;          /* never innerHTML */
+  // A transcript of models correcting each other should also record where it
+  // has been made to stop. An entry the shield HELD renders as a visible hole
+  // rather than being silently dropped — the page states its own blind spot in
+  // the same typography as everything else, and the masthead keeps the count.
+  if (m.body.startsWith('[HELD')) { art.classList.add('held'); }
+
+  bodyWrap.append(body);
+  art.append(meta, bodyWrap);
+  feed.append(art);
+  if (stick) window.scrollTo(0, document.body.scrollHeight);
+}
+</script>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    db_path = ""
+    room = "main"
+    allowed_hosts = frozenset()
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        """Silent: the access log would mirror the transcript's shape."""
+
+    def _origin_ok(self) -> bool:
+        """Reject a request that did not come from this machine's own browser tab.
+
+        WHY THIS EXISTS, and it is a correction of my own reasoning. The first
+        version bound to loopback and treated that as the whole defence. It is
+        not: binding to 127.0.0.1 controls which interface accepts packets, NOT
+        which page may read the response. A browser on this machine will happily
+        connect to 127.0.0.1 on behalf of ANY site the operator visits, and DNS
+        rebinding is the standard, automated defeat of exactly that assumption —
+        the attacker's domain re-resolves to 127.0.0.1, so the browser believes
+        it is same-origin and CORS never applies.
+
+        PROVED against the running instance by an adversarial review, not
+        theorised: `curl -H "Host: evil.example.com" http://127.0.0.1:7420/events`
+        returned the whole transcript — absolute worktree paths, the operator's
+        handle, peer session ids, and VPS internals including a named API-key
+        variable. The docstring one screen above reasoned carefully about why
+        there must be no --allow-remote flag "because that would be an
+        unauthenticated broadcast", while leaving that same broadcast open
+        conditionally, to any operator who visits a hostile page with the viewer
+        running. Which the design encourages, since it is meant to be left open.
+
+        Two checks, because they catch different attacks. HOST defeats rebinding:
+        the browser sends the attacker's hostname, which is not in the allowlist,
+        and the real value is unforgeable from a page. ORIGIN defeats an ordinary
+        cross-origin fetch: a same-origin EventSource sends no Origin at all, so
+        its presence means the request came from a page that is not us.
+        """
+        host = (self.headers.get("Host") or "").strip().lower()
+        if host not in self.allowed_hosts:
+            return False
+        # A legitimate same-origin EventSource or navigation sends no Origin.
+        return self.headers.get("Origin") is None
+
+    def do_GET(self):  # noqa: N802
+        if not self._origin_ok():
+            self.send_error(403, "this viewer serves its own origin only")
+            return
+        if self.path == "/":
+            return self._page()
+        if self.path.startswith("/events"):
+            return self._stream()
+        self.send_error(404)
+
+    def _page(self):
+        raw = PAGE.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        # No remote assets are referenced; say so, so a later edit cannot add one.
+        self.send_header("Content-Security-Policy",
+                         "default-src 'none'; style-src 'unsafe-inline'; "
+                         "script-src 'unsafe-inline'; connect-src 'self'")
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _stream(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        conn = open_readonly(self.db_path)
+        seq = 0
+        try:
+            while True:
+                for row in rows_since(conn, seq, room=self.room):
+                    self.wfile.write(as_event(row).encode())
+                    seq = row["seq"]
+                self.wfile.flush()
+                time.sleep(1.0)
+                self.wfile.write(b": keep-alive\n\n")   # holds idle proxies open
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass          # the tab closed; nothing to clean up, nothing written
+        except Exception as exc:          # noqa: BLE001
+            # ANY other error must not escape. A single malformed row — a
+            # reply_to that is not an int, say, which post()'s type hint does
+            # not enforce — would otherwise raise, and because each reconnect
+            # replays from the same cursor it would brick the viewer for every
+            # client, permanently, on one bad message. Report it in-band and
+            # stop this stream only.
+            try:
+                self.wfile.write(
+                    f"event: error\ndata: stream stopped: "
+                    f"{type(exc).__name__}\n\n".encode())
+                self.wfile.flush()
+            except OSError:
+                pass
+        finally:
+            conn.close()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Watch the GRIP peer room live")
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT)
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--room", default="main")
+    ap.add_argument("--db", default=None)
+    ns = ap.parse_args()
+    try:
+        host = resolve_bind(ns.host)
+    except UnsafeBind as exc:
+        print(f"[grip-room-live] {exc}", file=sys.stderr)
+        return 2
+    Handler.db_path = ns.db or mesh_room.db_path()
+    Handler.room = ns.room
+    Handler.allowed_hosts = frozenset({
+        f"{host}:{ns.port}", f"localhost:{ns.port}", f"[::1]:{ns.port}",
+    })
+    srv = ThreadingHTTPServer((host, ns.port), Handler)
+    print(f"[grip-room-live] room {ns.room!r} -> http://{host}:{ns.port}", file=sys.stderr)
+    print(f"[grip-room-live] reading {Handler.db_path} read-only. Ctrl-C to stop.",
+          file=sys.stderr)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[grip-room-live] stopped.", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# grip-opencode — launch OpenCode wired to non-Anthropic providers via HAL keychain.
+#
+# Sovereign (non-Anthropic) models — zero Anthropic egress:
+#   deepseek/deepseek-chat      direct DeepSeek Chat
+#   deepseek/deepseek-reasoner  direct DeepSeek Reasoner
+#   deepseek/deepseek-v4-pro    direct DeepSeek V4 Pro
+#   oai/gpt-4o-mini            direct OpenAI GPT-4o-mini
+#   oai/gpt-4o                 direct OpenAI GPT-4o
+#
+# Anthropic (via HAL P1 gateway — needs gateway running at :4010):
+#   hal/claude-opus-4-8
+#
+#   grip-opencode                               # interactive: pick model
+#   grip-opencode run -m deepseek/deepseek-chat "..."   # non-interactive
+#   grip-opencode run -m oai/gpt-4o-mini "..."          # non-interactive
+#
+# Keys are read from macOS Keychain inside this process — never in argv.
+# Provider wiring lives in ~/.config/opencode/opencode.json.
+# GRIP safety gates run via ~/.config/opencode/plugins/grip-safety.js.
+set -euo pipefail
+
+# ── Cross-platform keychain reader ──
+# macOS: security(1) — Linux: secret-tool — Windows: PowerShell Credential Vault.
+_kv_get() {
+  case "$(uname -s)" in
+    Darwin)
+      security find-generic-password -s "$1" -w 2>/dev/null
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      GK_N="$1" powershell -NoProfile -Command '
+        $v=[Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime]::new();
+        try { $c=$v.Retrieve($env:GK_N,"grip"); $c.RetrievePassword(); [Console]::Out.Write($c.Password) } catch { exit 1 }' 2>/dev/null
+      ;;
+    Linux)
+      secret-tool lookup service "$1" 2>/dev/null
+      ;;
+  esac
+}
+
+# ── HAL P1 gateway key (for hal/* models only; gateway must be up at :4010) ──
+HAL_KEY=""
+if HAL_KEY=$(_kv_get grip-claude-oauth) && [ -n "$HAL_KEY" ]; then
+  :  # subscription token (sk-ant-oat) preferred; survives the gateway since the OAuth guard
+elif HAL_KEY=$(_kv_get grip-anthropic-external) && [ -n "$HAL_KEY" ]; then
+  export HAL_GATEWAY_KEY="$HAL_KEY"
+fi
+export HAL_GATEWAY_MULTIPROVIDER=1
+
+# ── DeepSeek (sovereign — zero Anthropic egress) ──
+DS_KEY=""
+if DS_KEY=$(_kv_get grip-deepseek) && [ -n "$DS_KEY" ]; then
+  export DEEPSEEK_API_KEY="$DS_KEY"
+fi
+
+# ── OpenAI (sovereign — zero Anthropic egress; per-token, so opt-in only) ──
+# GPT runs on the ChatGPT subscription (rules/gpt-on-the-subscription-never-credits.md).
+# The key reaches OpenCode only when GRIP_CODEX_ALLOW_PAID is exactly "1".
+# shellcheck source=../lib/openai-key.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/openai-key.sh"
+OA_KEY=""
+if OA_KEY=$(grip_openai_api_key _kv_get) && [ -n "$OA_KEY" ]; then
+  export OPENAI_API_KEY="$OA_KEY"
+else
+  echo "grip-opencode: OpenAI models are off (they bill per token); set GRIP_CODEX_ALLOW_PAID=1 to allow paid spend" >&2
+fi
+
+# ── Gemini (sovereign — zero Anthropic egress) ──
+GM_KEY=""
+if GM_KEY=$(_kv_get grip-gemini) && [ -n "$GM_KEY" ]; then
+  export GEMINI_API_KEY="$GM_KEY"
+fi
+
+# ── Anthropic direct (fallback) ──
+AN_KEY=""
+if AN_KEY=$(_kv_get grip-anthropic-external) && [ -n "$AN_KEY" ]; then
+  export ANTHROPIC_API_KEY="$AN_KEY"
+fi
+
+if [ -z "$HAL_KEY" ] && [ -z "$DS_KEY" ] && [ -z "$OA_KEY" ] && [ -z "$GM_KEY" ]; then
+  echo "grip-opencode: no provider keys found in keychain." >&2
+  echo "  Expected at least one of: grip-anthropic-external, grip-deepseek, grip-openai, grip-gemini" >&2
+  exit 1
+fi
+
+# ── Portable config bootstrap: write the sovereign provider config on first run ──
+# Makes the sovereign setup work on any machine with the keychain keys: clone GRIP,
+# run grip-opencode, and the OpenCode provider wiring is written from the repo
+# template. Idempotent — never clobbers an existing (possibly user-edited) config.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OC_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json"
+if [ ! -f "$OC_CONFIG" ]; then
+  TEMPLATE="$SCRIPT_DIR/../config/opencode-sovereign.json"
+  if [ -f "$TEMPLATE" ]; then
+    mkdir -p "$(dirname "$OC_CONFIG")"
+    cp "$TEMPLATE" "$OC_CONFIG"
+    echo "grip-opencode: wrote sovereign provider config -> $OC_CONFIG" >&2
+  else
+    echo "grip-opencode: WARNING — config template missing at $TEMPLATE" >&2
+  fi
+fi
+
+# ── GRIP safety plugin: link the OpenCode safety gate (task #79) on first run ──
+# Closes the safety half of portability: a fresh sovereign OpenCode must still run
+# GRIP's DENY gates. Symlinked (not copied) so repo updates to the gate propagate.
+OC_PLUGIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins"
+SAFETY_SRC="$SCRIPT_DIR/../integrations/opencode/grip-safety.js"
+if [ -f "$SAFETY_SRC" ] && [ ! -e "$OC_PLUGIN_DIR/grip-safety.js" ]; then
+  mkdir -p "$OC_PLUGIN_DIR"
+  ln -sf "$SAFETY_SRC" "$OC_PLUGIN_DIR/grip-safety.js"
+  echo "grip-opencode: linked GRIP safety plugin -> $OC_PLUGIN_DIR/grip-safety.js" >&2
+fi
+
+# ── GRIP canonical style: the per-turn system-prompt transform (grip-style.js) ──
+# OpenCode reads ~/.config/opencode/AGENTS.md at session start, where bin/grip-harness
+# opencode writes the projected style block. The plugin appends the same block to
+# the system prompt on EVERY request, so the style survives compaction. Symlinked
+# like the safety gate, so repo updates to the block's reader propagate.
+STYLE_SRC="$SCRIPT_DIR/../integrations/opencode/grip-style.js"
+if [ -f "$STYLE_SRC" ] && [ ! -e "$OC_PLUGIN_DIR/grip-style.js" ]; then
+  mkdir -p "$OC_PLUGIN_DIR"
+  ln -sf "$STYLE_SRC" "$OC_PLUGIN_DIR/grip-style.js"
+  echo "grip-opencode: linked GRIP style plugin -> $OC_PLUGIN_DIR/grip-style.js" >&2
+fi
+
+exec opencode "$@"

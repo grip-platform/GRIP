@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# grip-wa-visibility -- watch whether WhatsApp contacts' profiles are visible to your number.
+# WhatsApp never reports blocks: "hidden" can mean a block or a privacy setting.
+# Everything else is in lib/wa_visibility_watch.py; run with --help for the commands.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec "$here/bin/grip-py" "$here/lib/wa_visibility_watch.py" "$@"

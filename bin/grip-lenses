@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""grip-lenses — decision-lens advisory CLI.
+
+Runs the deterministic four-lens evaluator (evidence / consistency /
+challenge / synthesis) over a decision context and prints a structured
+advisory report. Advisory only: exits 0 on valid input regardless of
+verdict — the verdict lives in the report, never in the exit code.
+
+Usage:
+    grip-lenses <file>            Evaluate a file
+    echo "context" | grip-lenses  Evaluate stdin
+    grip-lenses <file> --json     Emit JSON instead of text
+"""
+
+import sys
+from pathlib import Path
+
+# The code comes from the checkout this script lives in, never from $CLAUDE_DIR:
+# that names the state directory, which in a worktree is the shared tree and in
+# a test is an empty folder, so importing through it ran the wrong copy or none.
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from lib.decision_lenses import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main())

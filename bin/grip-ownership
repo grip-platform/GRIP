@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""grip-ownership -- who owns each dirty file and each stash in this repository?
+
+The Clean Ledger's one-command reader. It reads every session manifest under
+<git-common-dir>/grip-ledger/ (written by grip-git, grip-stash and
+lib/grip_dirty_snapshot.py) and attributes the live dirty set and the shared
+stash stack to the sessions that made them.
+
+Usage:
+    grip-ownership [--tree PATH] [--all-worktrees] [--json] [--strict] [--quiet]
+    grip ownership ...            (same thing, via bin/grip)
+
+    --tree PATH       the repository to read (default: the current directory,
+                      else the GRIP install dir)
+    --all-worktrees   also read every linked worktree of that repository
+    --json            machine-readable report (per file, never grouped)
+    --strict          count CONTESTED files and stashes as unattributed
+    --quiet           print only the verdict line
+
+Exit codes -- note that 3 is NOT success, because "could not tell" must never
+look like "everything is owned":
+    0  ATTRIBUTED     every dirty file and stash has an owner
+    1  UNATTRIBUTED   at least one does not (the table says which)
+    3  INDETERMINATE  git failed, or a manifest is corrupt
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Optional, Sequence
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+import grip_dirty_snapshot as ledger  # noqa: E402
+import grip_ownership as ownership  # noqa: E402
+from claude_dir import get_claude_dir  # noqa: E402
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="grip-ownership", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--tree", default=None)
+    parser.add_argument("--all-worktrees", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--strict", action="store_true")
+    parser.add_argument("--quiet", action="store_true")
+    return parser
+
+
+def _caller_sid() -> Optional[str]:
+    try:
+        return ledger.resolve_session_id()
+    except ledger.InvalidSessionId:
+        return None
+
+
+def base_ctx(tree: Optional[str]) -> ledger.GitCtx:
+    """--tree, else the current directory, else the GRIP install dir."""
+    if tree:
+        return ledger.ctx_for(tree)
+    here = ledger.ctx_for(None)
+    try:
+        here.toplevel()
+        return here
+    except ledger.LedgerError:
+        return ledger.ctx_for(str(get_claude_dir()))
+
+
+def scan_trees(ctx: ledger.GitCtx, manifests: dict, everywhere: bool) -> list[dict]:
+    if not everywhere:
+        return [ownership.scan_tree(ctx, manifests)]
+    trees = []
+    for path in ownership.worktree_paths(ctx):
+        if not os.path.isdir(path):
+            trees.append(ownership.missing_tree(path))
+            continue
+        trees.append(ownership.scan_tree(ledger.ctx_for(path, ctx.argv0[0]), manifests))
+    return trees
+
+
+def collect(args: argparse.Namespace) -> dict:
+    ctx = base_ctx(args.tree)
+    manifests, corrupt = ownership.load_manifests(ctx.ledger_dir())
+    trees = scan_trees(ctx, manifests, args.all_worktrees)
+    stashes = ownership.scan_stashes(ctx, manifests)
+    return ownership.build_report(trees, stashes, corrupt, _caller_sid(), args.strict)
+
+
+def main(argv: Sequence[str]) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        report = collect(args)
+    except ledger.LedgerError as exc:
+        print(f"[grip-ownership] INDETERMINATE: {exc}", file=sys.stderr)
+        return 3
+    if args.json:
+        print(json.dumps(report, indent=1))
+    elif args.quiet:
+        print(ownership.render_table(report).splitlines()[-1])
+    else:
+        print(ownership.render_table(report))
+    return report["exit_code"]
+
+
+if __name__ == "__main__":
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(errors="backslashreplace")
+    raise SystemExit(main(sys.argv[1:]))

@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# grip-afk — Away From Keyboard mode (thin composition — reinvents nothing).
+#
+# The operator steps away and types /afk; GRIP keeps working autonomously
+# (the /auto /rsi spirit) until the operator returns and types /back.
+#
+# Composition (the whole design):
+#   * Marker lifecycle → the generic session-mode shim (bin/grip-mode <name> …,
+#     lib/session_mode.py): atomic marker writes, TTL honoured on READ (an
+#     expired marker reads INACTIVE and is reaped — fixing the staleness bug
+#     the first hand-rolled grip-afk had), audit log at logs/<name>-mode.log.
+#   * Session-scoped marker (2026-07-13 fix) → the mode NAME is keyed by
+#     CLAUDE_CODE_SESSION_ID (the per-session id the harness exports to Bash;
+#     NOT CLAUDE_SESSION_ID, which is unset there) so N concurrent sessions do
+#     NOT share one global "afk"
+#     marker. Before this, every session's /back read the same global marker +
+#     the same shared backlog, so six sessions all resumed the SAME work. Now
+#     each session owns state/session/afk-<sid>-mode.json and /back resumes only
+#     THAT session's own recorded intent. Absent/degenerate id → global "afk"
+#     (backward-compatible with non-harness callers and pre-fix markers).
+#   * Halting-gate relaxation → grip-yolo, PAIRED with the marker flip so GRIP
+#     proceeds on non-destructive work without pausing for confirmation.
+#     Quality gates (DRY/KISS/CC/no-stubs) STILL fire. Non-fatal if absent.
+#   * NEVER authorises the four HALT classes (rules/operational-context.md):
+#     irreversible/destructive ops, direction-A-vs-B forks, operator-only
+#     information gaps, cross-client commercial decisions — those are deferred
+#     to a "needs you" list surfaced on /back, never done blind. Force-push
+#     and remote-history rewrites never pass (inherited from grip-yolo).
+#
+# Usage
+#   grip-afk on ["note"] [ttl_seconds]   # default 43200 (12h); shim clamps to 12h max
+#   grip-afk off                          # alias: back
+#   grip-afk status
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Test seams: point at fakes so tests never touch the real shim or yolo gate.
+GRIP_MODE="${GRIP_AFK_MODE_BIN:-$SCRIPT_DIR/grip-mode}"
+GRIP_YOLO="${GRIP_AFK_YOLO_BIN:-$SCRIPT_DIR/grip-yolo}"
+
+# The marker shim is a hard dependency — fail with a plain-language error,
+# never a bash trace (the yolo pairing below stays soft by contrast).
+if [ ! -x "$GRIP_MODE" ]; then
+  echo "grip-afk: grip-mode not found at $GRIP_MODE — is GRIP installed correctly?" >&2
+  exit 1
+fi
+
+# Session-scope the AFK marker name by the per-session id the harness exports to
+# Bash-tool subprocesses. That var is CLAUDE_CODE_SESSION_ID — verified
+# 2026-07-13: a bare CLAUDE_SESSION_ID is UNSET in the Bash env (only the hook
+# PAYLOAD carries session_id), so keying on it silently fell back to the global
+# "afk" name and scoped nothing. Prefer the real var; keep CLAUDE_SESSION_ID as a
+# compat fallback; scope by the first 16 chars (64-bit — collision-negligible
+# for any realistic concurrent-session count; sanitised to the [a-z0-9] the
+# mode-name validator accepts). Empty / non-conforming id → the global "afk"
+# name, so nothing changes for non-harness callers or a pre-fix global marker.
+_scoped_afk_name() {
+  local raw sid
+  raw="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-}}"
+  sid="$(printf '%s' "$raw" | tr 'A-Z' 'a-z' | tr -cd 'a-z0-9')"
+  sid="${sid:0:16}"
+  if [ -n "$sid" ]; then printf 'afk-%s' "$sid"; else printf 'afk'; fi
+}
+MODE_NAME="$(_scoped_afk_name)"
+
+cmd="${1:-status}"
+case "$cmd" in
+  on)
+    # Accept BOTH the positional form (grip-afk on "note" [ttl_seconds]) AND the
+    # flag form (grip-afk on --note "text" --ttl SECONDS, any order). Fixes #4046:
+    # the old note="${2:-}" / ttl="${3:-}" silently mis-mapped a flag-style call
+    # (e.g. `on --note X` made note="--note", ttl="X" → a cryptic downstream
+    # "invalid int value" and afk never armed). Feature-complete over the promised
+    # input domain, per rules/feature-complete-input-domain.md.
+    shift  # drop "on"; $@ is now the argument list
+    note=""
+    ttl="43200"
+    note_set=0
+    ttl_set=0
+    pos=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --ttl)    ttl="${2:-}"; ttl_set=1; shift 2 ;;
+        --ttl=*)  ttl="${1#--ttl=}"; ttl_set=1; shift ;;
+        --note)   note="${2:-}"; note_set=1; shift 2 ;;
+        --note=*) note="${1#--note=}"; note_set=1; shift ;;
+        --)       shift; while [ $# -gt 0 ]; do pos+=("$1"); shift; done ;;
+        --*)      echo "grip-afk on: unknown flag '$1'. Usage: grip-afk on [\"note\"] [ttl_seconds]  OR  grip-afk on --note \"text\" --ttl SECONDS" >&2; exit 2 ;;
+        *)        pos+=("$1"); shift ;;
+      esac
+    done
+    # Positional back-compat: first bare arg = note (unless --note given), second
+    # bare arg = ttl (unless --ttl given).
+    if [ "$note_set" -eq 0 ] && [ "${#pos[@]}" -ge 1 ]; then note="${pos[0]}"; fi
+    if [ "$ttl_set" -eq 0 ] && [ "${#pos[@]}" -ge 2 ]; then ttl="${pos[1]}"; fi
+    # Validate ttl is a non-negative integer HERE, with a plain-language error,
+    # rather than leaking the downstream shim's cryptic "invalid int value" (#4046).
+    case "$ttl" in
+      ''|*[!0-9]*)
+        echo "grip-afk on: ttl_seconds must be a positive integer number of seconds, got '$ttl'. Usage: grip-afk on [\"note\"] [ttl_seconds]  OR  grip-afk on --note \"text\" --ttl SECONDS" >&2
+        exit 2 ;;
+    esac
+    "$GRIP_MODE" "$MODE_NAME" on --ttl "$ttl" --note "$note"
+    # Pair with yolo: relax the HALTING gates only. Non-fatal if unavailable.
+    "$GRIP_YOLO" on --reason "afk autonomous continuation${note:+: $note}" --ttl "$ttl" >/dev/null 2>&1 || true
+    echo "AFK ON — GRIP continues autonomously until /back (TTL-bounded). marker=$MODE_NAME"
+    ;;
+  off|back)
+    # Capture the window BEFORE clearing: it is the durable digest anchor the
+    # returning agent uses (git log --since works even across compaction). The
+    # note is THIS session's own recorded intent — /back resumes THIS, never the
+    # shared backlog or another concurrent session's work.
+    status_out="$("$GRIP_MODE" "$MODE_NAME" status 2>/dev/null || true)"
+    window_out="$status_out"
+    lapsed=""
+    # A marker that lapsed before /back is gone (status just reaped it), and an
+    # unreadable one reads INACTIVE too, but the audit log still holds the
+    # window's start and note: read them before `off` closes the window
+    # (GRIP#9244). The note says only what is known: no live marker.
+    case "$status_out" in
+      *": ACTIVE"*) ;;
+      *)
+        window_out="$("$GRIP_MODE" "$MODE_NAME" window 2>/dev/null || true)"
+        lapsed=" (no live marker at /back; start read from logs/${MODE_NAME}-mode.log)"
+        ;;
+    esac
+    started="$(printf '%s\n' "$window_out" | sed -n 's/^  started: *//p')"
+    note="$(printf '%s\n' "$window_out" | sed -n 's/^  note: *//p')"
+    "$GRIP_MODE" "$MODE_NAME" off
+    "$GRIP_YOLO" off >/dev/null 2>&1 || true
+    echo "AFK OFF — interactive control restored."
+    # Window line only for a genuine window, live or lapsed. A degenerate marker
+    # (no usable started timestamp, e.g. a pre-shim schema) gets an honest
+    # "partial" annotation instead of a nonsense --since anchor (AGORA #3964).
+    case "$window_out" in
+      *": ACTIVE"*|*": OPEN WINDOW"*)
+        if [ -n "$started" ] && [ "$started" != "None" ]; then
+          echo "AFK window: $started -> $(date -u +%Y-%m-%dT%H:%M:%SZ) (digest anchor: git log --since \"$started\")$lapsed"
+        else
+          echo "AFK window: partial — marker had no usable started timestamp; digest falls back to session context + logs/${MODE_NAME}-mode.log"
+        fi
+        # Surface THIS session's own intent so /back resumes it (not the shared
+        # backlog). Empty/None note → no line (honest: nothing was recorded).
+        if [ -n "${note:-}" ] && [ "$note" != "None" ]; then
+          echo "AFK intent (resume THIS session's own work): $note"
+        fi
+        ;;
+    esac
+    ;;
+  status)
+    "$GRIP_MODE" "$MODE_NAME" status
+    ;;
+  *)
+    echo "usage: grip-afk on [\"note\"] [ttl_seconds] | off | back | status" >&2
+    exit 2
+    ;;
+esac

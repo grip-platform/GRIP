@@ -1,0 +1,42 @@
+name: create
+description: Meta-mode for creating new modes with quality gates
+version: 1.0.0
+effort: high
+triggers:
+- /mode create
+- create a mode
+- new mode
+- define mode
+skills:
+  always:
+  - skill-creation-best-practices
+  - creating-skills
+  - create-mode
+  optional: []
+token_budget: ~2000
+foundation: true
+stacks_with:
+- ut++
+- asking-users
+- creating-wizards
+- hitl
+- context-gate
+prompt_injection: "[MODE: CREATE]\n\nMode creation wizard active.\n\nTo create a new mode, gather:\n1. Mode name (single word,\
+  \ lowercase)\n2. Description (purpose statement)\n3. Triggers (commands and phrases)\n4. Skills always loaded\n5. Skills\
+  \ optionally available\n6. Token budget estimate\n7. Prompt injection (context-specific instructions)\n\nQuality gates (from\
+  \ skill-creation-best-practices):\n- Name: lowercase, hyphens allowed\n- Description: clear, includes \"Use when\"\n- Skills:\
+  \ must exist in ~/.claude/skills/\n- Token budget: realistic estimate\n\nMode definition schema:\n```yaml\nname: mode-name\n\
+  description: Purpose statement. Use when...\nversion: 1.0.0\ntriggers:\n  - /mode name\n  - \"natural language\"\nskills:\n\
+  \  always: [skill1, skill2]\n  optional: [skill3]\ntoken_budget: ~N\nfoundation: true\nstacks_with: [ut++, asking-users, creating-wizards, hitl,\
+  \ context-gate]\nprompt_injection: |\n  Context-specific instructions...\ncontext:\n  - Use case 1\n  - Use case 2\n```\n\
+  \nAfter creation:\n1. Save to ~/.claude/modes/definitions/{name}-mode.yaml\n2. Test with /mode {name}\n3. Verify skills\
+  \ load correctly\n"
+wave:
+  category: orthogonal
+broly:
+  enabled: false
+context:
+- Creating new operating modes
+- Extending GRIP capabilities
+- Meta-level configuration
+welcome_message: Create mode active. Guided skill/mode creation with quality gates.

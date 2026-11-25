@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# grip-catalogue — build / serve the "GRIP Hears" interactive catalogue.
+#   build : run grip-hear --json over the published tracks -> catalogue.json -> site
+#   serve : serve the generated site over http (robust audio playback, any browser)
+#   open  : open the generated site in the default browser (Safari plays file:// audio)
+set -euo pipefail
+CLAUDE="${CLAUDE_DIR:-$HOME/.claude}"
+source "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib/venv-utils.sh"
+# The venv is required here. resolve_venv_python falls back to system python,
+# so accept its answer only when it comes from inside the venv.
+PY="$(resolve_venv_python "$CLAUDE/venv" || true)"
+if [[ "$PY" != "$CLAUDE/venv/"* ]]; then
+  echo "[grip-catalogue] no GRIP venv Python at $CLAUDE/venv (looked for Scripts/python.exe, bin/python3, bin/python)" >&2
+  exit 1
+fi
+SITE="$CLAUDE/state/catalogue/site"
+
+cmd="${1:-build}"
+case "$cmd" in
+  build)
+    PYTHONPATH="$CLAUDE" "$PY" "$CLAUDE/lib/build_catalogue.py"
+    PYTHONPATH="$CLAUDE" "$PY" "$CLAUDE/lib/grip_catalogue_site.py"
+    echo "Built. Run 'grip-catalogue serve' (any browser) or 'grip-catalogue open' (Safari)."
+    ;;
+  serve)
+    port="${2:-8765}"
+    echo "Serving $SITE at http://localhost:$port  (Ctrl-C to stop)"
+    cd "$SITE" && exec "$PY" -m http.server "$port"
+    ;;
+  open)
+    open "$SITE/index.html"
+    ;;
+  *)
+    echo "usage: grip-catalogue [build|serve [port]|open]" >&2; exit 2 ;;
+esac

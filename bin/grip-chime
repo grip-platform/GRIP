@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""grip-chime — sound the alert when a GRIP session needs the operator.
+
+WHY THIS EXISTS
+    ``lib/handoff_chime.py`` could always generate AND play a chime. It had
+    never once played, because nothing called it: there was no entrypoint on
+    PATH, and it was bound to zero hook events. The capability was complete and
+    inert — the defect class GRIP hits most often, where the fix is a binding
+    rather than more code.
+
+HARNESS-AGNOSTIC BY CONSTRUCTION
+    This file is the abstraction. Claude Code, Codex, OpenCode, pi, agy and any
+    future harness all alert the same way: they run ``grip-chime``. No harness
+    needs to know GRIP's module layout, its cwd, or its PYTHONPATH — the three
+    things that made ``python3 -m lib.handoff_chime`` uncallable from anywhere
+    but inside GRIP itself.
+
+    Self-locating on purpose: it resolves GRIP from its own path, never from
+    $CLAUDE_DIR. That variable answers "where is session STATE", and a test
+    harness or another session may point it elsewhere; resolving CODE through it
+    is how eleven hooks broke once already.
+
+CONTRACT — a chime must never be able to damage a session
+    - NON-BLOCKING: playback is detached, so a hook returns immediately. An
+      alert that delays the thing it is alerting about is a worse bug than
+      silence.
+    - TOTAL: every failure path exits 0. No missing binary, no absent audio
+      device, no non-macOS host may ever fail a hook or break a turn. Silence is
+      an acceptable degradation; a broken session is not.
+    - QUIET WHEN ASKED: honours $GRIP_CHIME_OFF and the existing outbound brake
+      at state/session/outbound-stop.json, so one stop gesture silences GRIP's
+      mouth and its bell together.
+
+USAGE
+    grip-chime                      # alert
+    grip-chime "needs permission"   # alert, with a reason recorded
+    grip-chime --check              # report whether a chime WOULD sound, and why
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# Self-locate: bin/grip-chime -> GRIP root. Never $CLAUDE_DIR (see docstring).
+GRIP_ROOT = Path(__file__).resolve().parent.parent
+LOG = GRIP_ROOT / "logs" / "grip-chime.jsonl"
+STOP_MARKER = GRIP_ROOT / "state" / "session" / "outbound-stop.json"
+# Beside the log, never in /tmp: /tmp is shared by every local user, so a fixed
+# name there can be planted as a symlink first, and generating the chime then
+# wrote through it (GRIP#6626). Must name the same file as
+# lib.handoff_chime.CHIME_WAV, which this hot path cannot import (see _wav_path);
+# tests/test_chime_asset_location.py holds the two together.
+CHIME_WAV = GRIP_ROOT / "cache" / "grip-chime.wav"
+
+
+def _muted() -> str | None:
+    """Reason the chime should stay silent, or None to sound it."""
+    if os.environ.get("GRIP_CHIME_OFF", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return "GRIP_CHIME_OFF is set"
+    if STOP_MARKER.exists():
+        return "outbound stop marker present (bin/grip-stop)"
+    return None
+
+
+def _audit(reason: str, sounded: bool, note: str = "") -> None:
+    """Record every decision. A bell nobody can prove rang is not evidence that
+    the operator was alerted, and the whole point of this file is that the
+    alerting is verifiable after the fact."""
+    try:
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        with LOG.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "reason": reason, "sounded": sounded, "note": note,
+                "harness": os.environ.get("GRIP_HARNESS")
+                           or os.environ.get("CLAUDE_CODE_SESSION_ID") and "claude-code"
+                           or "unknown",
+            }, ensure_ascii=False) + "\n")
+    except Exception:
+        pass            # audit is best-effort; it must never break the alert
+
+
+def _wav_path() -> Path | None:
+    """Ensure the chime WAV exists, generating it if needed."""
+    try:
+        target = CHIME_WAV
+        # HOT PATH FIRST, and this is load-bearing for harness-agnosticism: if
+        # the asset already exists, play it WITHOUT importing anything. The
+        # first draft imported GRIP's lib unconditionally, which died under
+        # macOS's system python 3.9 with
+        #   TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'
+        # because lib/handoff_chime.py uses `X | None` (3.10+). A harness not
+        # running GRIP's venv therefore got silence while the WAV sat on disk.
+        # Caught by invoking it as a foreign harness would — stripped env, plain
+        # PATH — which is the only way that failure was ever going to show up.
+        if target.exists():
+            return target
+
+        # COLD PATH ONLY: generation needs the library, so it needs a modern
+        # interpreter. Tolerate failure — a missing chime is silence, never an
+        # error, and the next run under the venv will generate it.
+        sys.path.insert(0, str(GRIP_ROOT))
+        # ChimeSpec() carries the defaults; there is NO DEFAULT_SPEC constant.
+        # Verified against the module rather than assumed — the first draft
+        # invented that name and --check caught it failing silently.
+        from lib.handoff_chime import ChimeSpec, write_wav  # type: ignore
+        write_wav(target, ChimeSpec())
+        return target
+    except Exception:
+        return None
+
+
+def sound(reason: str = "") -> int:
+    muted = _muted()
+    if muted:
+        _audit(reason, False, muted)
+        return 0
+
+    wav = _wav_path()
+    if wav is None or not wav.exists():
+        _audit(reason, False, "chime asset unavailable")
+        return 0
+
+    try:
+        # Detached: the hook returns now, the bell rings on its own time.
+        subprocess.Popen(
+            ["afplay", str(wav)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        _audit(reason, True)
+    except Exception as exc:                      # no afplay, no audio device
+        _audit(reason, False, f"{type(exc).__name__}: {exc}")
+    return 0
+
+
+def main() -> int:
+    args = [a for a in sys.argv[1:]]
+    if "--check" in args:
+        muted = _muted()
+        wav = _wav_path()
+        print(f"would sound : {'no' if muted else 'yes'}")
+        print(f"reason      : {muted or 'not muted'}")
+        print(f"asset       : {wav if wav else 'UNAVAILABLE'}")
+        print(f"player      : {'afplay present' if _has_afplay() else 'afplay MISSING'}")
+        print(f"audit log   : {LOG}")
+        return 0
+    # $GRIP_CHIME_REASON before argv, because the hook registry derives a
+    # policy identity from the LAST token of the command string: an argument
+    # like `grip-chime "needs you"` yields the identity "you" and mints a
+    # nonsense `policy.you`. Passing the reason by environment keeps the
+    # identity `grip-chime` while preserving per-event detail in the audit log.
+    return sound(os.environ.get("GRIP_CHIME_REASON")
+                 or " ".join(args) or "unspecified")
+
+
+def _has_afplay() -> bool:
+    import shutil
+    return shutil.which("afplay") is not None
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

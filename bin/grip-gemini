@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+# grip-gemini — Gemini-only proxy shorthand. Delegates to grip-hal --provider gemini.
+#
+# This wrapper is kept for backward compatibility. For all-provider access
+# (DeepSeek, Groq, Qwen, Mistral, OpenRouter, Moonshot, Zhipu, OpenAI, Soruxgpt,
+# Ollama, vLLM, LM Studio, MLX-VLM), use grip-hal instead.
+#
+# Security: requires LiteLLM >= 1.82.9 (supply chain incident, March 2026).
+# See docs/litellm-proxy.md.
+#
+# Usage
+#   grip-gemini                       # start proxy + launch claude, tear down on exit
+#   grip-gemini --keep-alive          # leave proxy running after claude exits
+#   grip-gemini --port 4001           # override port (default 4000)
+#   grip-gemini -- grip latest        # launch a different target instead of claude
+#   grip-gemini proxy                 # start proxy in the foreground (Ctrl-C to stop)
+#   grip-gemini status                # show proxy pid / port / health
+#   grip-gemini stop                  # kill the background proxy if one is running
+#
+# Environment overrides
+#   LITELLM_BIN   path to litellm CLI   (default: /opt/homebrew/bin/litellm)
+#   LITELLM_PORT  port to bind          (default: 4000)
+#   GRIP_GEMINI_KEYCHAIN_SERVICE  service name  (default: grip-gemini)
+#   GRIP_GEMINI_CONFIG            path to yaml  (default: ~/.claude/config/litellm-config.yaml)
+
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+CONFIG="${GRIP_GEMINI_CONFIG:-$CLAUDE_DIR/config/litellm-config.yaml}"
+LITELLM_BIN="${LITELLM_BIN:-/opt/homebrew/bin/litellm}"
+PORT="${LITELLM_PORT:-4000}"
+KEYCHAIN_SERVICE="${GRIP_GEMINI_KEYCHAIN_SERVICE:-grip-gemini}"
+LOG_DIR="$CLAUDE_DIR/logs"
+LOG="$LOG_DIR/litellm-proxy.log"
+STATE_DIR="$CLAUDE_DIR/state"
+PID_FILE="$STATE_DIR/litellm-proxy.pid"
+
+MIN_LITELLM_VERSION="1.82.9"
+
+err() { printf '[grip-gemini] %s\n' "$*" >&2; }
+info() { printf '[grip-gemini] %s\n' "$*"; }
+
+require_litellm() {
+    if [[ ! -x "$LITELLM_BIN" ]]; then
+        err "LiteLLM binary not found at $LITELLM_BIN"
+        err "Install: pip3 install 'litellm[proxy]>=$MIN_LITELLM_VERSION'"
+        err "Or set LITELLM_BIN=/path/to/litellm"
+        exit 1
+    fi
+    local ver
+    ver="$("$LITELLM_BIN" --version 2>&1 | awk -F'= ' '/Current Version/ {print $2; exit}')"
+    if [[ -z "$ver" ]]; then
+        err "Could not determine LiteLLM version from $LITELLM_BIN"
+        exit 1
+    fi
+    # Reject if ver sorts before the minimum under version-aware sort.
+    if [[ "$(printf '%s\n%s\n' "$MIN_LITELLM_VERSION" "$ver" | sort -V | head -1)" != "$MIN_LITELLM_VERSION" ]]; then
+        err "LiteLLM $ver < $MIN_LITELLM_VERSION (CVE-tainted: 1.82.7, 1.82.8)"
+        err "Upgrade: pip3 install --upgrade 'litellm[proxy]>=$MIN_LITELLM_VERSION'"
+        exit 1
+    fi
+}
+
+require_config() {
+    if [[ -f "$CONFIG" ]]; then
+        return 0
+    fi
+    # Auto-bootstrap: the yaml is gitignored per repo convention, so seed it
+    # from the embedded template on first run. User can edit freely afterwards.
+    info "config not found at $CONFIG — writing default template"
+    mkdir -p "$(dirname "$CONFIG")"
+    cat > "$CONFIG" <<'YAML'
+model_list:
+  - model_name: claude-opus-4-7
+    litellm_params:
+      model: gemini/gemini-3.5-flash-lite
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: gemini/gemini-3.5-flash-lite
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: claude-haiku-4-5-20251001
+    litellm_params:
+      model: gemini/gemini-3.5-flash-lite
+      api_key: os.environ/GEMINI_API_KEY
+
+litellm_settings:
+  drop_params: true
+
+  # Total retries across all error types (baseline). Six attempts with
+  # LiteLLM's tenacity-backed exp backoff + jitter span ~63s worst case
+  # — comfortably covers Gemini's 60s per-minute rate-limit reset window.
+  num_retries: 6
+
+  # Per-request ceiling (10 min). Prevents a single stuck call from
+  # wedging the proxy while it chews through the retry ladder.
+  request_timeout: 600
+
+  # Per-error-type retry counts. LiteLLM respects a provider's
+  # Retry-After header automatically when one is returned; these counts
+  # govern what happens when no header is present.
+  retry_policy:
+    RateLimitErrorRetries: 6              # Gemini free tier = 10 RPM; be patient.
+    TimeoutErrorRetries: 3                # Transient network hiccups.
+    InternalServerErrorRetries: 3         # 5xx from Gemini.
+    ContentPolicyViolationErrorRetries: 0 # Deterministic; retry cannot help.
+    AuthenticationErrorRetries: 0         # Fix the key, do not burn quota.
+    BadRequestErrorRetries: 0             # Caller error; same response on retry.
+
+  # Deployment-level failure circuit breaker. After 10 consecutive
+  # failures on a deployment, cool it down for 60s before routing to
+  # it again. Prevents hot-looping a throttled model.
+  allowed_fails: 10
+  cooldown_time: 60
+YAML
+}
+
+fetch_key() {
+    local key
+    if ! key=$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null); then
+        err "Keychain entry '$KEYCHAIN_SERVICE' not found."
+        err "Add it with:"
+        err "  security add-generic-password -U -s $KEYCHAIN_SERVICE -a \"\$USER\" -w '<your-gemini-api-key>'"
+        exit 1
+    fi
+    if [[ -z "$key" ]]; then
+        err "Keychain entry '$KEYCHAIN_SERVICE' is empty."
+        exit 1
+    fi
+    printf '%s' "$key"
+}
+
+port_in_use() {
+    lsof -iTCP:"$PORT" -sTCP:LISTEN -t >/dev/null 2>&1
+}
+
+wait_for_ready() {
+    local pid="$1" url="http://127.0.0.1:$PORT/health/readiness"
+    for _ in $(seq 1 60); do
+        if curl -fsS -o /dev/null -m 1 "$url" 2>/dev/null; then
+            return 0
+        fi
+        if ! kill -0 "$pid" 2>/dev/null; then
+            err "Proxy process $pid died before readiness"
+            err "Last 20 log lines:"
+            tail -n 20 "$LOG" >&2 || true
+            return 1
+        fi
+        sleep 0.5
+    done
+    err "Timed out waiting for proxy readiness at $url"
+    return 1
+}
+
+start_proxy_background() {
+    mkdir -p "$LOG_DIR" "$STATE_DIR"
+    if port_in_use; then
+        err "Port $PORT already in use"
+        exit 1
+    fi
+    export GEMINI_API_KEY
+    GEMINI_API_KEY="$(fetch_key)"
+    info "starting LiteLLM proxy on 127.0.0.1:$PORT (log: $LOG)"
+    "$LITELLM_BIN" --config "$CONFIG" --port "$PORT" --host 127.0.0.1 \
+        >"$LOG" 2>&1 &
+    local pid=$!
+    printf '%s\n' "$pid" > "$PID_FILE"
+    if ! wait_for_ready "$pid"; then
+        kill "$pid" 2>/dev/null || true
+        rm -f "$PID_FILE"
+        exit 1
+    fi
+    info "proxy ready (pid $pid)"
+    printf '%s' "$pid"
+}
+
+stop_proxy() {
+    local pid=""
+    if [[ -f "$PID_FILE" ]]; then
+        pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    fi
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        info "stopping proxy (pid $pid)"
+        kill "$pid" 2>/dev/null || true
+        for _ in 1 2 3 4 5; do
+            if ! kill -0 "$pid" 2>/dev/null; then break; fi
+            sleep 0.2
+        done
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+}
+
+cmd_run() {
+    local keep_alive=0
+    local target=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --keep-alive) keep_alive=1; shift ;;
+            --port) PORT="$2"; shift 2 ;;
+            --) shift; target=("$@"); break ;;
+            -h|--help) print_help; exit 0 ;;
+            *) err "unknown flag: $1"; exit 2 ;;
+        esac
+    done
+    if [[ ${#target[@]} -eq 0 ]]; then
+        target=(claude)
+    fi
+    require_litellm
+    require_config
+
+    local pid
+    pid="$(start_proxy_background)"
+
+    cleanup_run() {
+        if [[ $keep_alive -eq 0 ]]; then
+            stop_proxy
+        else
+            info "proxy left running on port $PORT (pid $pid) — stop with: grip-gemini stop"
+        fi
+    }
+    trap cleanup_run EXIT INT TERM
+
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT"
+    info "launching: ${target[*]} (ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL)"
+    set +e
+    "${target[@]}"
+    local rc=$?
+    set -e
+    exit "$rc"
+}
+
+cmd_proxy_foreground() {
+    require_litellm
+    require_config
+    if port_in_use; then
+        err "Port $PORT already in use"
+        exit 1
+    fi
+    mkdir -p "$LOG_DIR" "$STATE_DIR"
+    export GEMINI_API_KEY
+    GEMINI_API_KEY="$(fetch_key)"
+    info "LiteLLM proxy on 127.0.0.1:$PORT (Ctrl-C to stop)"
+    exec "$LITELLM_BIN" --config "$CONFIG" --port "$PORT" --host 127.0.0.1
+}
+
+cmd_status() {
+    if [[ ! -f "$PID_FILE" ]]; then
+        info "status: STOPPED (no pid file)"
+        return 0
+    fi
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+        info "status: STOPPED (stale pid file, removing)"
+        rm -f "$PID_FILE"
+        return 0
+    fi
+    info "status: RUNNING  pid=$pid  port=$PORT  log=$LOG"
+    if curl -fsS -o /dev/null -m 1 "http://127.0.0.1:$PORT/health/readiness" 2>/dev/null; then
+        info "health:  READY"
+    else
+        info "health:  NOT READY"
+    fi
+}
+
+print_help() {
+    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+ACTION="${1:-run}"
+case "$ACTION" in
+    run)    shift || true; cmd_run "$@" ;;
+    proxy)  shift || true; cmd_proxy_foreground ;;
+    status) shift || true; cmd_status ;;
+    stop)   shift || true; stop_proxy; info "stopped" ;;
+    -h|--help|help) print_help ;;
+    --*|-*) cmd_run "$@" ;;
+    *)      err "unknown action: $ACTION"; print_help; exit 1 ;;
+esac

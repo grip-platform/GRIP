@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# brave-cdp — launch Brave with Chrome DevTools Protocol enabled for the
+# LinkedIn Feed Scout (Tier-1) to attach to.
+#
+# Uses a DEDICATED Brave profile under ~/Library/Application Support/
+# BraveSoftware/Brave-Browser-CDP/ so V>>'s daily Brave stays untouched
+# and CDP-driven sessions cannot accidentally read V>>'s normal-browsing
+# cookies/history.
+#
+# V>> logs in manually to LinkedIn once in this profile; subsequent
+# linkedin-feed-scout runs reuse the persistent session cookies.
+#
+# Usage:
+#   bin/brave-cdp                     # launch + foreground (Ctrl-C to quit)
+#   bin/brave-cdp --background        # launch detached
+#   bin/brave-cdp --status            # show whether the CDP endpoint is alive
+#   bin/brave-cdp --kill              # kill any running brave-cdp instance
+#
+# Env overrides:
+#   GRIP_BRAVE_CDP_PORT     default 9222
+#   GRIP_BRAVE_PROFILE_DIR  default ~/Library/Application Support/BraveSoftware/Brave-Browser-CDP
+
+set -euo pipefail
+
+CDP_PORT="${GRIP_BRAVE_CDP_PORT:-9222}"
+PROFILE_DIR="${GRIP_BRAVE_PROFILE_DIR:-$HOME/Library/Application Support/BraveSoftware/Brave-Browser-CDP}"
+
+# Cross-platform Brave path resolution (per rules/path-portability.md +
+# AGORA #3162 concern). Precedence: GRIP_BRAVE_APP env override → macOS bundle
+# → Linux PATH (brave-browser) → Windows Brave install → first PATH match.
+detect_brave() {
+  if [[ -n "${GRIP_BRAVE_APP:-}" && -x "${GRIP_BRAVE_APP}" ]]; then
+    echo "${GRIP_BRAVE_APP}"; return
+  fi
+  local mac="/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+  if [[ -x "${mac}" ]]; then echo "${mac}"; return; fi
+  local lin; lin="$(command -v brave-browser 2>/dev/null || command -v brave 2>/dev/null || true)"
+  if [[ -n "${lin}" ]]; then echo "${lin}"; return; fi
+  local win="/c/Program Files/BraveSoftware/Brave-Browser/Application/brave.exe"
+  if [[ -x "${win}" ]]; then echo "${win}"; return; fi
+  echo ""
+}
+BRAVE_APP="$(detect_brave)"
+
+# --- Subcommands ----------------------------------------------------------
+
+cmd_status() {
+  if curl -sf "http://localhost:${CDP_PORT}/json/version" >/dev/null 2>&1; then
+    echo "[brave-cdp] OK — CDP endpoint live on port ${CDP_PORT}"
+    curl -sf "http://localhost:${CDP_PORT}/json/version" | head -c 400
+    echo
+    return 0
+  fi
+  echo "[brave-cdp] no CDP endpoint at localhost:${CDP_PORT}" >&2
+  return 1
+}
+
+cmd_kill() {
+  local pids
+  # pgrep is BSD/macOS/Linux; absent on Windows Git Bash → fallback to
+  # `ps` + grep which works on every Unix-y shell incl. Git Bash on Win
+  # (AGORA round-3 cross-platform fix).
+  if command -v pgrep >/dev/null 2>&1; then
+    pids="$(pgrep -fl 'remote-debugging-port=' | awk '/[Bb]rave/{print $1}')" || true
+  else
+    pids="$(ps -ef 2>/dev/null | grep 'remote-debugging-port=' | grep -i brave | grep -v grep | awk '{print $2}')" || true
+  fi
+  if [[ -z "${pids}" ]]; then
+    echo "[brave-cdp] no brave-cdp process found"
+    return 0
+  fi
+  echo "[brave-cdp] killing pids: ${pids}"
+  echo "${pids}" | xargs -n 1 kill || true
+}
+
+cmd_launch() {
+  local detach="$1"
+
+  if [[ -z "${BRAVE_APP}" || ! -x "${BRAVE_APP}" ]]; then
+    echo "[brave-cdp] ERROR: Brave Browser not found." >&2
+    echo "          Tried: \$GRIP_BRAVE_APP override, macOS app bundle," >&2
+    echo "          \`brave-browser\` / \`brave\` on PATH, Windows install dir." >&2
+    echo "          Install via: brew install --cask brave-browser (macOS)" >&2
+    echo "                       https://brave.com/download (Linux/Windows)" >&2
+    echo "          OR set GRIP_BRAVE_APP=/path/to/brave-binary" >&2
+    exit 1
+  fi
+
+  # If a CDP endpoint is already live on the chosen port, refuse — don't
+  # double-launch (likely another Brave with CDP, or stale process).
+  if curl -sf "http://localhost:${CDP_PORT}/json/version" >/dev/null 2>&1; then
+    echo "[brave-cdp] CDP endpoint already live at localhost:${CDP_PORT}" >&2
+    echo "          Use --kill first if this is a stale Brave instance." >&2
+    exit 1
+  fi
+
+  mkdir -p "${PROFILE_DIR}"
+
+  echo "[brave-cdp] launching Brave with CDP on port ${CDP_PORT}"
+  echo "[brave-cdp] profile dir: ${PROFILE_DIR}"
+  echo "[brave-cdp] On first run, log into LinkedIn manually in the spawned"
+  echo "[brave-cdp] Brave window (incl. any 2FA). The session cookies persist"
+  echo "[brave-cdp] for future linkedin-feed-scout runs."
+  echo
+
+  local args=(
+    "--remote-debugging-port=${CDP_PORT}"
+    "--user-data-dir=${PROFILE_DIR}"
+    # Open straight to the feed so V>> sees what we'll be scraping
+    "https://www.linkedin.com/feed/"
+  )
+
+  if [[ "${detach}" == "true" ]]; then
+    nohup "${BRAVE_APP}" "${args[@]}" >/dev/null 2>&1 &
+    local pid=$!
+    disown "${pid}" 2>/dev/null || true   # detach from job table — avoid zombies
+    echo "[brave-cdp] launched detached, pid=${pid}"
+    # Wait briefly for the CDP endpoint to come up; check pid liveness per
+    # iteration to detect fast-fail (missing fonts, profile lock) and reap
+    # the dead process instead of leaving a stale CDP port claim (AGORA #3162).
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      sleep 1
+      if ! kill -0 "${pid}" 2>/dev/null; then
+        wait "${pid}" 2>/dev/null || true   # reap if still in job table
+        echo "[brave-cdp] ERROR: Brave (pid ${pid}) exited within ${i}s" >&2
+        echo "          Common causes: profile lock, missing fonts, CDP port already taken." >&2
+        echo "          Try: bin/brave-cdp --kill && bin/brave-cdp --background" >&2
+        return 1
+      fi
+      if curl -sf "http://localhost:${CDP_PORT}/json/version" >/dev/null 2>&1; then
+        echo "[brave-cdp] CDP endpoint live at localhost:${CDP_PORT}"
+        return 0
+      fi
+    done
+    echo "[brave-cdp] WARN: CDP endpoint did not come up within 10s (pid ${pid} still alive)" >&2
+    return 1
+  fi
+
+  exec "${BRAVE_APP}" "${args[@]}"
+}
+
+# --- Dispatcher -----------------------------------------------------------
+
+case "${1:-launch}" in
+  --status|status)         cmd_status ;;
+  --kill|kill)             cmd_kill ;;
+  --background|background) cmd_launch true ;;
+  --help|-h|help)
+    sed -n '2,30p' "$0"
+    ;;
+  *)                       cmd_launch false ;;
+esac

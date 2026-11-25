@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""Attack a sealed record and report whether its verifier noticed.
+
+WHAT THIS IS. Point it at any sealed council record and it runs the adversarial
+injections a non-Anthropic council designed against that record's own verifier,
+then prints what the verifier said. Every injection is applied to the real file
+and reverted byte-identically; the audit itself changes nothing.
+
+WHY IT EXISTS. On 2026-09-17 a council specified six injections against this
+project's integrity claims. One of them found a real defect: a sealed decision
+record could be rewritten to say the opposite of what it said, the hash
+recomputed, and `--verify` still reported "PROVEN - dual tamper-evident
+provenance". Three checks, none able to disagree with anyone who can write the
+file. That is the kind of thing a reader cannot discover by reading a README,
+and it is exactly what this makes reproducible in one command.
+
+The honest framing, which the council insisted on and which is repeated here so
+it cannot be lost in a demo: a passing audit is a record of THIS run against
+THESE injections. It is not a proof that the verifier is sound, and it says
+nothing about attacks nobody has thought of yet.
+
+    grip-seal-audit <short-sha>        audit one sealed record
+    grip-seal-audit --list             show which records are auditable
+    grip-seal-audit <sha> --json       machine-readable result
+
+Exit status is 0 when every injection was CAUGHT, 1 when any was MISSED, and 2
+when the audit could not run. A MISSED injection is a finding, not an error.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+CLAUDE = Path(os.environ.get("CLAUDE_DIR") or (Path.home() / ".claude"))
+RECORDS = CLAUDE / "state" / "sovereign-council"
+
+
+def _verifier() -> Path:
+    """The verifier under audit — THIS checkout's, not whatever $HOME points at.
+
+    Resolution: $GRIP_SEAL_AUDIT_VERIFIER -> this checkout -> the home install.
+
+    This is not defensive padding. The first run of this tool resolved the
+    verifier as ``~/.claude/bin/grip-sovereign-council`` — the SHARED tree, which
+    was behind main and lacked the fix merged in GRIP#6176 — and duly reported
+    the forgery as MISSED. The tool was auditing a different verifier from the
+    one in the checkout being worked on, which is exactly the wrong-artefact
+    defect fixed for the mutation proofs in GRIP#6166, reproduced here within the
+    hour by its own author. Records still come from the shared state directory,
+    which is correct: the records are shared, the CODE under audit is not.
+    """
+    env = os.environ.get("GRIP_SEAL_AUDIT_VERIFIER", "").strip()
+    if env:
+        return Path(env).expanduser().resolve()
+    here = Path(__file__).resolve().parent.parent / "bin" / "grip-sovereign-council"
+    if here.is_file():
+        return here
+    return CLAUDE / "bin" / "grip-sovereign-council"
+
+
+VERIFIER = _verifier()
+
+
+#: The byte forms this auditor can FORGE for itself. A record sealed in any other
+#: form cannot be re-hashed here, and the injections that need a matching hash
+#: report N/A rather than running a weaker attack under their own name.
+FORGEABLE_FORMATS = ("", "json-sorted-keys")
+
+
+def canonical_sha(d: dict) -> "str | None":
+    """The hash a FORGER would compute for *d*, or None when this tool cannot.
+
+    Recomputed here rather than imported, deliberately: an auditor that shares a
+    helper with the thing it audits cannot detect a fault in that helper. This is
+    the same class of defect the audit exists to find -- a check derived from the
+    value it is meant to guard.
+
+    THE HONEST LIMIT, added when RFC 8785 support landed in the verifier. This is
+    the attacker's tool, not the auditor's check: `_rewrite_and_rehash` uses it to
+    make a mutated record agree with itself, so that only the signed IDR leaf can
+    catch the edit. If this form ever DISAGREES with the verifier's, that
+    injection stops being the strong attack it is named for and becomes a plain
+    rewrite the sha alone rejects -- reported as CAUGHT, while no longer testing
+    what its description claims. The audit would look cleaner precisely because
+    its best attack had been defanged.
+
+    So a record declaring a `seal_format` this tool cannot produce returns None,
+    and the caller reports N/A. Refusing is the only answer that does not
+    overstate what was tested; writing a second canonicaliser here would be worse,
+    because two implementations of one byte form can disagree and this one is
+    graded against nothing.
+    """
+    if str(d.get("seal_format", "")) not in FORGEABLE_FORMATS:
+        return None
+    payload = {"prompt": d["prompt"], "speakers": d["speakers"], "judge": d["judge"]}
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()
+
+
+def _verify(short_sha: str) -> str:
+    r = subprocess.run([sys.executable, str(VERIFIER), "--verify", short_sha],
+                       capture_output=True, text=True, timeout=180)
+    return r.stdout + r.stderr
+
+
+def _caught(output: str) -> bool:
+    """Did the verifier POSITIVELY report tampering?
+
+    Keyed on the presence of a detection marker, never on the absence of a pass
+    token. The first version asked ``"PROVEN" not in output``, and when the
+    verifier stopped printing a single ``PROVEN`` verdict — replaced by an explicit
+    non-assertions list — every result including the CONTROL read as "caught", so
+    the audit refused to run at all. It failed safely, which is the enforced
+    control working, but the check was wrong in the way this whole tool exists to
+    find: an absence standing in for a positive fact. A verifier that goes silent,
+    crashes, or is replaced now reads as NOT-caught rather than as success.
+    """
+    return "TAMPERED" in output
+
+
+# Each injection returns the mutated record, or None when it does not apply.
+def _rewrite_and_rehash(d: dict) -> dict:
+    """The one that found the real defect: flip the verdict, make the hash agree."""
+    d["judge"]["synthesis"] = "AUDIT INJECTION - this verdict was rewritten."
+    d["judge"]["best"] = "AUDIT INJECTION"
+    forged = canonical_sha(d)
+    if forged is None:
+        return {}
+    d["sha256"] = forged
+    return d
+
+
+def _strip_hash(d: dict) -> dict:
+    """Delete the hash entirely, so any comparison against it goes vacuous."""
+    d["sha256"] = ""
+    return d
+
+
+def _forge_leaf_id(d: dict) -> dict:
+    """Point at a leaf that does not exist, keeping the record self-consistent."""
+    d["idr_id"] = "precog-0-auditinjection000"
+    return d
+
+def _drop_a_speaker(d: dict) -> dict:
+    """Remove a dissenting voice and rehash — the verdict's support silently shrinks."""
+    if len(d.get("speakers", [])) < 2:
+        return {}
+    d["speakers"] = d["speakers"][:-1]
+    forged = canonical_sha(d)
+    if forged is None:
+        return {}
+    d["sha256"] = forged
+    return d
+
+
+INJECTIONS = (
+    ("rewrite-and-rehash", _rewrite_and_rehash,
+     "rewrite the verdict, recompute sha256 so the record agrees with itself"),
+    ("strip-hash", _strip_hash,
+     "delete sha256 so a comparison against it has nothing to compare"),
+    ("forge-leaf-id", _forge_leaf_id,
+     "name a leaf that is not in the chain"),
+    ("drop-a-speaker", _drop_a_speaker,
+     "delete a dissenting speaker and rehash — the verdict loses its support silently"),
+)
+
+
+def audit(short_sha: str) -> dict:
+    path = RECORDS / f"{short_sha}.json"
+    if not path.is_file():
+        return {"error": f"no sealed record at {path}"}
+
+    original = path.read_bytes()
+    before = hashlib.sha256(original).hexdigest()
+    results = []
+    try:
+        control = _verify(short_sha)
+        # The control MUST pass, or every result below is meaningless: a verifier
+        # that rejects everything would score a perfect audit while being useless.
+        if _caught(control):
+            return {"error": "control failed — the untouched record does not verify; "
+                             "fix that before trusting any injection result",
+                    "control_output": control.strip()[-400:]}
+
+        # SECOND control: can this tool still forge a hash the verifier accepts?
+        # The first control proves the VERIFIER works. This proves the FORGER
+        # does, and they are different facts. If canonical_sha has drifted from
+        # whatever the sealer now computes -- a new canonical byte form, a payload
+        # key added, anything -- then rewrite-and-rehash produces a hash that does
+        # not agree with itself, degenerating into a plain rewrite that the sha
+        # alone rejects. It would still be reported CAUGHT, and the audit would
+        # look BETTER for having lost its strongest attack. So the degradation is
+        # named here rather than absorbed silently.
+        pristine = json.loads(original)
+        forged = canonical_sha(pristine)
+        if forged is None:
+            fidelity = {"forge_fidelity": "N/A",
+                        "forge_note": f"seal_format {pristine.get('seal_format', '')!r} "
+                                      "is not one this auditor can re-hash; the "
+                                      "rehash injections are skipped, not weakened"}
+        elif forged != pristine.get("sha256", ""):
+            return {"error": "forge control failed — this auditor cannot reproduce "
+                             "the record's own hash, so the rehash injections would "
+                             "run as weaker attacks under their real names. Fix "
+                             "canonical_sha before trusting any result.",
+                    "expected": pristine.get("sha256", ""), "computed": forged}
+        else:
+            fidelity = {"forge_fidelity": "passed"}
+
+        for name, mutate, description in INJECTIONS:
+            mutated = mutate(json.loads(original))
+            if not mutated:
+                results.append({"injection": name, "status": "N/A",
+                                "description": description})
+                continue
+            path.write_text(json.dumps(mutated, indent=2, ensure_ascii=False))
+            out = _verify(short_sha)
+            results.append({
+                "injection": name,
+                "description": description,
+                "status": "CAUGHT" if _caught(out) else "MISSED",
+                "verifier_said": out.strip().splitlines()[-1] if out.strip() else "",
+            })
+    finally:
+        path.write_bytes(original)
+        after = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    return {
+        "record": short_sha,
+        "control": "passed",
+        **fidelity,
+        "restored_byte_identically": before == after,
+        "injections": results,
+        "missed": [r["injection"] for r in results if r["status"] == "MISSED"],
+        "limits": "A passing audit records THIS run against THESE injections. It is "
+                  "not a proof of soundness and says nothing about untried attacks.",
+    }
+
+
+def _render(report: dict) -> int:
+    if "error" in report:
+        print(f"  ERROR: {report['error']}", file=sys.stderr)
+        if report.get("control_output"):
+            print(report["control_output"], file=sys.stderr)
+        return 2
+
+    print(f"\n  seal-audit: {report['record']}")
+    print(f"  control (untouched record verifies): passed")
+    # Printed beside the first control because they prove different things: one
+    # that the verifier works, one that this tool can still forge a hash the
+    # verifier would accept. An N/A here means the rehash injections were SKIPPED
+    # rather than run weakly -- which the reader must be able to see, or a shorter
+    # injection list reads as a cleaner result.
+    # Defaults to "not recorded", never to "passed". An AGORA seat asked for a
+    # KeyError guard here; there was no KeyError to guard (`.get` with a default
+    # cannot raise) but the region hid the real defect, which is that the default
+    # was "passed" -- a control that never ran printing as one that did. That is
+    # the exact absence-reads-as-success shape this whole change set exists to
+    # remove, so it is fixed rather than merely defended.
+    fid = report.get("forge_fidelity") or "NOT RECORDED"
+    print(f"  control (this auditor can forge a matching hash): {fid}")
+    if report.get("forge_note"):
+        print(f"            {report['forge_note']}")
+    print()
+    for r in report["injections"]:
+        mark = {"CAUGHT": "[caught]", "MISSED": "[MISSED]", "N/A": "[  n/a ]"}[r["status"]]
+        print(f"  {mark}  {r['injection']}")
+        print(f"            {r['description']}")
+        if r.get("verifier_said"):
+            print(f"            verifier: {r['verifier_said'][:96]}")
+    print()
+    if not report["restored_byte_identically"]:
+        print("  WARNING: the record was NOT restored byte-identically.", file=sys.stderr)
+        return 2
+    print("  record restored byte-identically.")
+    if report["missed"]:
+        print(f"  RESULT: {len(report['missed'])} injection(s) MISSED — {', '.join(report['missed'])}")
+        print(f"  {report['limits']}")
+        return 1
+    # An EMPTY injection list is not a pass. Nothing was attempted, so there is
+    # nothing to have caught -- and "all 0 injections caught" is the most
+    # flattering possible rendering of having tested nothing at all. Found while
+    # probing the concern above on a partial report.
+    if not report["injections"]:
+        print("  RESULT: NO injections ran \u2014 this is not a pass. Nothing was "
+              "attempted, so nothing was caught.", file=sys.stderr)
+        return 2
+    if report.get("forge_fidelity") not in ("passed", "N/A"):
+        print(f"  RESULT: forge control is {fid} \u2014 refusing to report a pass "
+              "when the auditor's own ability to forge was never established.",
+              file=sys.stderr)
+        return 2
+    print(f"  RESULT: all {len(report['injections'])} injections caught.")
+    print(f"  {report['limits']}")
+    return 0
+
+
+def main(argv: list) -> int:
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    if argv[0] == "--list":
+        if not RECORDS.is_dir():
+            print(f"  no records directory at {RECORDS}", file=sys.stderr)
+            return 2
+        found = sorted(p.stem for p in RECORDS.glob("*.json"))
+        for s in found:
+            print(f"  {s}")
+        print(f"\n  {len(found)} auditable record(s)")
+        return 0
+    short_sha = argv[0]
+    report = audit(short_sha)
+    if "--json" in argv:
+        print(json.dumps(report, indent=2))
+        return 2 if "error" in report else (1 if report["missed"] else 0)
+    return _render(report)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

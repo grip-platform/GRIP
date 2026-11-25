@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# agora-falsify — run the W4 falsification harness against N synthetic conversations.
+#
+# Usage:
+#   bin/agora-falsify [N=10]
+#
+# Builds N synthetic 2-agent conversations using scripted-LLM stubs that return
+# realistic Anthropic-shaped responses, runs the runner, collects telemetry,
+# and emits FailifierVerdict for each implemented spec condition.
+#
+# Exit codes:
+#   0 — all falsifiers passed (protocol claims survive this run)
+#   1 — at least one falsifier failed (protocol claim refuted)
+set -euo pipefail
+
+N="${1:-10}"
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+ROOT_DIR="$( dirname "${SCRIPT_DIR}" )"
+source "${SCRIPT_DIR}/../scripts/lib/venv-utils.sh"
+# The venv is required (the harness imports GRIP's runner deps).
+PY_BIN="$(resolve_venv_python "${HOME}/.claude/venv" || true)"
+if [[ "${PY_BIN}" != "${HOME}/.claude/venv/"* ]]; then
+    echo "[agora-falsify] no GRIP venv Python at ${HOME}/.claude/venv (looked for Scripts/python.exe, bin/python3, bin/python)" >&2
+    exit 1
+fi
+
+PYTHONPATH="${ROOT_DIR}" "${PY_BIN}" - "${N}" <<'PY'
+"""W4 falsification harness — synthetic 2-agent conversations."""
+import json
+import sys
+
+# Walk back to find the worktree we're in (script may be invoked from anywhere)
+N = int(sys.argv[1])
+
+from lib.agora import (
+    AgoraAgent, ConversationRunner, MessageBus, Message, RunnerLimits,
+    TelemetryRecord, falsifier_gate, run_all,
+)
+
+
+def _llm_raw(text: str) -> dict:
+    return {"content": [{"type": "text", "text": text}], "stop_reason": "end_turn"}
+
+
+def _scripted(scripts):
+    it = iter(scripts)
+    def chat_fn(*, messages, tools):
+        return _llm_raw(next(it))
+    return chat_fn
+
+
+def _conversation(turn: int):
+    """Build a 2-agent conversation: 2 replies + 2 stops = 4 turns, quorum_stop."""
+    bus = MessageBus()
+    a = AgoraAgent(agent_id="a", chat_fn=_scripted([
+        json.dumps({"decision": "reply", "content": "I think 4."}),
+        json.dumps({"decision": "stop", "content": "done", "stop_rationale": "answered"}),
+    ]))
+    b = AgoraAgent(agent_id="b", chat_fn=_scripted([
+        json.dumps({"decision": "reply", "content": "Agreed, 4."}),
+        json.dumps({"decision": "stop", "content": "done", "stop_rationale": "agreed"}),
+    ]))
+    runner = ConversationRunner(bus, RunnerLimits(turn_cap=20), supervisors=[falsifier_gate])
+    opening = Message(sender_id="user", recipients=["*"], content=f"Run {turn}: 2+2?")
+    result = runner.run([a, b], opening)
+    return TelemetryRecord.from_result(result, agent_count=2)
+
+
+print(f"# Running {N} synthetic conversations through AGORA W4 harness")
+records = [_conversation(i) for i in range(N)]
+verdicts = run_all(records)
+
+print(f"\n# Results ({N} conversations):")
+exit_code = 0
+for v in verdicts:
+    status = "FAILED" if v.failed else "passed"
+    print(f"  {v.name:25s} {status:8s} {v.evidence}")
+    if v.failed:
+        exit_code = 1
+
+print(f"\n# Convergence rate: {sum(1 for r in records if r.converged())/N:.0%}")
+print(f"# Median turns: {sorted(r.turns for r in records)[N//2]}")
+sys.exit(exit_code)
+PY

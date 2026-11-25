@@ -1,0 +1,15 @@
+{
+  "description": "Exact source URLs measured by H809, H810 and H815; no domain-wide permission.",
+  "corpora": [
+    "docs/measurements/2026-10-11-support-probe-corpus.json",
+    "docs/measurements/2026-10-11-support-calibration-corpus.json",
+    "docs/measurements/2026-10-12-support-calibration-growth-corpus.json"
+  ],
+  "urls": [
+    "https://www.archives.gov/founding-docs/amendments-11-27",
+    "https://www.archives.gov/founding-docs/bill-of-rights-transcript",
+    "https://www.archives.gov/founding-docs/constitution-transcript",
+    "https://www.legislation.gov.uk/ukpga/1998/42/schedule/1",
+    "https://www.un.org/en/about-us/universal-declaration-of-human-rights"
+  ]
+}

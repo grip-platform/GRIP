@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""grip-token-canary — prove on THIS machine that a relay session cannot read
+the Claude token store.
+
+It plants a synthetic secret in the real token store, then starts one session
+per vector (read an ordinary file, read the secret, search the store and, on
+Linux, read its own environment) through the relay's own spawn path at the
+relay's default (read-only) tier, and reports whether any secret came back.
+That is three or four short model calls. See ``lib/token_canary.py`` for why
+each vector gets its own session and for what a PASS does and does not say.
+
+Usage:
+  grip-token-canary             run the relay-tier sessions, print the verdict
+  grip-token-canary --json      the same, as one JSON object
+  grip-token-canary --model M   use model M for those sessions (default: the relay's)
+
+Exit code: 0 PASS, 1 FAIL, 2 INCONCLUSIVE.
+
+RUN IT WITH THE RELAY'S ENVIRONMENT. The relay reads its harness and billing
+mode from GRIP_RELAY_* variables that the service manager sets, and a plain
+shell does not have them. Without them this tests the Claude Code harness on
+subscription billing, which may not be what the daemon on this machine runs.
+The report names the harness and billing it actually tested, so a mismatch is
+visible. To cover a later configuration change, run it once per harness:
+
+  GRIP_RELAY_HARNESS=claude   grip-token-canary
+  GRIP_RELAY_HARNESS=opencode GRIP_RELAY_BILLING=gateway grip-token-canary
+
+The session's raw output is never printed: if the fence fails, that output is
+where a real token would be.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="grip-token-canary",
+        description="Prove that a relay-tier session cannot read the Claude token store.")
+    parser.add_argument("--model", default=None,
+                        help="model for the test session (default: the relay's own)")
+    parser.add_argument("--json", action="store_true",
+                        help="print the result as one JSON object")
+    args = parser.parse_args(argv)
+
+    import relay_dispatcher as relay
+    import token_canary
+
+    result = token_canary.run_canary(relay._spawn, relay.CLAUDE_DIR, model=args.model)
+    result["harness"] = relay.RELAY_HARNESS
+    result["billing"] = relay.RELAY_BILLING or "subscription"
+    print(json.dumps(result, sort_keys=True) if args.json
+          else token_canary.render(result))
+    return token_canary.EXIT_CODES[result["verdict"]]
+
+
+if __name__ == "__main__":
+    # This shebang is `/usr/bin/env python3`, which need not be the GRIP
+    # interpreter. Importing the relay reaches its decision-record writer, so
+    # re-exec into a capable interpreter first (rules/never-system-python-for-grip.md).
+    from pq_reexec import reexec_if_incapable as _reexec
+
+    _reexec(Path(__file__))
+    sys.exit(main())

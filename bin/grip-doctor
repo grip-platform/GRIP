@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# grip-doctor — wire the SessionStart [ACTIVATION REQUIRED] banner's literal
+# `grip-doctor --fix` to the REAL activation heal+verify+sign engine
+# (lib/grip_activation_health.py).
+#
+# Why this shim exists (the bug it closes):
+#   The activation-health-probe banner names `grip-doctor --fix` as the remedy,
+#   but no such binary existed. The natural guess `grip doctor --fix` routes to
+#   lib/grip_doctor.py = INSTALLATION diagnostics, which never signs the
+#   state/activation/ receipt that clears the banner — so a user obeying the
+#   notice would loop forever ("healthy" yet still nagged). This shim makes the
+#   named command real: it runs grip_activation_health.py, which heals servers,
+#   does a live MCP handshake, and writes the signed receipt the probe reads.
+#
+# Modes (grip_activation_health.py argparse: --check, --json; default = heal+sign):
+#   grip-doctor            heal + verify live + sign receipt  (clears the banner)
+#   grip-doctor --fix      same as bare (the banner's verb; not a health.py flag)
+#   grip-doctor --check    dry preview — verify only, no install, no receipt
+#   grip-doctor --json     emit the signed receipt as JSON (non-tty / CI)
+#
+# Path-portability: rules/path-portability.md (CLAUDE_DIR override).
+set -eo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+
+# Cross-platform interpreter resolution. The hardcoded POSIX layout (bin/) does
+# not exist on Windows -- a virtualenv puts the interpreter under Scripts/ there
+# -- so this shim used to fall through to `command -v python3`, which on Git Bash
+# resolves to the Microsoft Store App Execution Alias stub. grip-doctor then
+# died with "Python was not found", i.e. the command named in the ACTIVATION
+# banner as the remedy could not run on Windows at all.
+# resolve_venv_python handles both layouts and rejects the stub; it is covered
+# by tests/test_venv_resolution.sh, so use it rather than re-deriving it here.
+_VENV_UTILS="$CLAUDE_DIR/scripts/lib/venv-utils.sh"
+if [ -r "$_VENV_UTILS" ]; then
+  # shellcheck source=../scripts/lib/venv-utils.sh
+  . "$_VENV_UTILS"
+  PY="$(resolve_venv_python "$CLAUDE_DIR/venv" || true)"
+else
+  # venv-utils absent (partial install): keep the historical two-step so a
+  # half-updated tree still resolves on POSIX rather than hard-failing.
+  PY="$CLAUDE_DIR/venv/bin/python"  # venv-path-ok(partial install: venv-utils.sh is the resolver and it is missing here, so there is nothing to call; the runs-check two lines below rejects the Microsoft Store stub)
+  [ -x "$PY" ] || PY="$(command -v python3 || true)"
+  # ...but apply the helper's own "does it actually run?" test inline, because
+  # the PATH candidate on Git Bash is routinely the Microsoft Store stub: found,
+  # executable, and runs no Python while exiting 49 on one machine and 0 on
+  # another (commit aebd49b52). So, as in venv-utils.sh::_python_answers, the
+  # test is what the candidate PRINTS, not its exit code. Without this line a
+  # partial install re-introduces on Windows exactly the failure the helper
+  # exists to prevent, and does it in the one state nobody tests. Clearing PY
+  # here routes into the shared "no working interpreter" exit below, which is a
+  # legible error instead of a Microsoft Store advert.
+  [ -z "$PY" ] || [ "$("$PY" -c 'import sys; sys.stdout.write("12345")' 2>/dev/null)" = "12345" ] || PY=""
+fi
+if [ -z "$PY" ]; then
+  echo "[grip-doctor] no working python interpreter found (looked in $CLAUDE_DIR/venv, then PATH)" >&2
+  exit 127
+fi
+
+# `--fix` is the banner's verb for the default heal+sign run; grip_activation_health
+# has no --fix flag, so strip it and pass any remaining args (--check/--json/--help)
+# straight through to the engine's own argparse.
+args=()
+for a in "$@"; do
+  [ "$a" = "--fix" ] || args+=("$a")
+done
+
+cd "$CLAUDE_DIR"
+exec env PYTHONPATH="$CLAUDE_DIR" "$PY" "$CLAUDE_DIR/lib/grip_activation_health.py" "${args[@]}"

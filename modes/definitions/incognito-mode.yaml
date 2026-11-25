@@ -1,0 +1,39 @@
+name: incognito
+description: Private conversation mode with no persistence, no external calls, minimal logging. Use when discussing sensitive
+  matters.
+version: 1.0.0
+effort: high
+triggers:
+- /mode incognito
+- go incognito
+- private mode
+- stealth mode
+skills:
+  always: []
+  optional: []
+token_budget: ~500
+foundation: true
+stacks_with:
+- ut++
+- asking-users
+- creating-wizards
+- hitl
+- context-gate
+prompt_injection: "[MODE: INCOGNITO]\n\nPRIVACY PROTOCOLS ACTIVE:\n\n1. NO PERSISTENCE\n   - NEVER run instance-serializer.py\n\
+  \   - NEVER update instance next_up field or SESSION.md\n   - NEVER create resurrection files\n   - NEVER save session state\n\
+  \n2. NO EXTERNAL CALLS\n   - NEVER use MCP servers (Notion, GitHub, Zapier, filesystem)\n   - NEVER make WebFetch calls\
+  \ unless user explicitly requests\n   - NEVER use WebSearch unless user explicitly requests\n\n3. MINIMAL LOGGING\n   -\
+  \ Avoid triggering hooks where possible\n   - Don't reference conversation specifics in any outputs\n\n4. ON MODE EXIT\n\
+  \   - Remind user: \"Incognito session ended. Nothing persisted.\"\n   - Do NOT offer to save state\n\nTECHNICAL LIMITATIONS\
+  \ (transparent):\n- Requests still go to Anthropic API (unavoidable)\n- Terminal history may retain commands (user's responsibility)\n\
+  - System hooks in settings.json still execute (GRIP can't override)\n\nBehave as if this conversation will leave no trace.\n"
+wave:
+  category: orthogonal
+broly:
+  enabled: false
+context:
+- Sensitive client discussions
+- Personal matters
+- Confidential planning
+- Any conversation user doesn't want persisted
+welcome_message: Incognito mode active. No persistence, no external calls, minimal logging.

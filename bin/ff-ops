@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""bin/ff-ops — CLI shim over `lib.ff_ops` (FF FinancialDataRegistry control).
+
+V>>-criterion EASILY: one bash line per FF op. See lib/ff_ops.py for kernel.
+
+Examples:
+    ff-ops status 0x428356B23DEAA7769e25634F9abCE4EE240c9ec5
+    ff-ops read   0x428356B23DEAA7769e25634F9abCE4EE240c9ec5 getAllRecordIds
+    ff-ops call   0x428356B23DEAA7769e25634F9abCE4EE240c9ec5 publishRecord <label> <cid>
+    ff-ops watch  0x428356B23DEAA7769e25634F9abCE4EE240c9ec5 --from-block 0
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+# DIP: import from the kernel; never duplicate logic.
+# Resolve GRIP root via CLAUDE_DIR (env override) or ~/.claude fallback.
+# Use os.path.expanduser so that a missing HOME degrades via /etc/passwd
+# pwd-lookup rather than raising RuntimeError (Path.home() raises when HOME unset).
+import types  # noqa: E402
+
+_grip_root = os.environ.get("CLAUDE_DIR") or os.path.expanduser("~/.claude")
+_kernel_path = os.path.join(_grip_root, "lib", "ff_ops.py")
+
+# Direct exec() kernel load (replaces prior sys.path.insert + from lib import).
+# Avoids global sys.path mutation per AGORA depth-6 suggestion #2 on PR #3234.
+# Tests access the loaded kernel as ff_ops_cli.ff_ops (patch.object pattern),
+# not via sys.modules["lib.ff_ops"] (which this loader deliberately does NOT
+# register — that was the structural blocker the prior attempt hit).
+#
+# Why exec() rather than importlib.util.spec_from_file_location: when bin/ff-ops
+# is loaded as a sub-module by tests via SourceFileLoader, pytest's assertion-
+# rewriter intercepts a nested spec_from_file_location call and corrupts the
+# module's __dict__. exec() bypasses the import machinery entirely — produces
+# an identical kernel-module object without crossing the rewriter boundary.
+def _kernel_failure(detail: str, hint: str, cause: BaseException | None = None) -> None:
+    """EXIT WHEN RUN AS A CLI, RAISE WHEN IMPORTED.
+
+    sys.exit() at module scope raises SystemExit, and pytest does NOT treat that
+    as a collection error: it escapes the collection hook as INTERNALERROR and
+    aborts the ENTIRE session. Measured on a bare venv (pytest + pyyaml, no
+    pycryptodome), collecting tests/test_ff_ops_cli.py alongside the unrelated
+    tests/test_gate_matches_the_measured_environment.py:
+
+        SystemExit  ->  "no tests collected", 0 of that file's 6 tests reached,
+                        and --continue-on-collection-errors does NOT help
+        ImportError ->  "6 passed, 1 error" under the same flag
+
+    So one absent wheel silently cost the whole suite. As an ImportError it costs
+    exactly the file that needs the wheel.
+
+    This is not a hypothetical. tests/test_ff_ops_cli.py's own header already
+    documents the same crash reached through the missing-file branch below, and
+    works around it by pinning CLAUDE_DIR across the exec -- treating the symptom
+    while the sys.exit stayed. Both call sites are routed through here for that
+    reason; fixing only one leaves the other able to abort a session.
+
+    The CLI path is byte-identical to what it printed before, so the exit-1
+    diagnostic anchored by test_import_error_exits_with_diagnostic is unchanged.
+    """
+    if __name__ == "__main__":
+        sys.exit(f"{detail}\n  {hint}")
+    raise ImportError(detail) from cause
+
+
+if not os.path.isfile(_kernel_path):
+    _kernel_failure(
+        f"ff-ops: cannot import kernel — no such file: {_kernel_path}",
+        "Set CLAUDE_DIR to the GRIP repo root.",
+    )
+
+ff_ops = types.ModuleType("ff_ops_kernel")
+ff_ops.__file__ = _kernel_path
+# Register in sys.modules BEFORE exec — Python 3.14 dataclasses._is_type
+# does sys.modules.get(cls.__module__).__dict__ during @dataclass decoration;
+# unregistered modules fail with NoneType.__dict__. This is the standard
+# manual-exec-with-dataclasses workaround.
+sys.modules["ff_ops_kernel"] = ff_ops
+try:
+    with open(_kernel_path) as _kernel_src:
+        exec(compile(_kernel_src.read(), _kernel_path, "exec"), ff_ops.__dict__)
+except Exception as exc:  # noqa: BLE001
+    sys.modules.pop("ff_ops_kernel", None)  # rollback on failure
+    # THE HINT BELONGS TO THE FAILURE, NOT TO THE FILE. CLAUDE_DIR is what fixes
+    # the missing-file branch above. Reaching HERE means the kernel was found and
+    # would not load, which on a bare runner is almost always a dependency absent
+    # from the environment -- lib/ff_ops.py needs pycryptodome, declared at
+    # requirements.txt:109. Printing "set CLAUDE_DIR" for a missing wheel sends
+    # the reader somewhere the problem is not, which is how this one survived.
+    _kernel_failure(
+        f"ff-ops: cannot import kernel — {exc}",
+        "Missing dependency: python -m pip install -r requirements.txt"
+        if isinstance(exc, ModuleNotFoundError)
+        else f"Kernel: {_kernel_path}",
+        exc,
+    )
+
+
+def _cmd_status(args: argparse.Namespace) -> int:
+    print(json.dumps(ff_ops.status(args.contract), indent=2))
+    return 0
+
+
+def _cmd_read(args: argparse.Namespace) -> int:
+    try:
+        result = ff_ops.read(args.contract, args.method, *args.args)
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"ok": False, "error": str(exc)}))
+        return 1
+    print(json.dumps({"ok": result.ok, "summary": result.summary, "raw": result.raw}, indent=2))
+    return 0 if result.ok else 1
+
+
+def _cmd_call(args: argparse.Namespace) -> int:
+    try:
+        result = ff_ops.call(args.contract, args.method, *args.args)
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"ok": False, "error": str(exc)}))
+        return 1
+    print(json.dumps({
+        "ok": result.ok,
+        "summary": result.summary,
+        "tx_hash": result.tx_hash,
+        "json_path": str(result.json_path) if result.json_path else None,
+    }, indent=2))
+    return 0 if result.ok else 1
+
+
+def _cmd_watch(args: argparse.Namespace) -> int:
+    try:
+        for log in ff_ops.watch(args.contract, from_block=args.from_block):
+            try:
+                print(json.dumps(log))
+            except (TypeError, ValueError) as exc:
+                print(json.dumps({"error": f"non-serializable log entry: {exc}"}))
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"ok": False, "error": str(exc)}))
+        return 1
+    return 0
+
+
+# Dispatch table — O(1) lookup, no if/elif chain (BIG-O + KISS)
+COMMANDS = {
+    "status": _cmd_status,
+    "read":   _cmd_read,
+    "call":   _cmd_call,
+    "watch":  _cmd_watch,
+}
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="ff-ops", description="FF FinancialDataRegistry control")
+    sub = p.add_subparsers(dest="subcommand", required=True)
+
+    s = sub.add_parser("status", help="composite snapshot of a contract")
+    s.add_argument("contract")
+
+    s = sub.add_parser("read", help="view call (read-only)")
+    s.add_argument("contract")
+    s.add_argument("method")
+    s.add_argument("args", nargs="*")
+
+    s = sub.add_parser("call", help="state-changing tx")
+    s.add_argument("contract")
+    s.add_argument("method")
+    s.add_argument("args", nargs="*")
+
+    s = sub.add_parser("watch", help="stream event logs")
+    s.add_argument("contract")
+    s.add_argument("--from-block", type=int, default=0)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    handler = COMMANDS.get(args.subcommand)
+    if handler is None:
+        sys.exit(f"ff-ops: unknown subcommand '{args.subcommand}' — bug in parser wiring")
+    return handler(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

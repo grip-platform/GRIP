@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# grip-sync-from-main — rebase the caller's isolation branch onto current main.
+#
+# The personal isolation branch must stay close to main or it diverges into a
+# shadow GRIP. This syscall makes the rebase one command:
+#
+#   1. Verify caller is on isolation/<user>-personal
+#   2. Fetch origin/main
+#   3. Rebase --autostash onto origin/main (per rules/commit-standards.md)
+#   4. Detect git-crypt phantom diffs after rebase and refresh smudge filter
+#   5. On conflict: surface affected files, exit 1, leave user to resolve
+#
+# autostash is enabled at the local-config level for ~/.claude (see
+# rules/commit-standards.md "Git Rebase Defaults"), so this is a thin wrapper
+# adding personal-branch validation + git-crypt handling + clear messaging.
+#
+# Usage
+#   grip-sync-from-main                # rebase current isolation branch
+#   grip-sync-from-main --dry-run      # show what would happen
+#   grip-sync-from-main --help
+
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+DRY_RUN=0
+
+usage() { sed -n '2,21p' "$0"; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run)  DRY_RUN=1; shift ;;
+        --help|-h)  usage; exit 0 ;;
+        *)          echo "grip-sync-from-main: unknown arg '$1'" >&2; exit 2 ;;
+    esac
+done
+
+cd "$CLAUDE_DIR"
+
+CURRENT_BRANCH="$(git symbolic-ref --short HEAD 2>/dev/null || echo 'detached')"
+if [[ ! "$CURRENT_BRANCH" =~ ^isolation/.*-personal$ ]]; then
+    echo "grip-sync-from-main: refusing — current branch '$CURRENT_BRANCH' is not isolation/<user>-personal" >&2
+    echo "  switch to your isolation branch first: git checkout isolation/<your-user>-personal" >&2
+    exit 1
+fi
+
+# Pre-flight: detect modified .gitattributes (git-crypt round-trip risk per
+# rules/commit-standards.md)
+if git status --porcelain .gitattributes 2>/dev/null | grep -q '^.M'; then
+    echo "grip-sync-from-main: ABORT — .gitattributes is modified" >&2
+    echo "  this risks git-crypt corruption on rebase. resolve first." >&2
+    exit 1
+fi
+
+echo "grip-sync-from-main: branch '$CURRENT_BRANCH' will rebase onto origin/main"
+
+if [[ $DRY_RUN -eq 1 ]]; then
+    git fetch origin main --quiet
+    BEHIND="$(git rev-list --count "${CURRENT_BRANCH}..origin/main")"
+    AHEAD="$(git rev-list --count "origin/main..${CURRENT_BRANCH}")"
+    echo "grip-sync-from-main: $AHEAD commits ahead, $BEHIND behind origin/main"
+    if [[ $BEHIND -eq 0 ]]; then
+        echo "grip-sync-from-main: already up-to-date — nothing to do"
+    else
+        echo "grip-sync-from-main: would run: git pull --rebase origin main"
+    fi
+    echo "grip-sync-from-main: --dry-run — exiting without mutation"
+    exit 0
+fi
+
+git fetch origin main --quiet
+
+if ! git pull --rebase origin main; then
+    echo "" >&2
+    echo "grip-sync-from-main: rebase produced conflicts. files affected:" >&2
+    git status --porcelain | grep -E '^(UU|AA|DD)' >&2 || true
+    echo "" >&2
+    echo "  resolve conflicts, then: git rebase --continue" >&2
+    echo "  or to abandon: git rebase --abort" >&2
+    exit 1
+fi
+
+# git-crypt phantom diff sweep (per scripts/grip-pull.sh pattern)
+if [[ -d .git-crypt ]] && git status --porcelain | grep -qE '^( M|MM)'; then
+    PHANTOMS="$(git status --porcelain | grep -E '^( M|MM)' | awk '{print $2}')"
+    echo "grip-sync-from-main: git-crypt phantom diffs detected; refreshing smudge filter…" >&2
+    echo "$PHANTOMS" | xargs -n1 git checkout -- 2>/dev/null || true
+fi
+
+echo "grip-sync-from-main: ✓ rebased onto origin/main"
+git --no-pager log -1 --oneline

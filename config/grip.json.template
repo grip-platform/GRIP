@@ -1,0 +1,15 @@
+{
+  "extended_thinking": false,
+  "paramount_skills": {
+    "ultrathink": true,
+    "asking_users": true,
+    "creating_wizards": true,
+    "efficiency_rules": true
+  },
+  "heartbeat": {
+    "enabled": true,
+    "cooldown_seconds": 7200,
+    "pipeline": ["evo", "consolidate", "generate-rules", "converge-check"]
+  },
+  "_comment": "Copy to grip.json. Use --pause/--resume or edit heartbeat.enabled directly."
+}

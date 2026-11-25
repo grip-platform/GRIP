@@ -1,0 +1,68 @@
+# .claude/self-healing-ci/config.yml
+# Self-Healing CI runtime configuration
+# Installed by: /self-healing-ci install
+# Interface version: 1.0 (pinned — see skill SKILL.md)
+
+version: "1.0"
+
+test:
+  # Shell command that runs the full test suite from repo root.
+  # MUST exit non-zero on any test failure.
+  command: "{{TEST_COMMAND}}"
+
+  # Branch the install PR opens against, and the target for inner-loop PRs.
+  base_branch: "{{PR_TARGET_BRANCH}}"
+
+schedule:
+  # Cron expression in UTC. Default: 22:00 UTC = 00:00 SAST.
+  cron: "{{SCHEDULE_CRON}}"
+  timezone: "UTC"
+
+limits:
+  # Hard ceilings — enforced BEFORE spawning inner loops.
+  max_inner_loops_per_night: 20
+  max_tokens_per_inner_loop: 500000
+  max_total_tokens_per_night: 8000000
+  max_fibonacci_depth_per_issue: 8
+
+  # Ops safety — escalate to human immediately if exceeded.
+  escalation_threshold_unresolved: 5
+
+flake_retry:
+  # Before classifying a failure as a regression, retry it N times.
+  # A test that passes any retry is a FLAKE, not a regression.
+  enabled: true
+  retry_count: 3
+  flaky_threshold: 0.3   # < 30% pass rate is still treated as regression
+
+digest:
+  # Where the morning digest is posted.
+  channel: "{{DIGEST_CHANNEL}}"
+  channel_type: "{{DIGEST_TYPE}}"   # slack | email | github_issue
+  morning_time: "07:00"
+
+bot:
+  # GitHub secret name holding a PAT or GitHub App token with
+  # `contents: write` and `pull-requests: write`.
+  token_secret: "{{BOT_TOKEN_SECRET}}"
+  commit_author: "GRIP Heal Bot <heal-bot@your-gateway.example.com>"
+
+council:
+  # MESH council review of the batch.
+  enabled: true
+  batch_only: true   # per-PR council is too expensive
+
+  # Automatic reject triggers — batch verdict goes RED if any match.
+  reject_triggers:
+    - "anchor_test_passes_on_pre_fix_code"
+    - "test_deletion_detected"
+    - "skip_or_xfail_decorator_added"
+    - "weakened_assertion_detected"
+
+# Tracked hypothesis (see lib/hypothesis_engine.py).
+# First install registers this claim with a 30-day deadline.
+hypothesis:
+  claim: "Self-healing CI adds >= 1 regression-anchor test per real bug fixed"
+  metric: "regression_anchors_added / real_bugs_fixed"
+  prediction: ">= 0.9"
+  deadline_days: 30

@@ -1,0 +1,135 @@
+name: security
+description: Security auditing, vulnerability detection, threat modeling
+version: 1.0.0
+effort: high
+triggers:
+- /mode security
+- security audit
+- vulnerability scan
+- threat model
+- security review
+- pentest
+skills:
+  always:
+  - vulnerability-detection
+  - threat-modeling
+  - sanitizing-public-releases
+  - deployment-hardening
+  optional:
+  - secure-code-review
+  - code-agentic
+token_budget: ~3500
+foundation: true
+stacks_with:
+- ut++
+- asking-users
+- creating-wizards
+- hitl
+- context-gate
+prompt_injection: '[MODE: SECURITY]
+
+
+  Security analysis protocols active. STRIDE + OWASP Top 10 frameworks loaded.
+
+
+  Before any security assessment:
+
+  1. Identify attack surface (entry points, trust boundaries)
+
+  2. Apply STRIDE threat categorization
+
+  3. Use DREAD for prioritization
+
+
+  During review:
+
+  - vulnerability-detection for pattern-based scanning
+
+  - threat-modeling for systematic analysis
+
+  - secure-code-review for PR/code review
+
+
+  MANDATORY AskUserQuestion when:
+
+  - Critical vulnerability discovered
+
+  - Severity assessment uncertain
+
+  - Remediation has trade-offs
+
+  - Need to confirm business context
+
+
+  After assessment:
+
+  - Document findings with severity
+
+  - Provide specific remediation
+
+  - Check for variant patterns
+
+
+  ## Broly Auto-Activation
+
+
+  Broly is AUTO-ACTIVE in this mode at CLUSTER level.
+
+  No /broly command needed -- UNLESS the operator has set the trigger to manual (check with `mode-loader.sh broly status`), in which case fan out ONLY on an explicit /broly. Assess task complexity and invoke automatically.
+
+
+  Default: CLUSTER (Agent Team swarm, up to 7 agents)
+
+  Team pattern: swarm | Reasoning: beam-of-thought (bot)
+
+
+  ### Escalation to PIPELINE
+
+  - Audit scope covers entire application
+
+  - Compliance framework requires multi-stage review
+
+  - Penetration test with multiple attack vectors
+
+
+  ### De-escalation to THREAD
+
+  - Single file/function security check
+
+  - Quick question about a specific vulnerability
+
+  - Minor security fix
+
+
+  ### Budget
+
+  CLUSTER uses ~5x tokens. De-escalate to THREAD for simple tasks.
+
+  AskUserQuestion if scope is unclear.
+
+  '
+wave:
+  category: wave_aligned
+  w_level: 3
+  phase: ascent
+broly:
+  enabled: true
+  default_level: cluster
+  team_pattern: swarm
+  reasoning_hint: bot
+  escalation:
+    to: pipeline
+    signals:
+    - audit scope covers entire application
+    - compliance framework requires multi-stage review
+    - penetration test with multiple attack vectors
+  context:
+    recommended: 1000000
+    auto_extend: true
+context:
+- Code security audits
+- Vulnerability scanning
+- Threat modeling sessions
+- Security-focused code review
+- Pre-release security gates
+welcome_message: Security mode active. STRIDE threat modeling, OWASP analysis, DREAD scoring ready.

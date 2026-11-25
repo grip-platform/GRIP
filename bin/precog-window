@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# precog-window — operator CLI for the PRECOG opt-in flag window.
+#
+# Thin bash wrapper around scripts/precog_window_impl.py — argv passes
+# through unchanged so user input cannot be injected as Python (the V1
+# heredoc form had a shell-injection hole on --reason where a value like
+# `--reason "'; import os; os.system(...); #"` would have executed
+# arbitrary Python via the unquoted `python -c` interpolation).
+#
+# Usage:
+#   precog-window open --hours 4 [--reason "W4 dogfood"]
+#   precog-window close
+#   precog-window status
+#
+# State file: $CLAUDE_DIR/state/precog/flag-window.json
+# Env override: PRECOG_ENABLED=1 wins over any window state.
+
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+source "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib/venv-utils.sh"
+# An explicit $PY still wins; otherwise resolve the venv (any platform layout).
+if [[ ! -x "${PY:-}" ]]; then
+    if ! PY="$(resolve_venv_python "$CLAUDE_DIR/venv")"; then
+        echo "[precog-window] no Python interpreter found (searched $CLAUDE_DIR/venv, then PATH)" >&2
+        exit 1
+    fi
+fi
+
+exec env PYTHONPATH="$CLAUDE_DIR" "$PY" "$CLAUDE_DIR/scripts/precog_window_impl.py" "$@"

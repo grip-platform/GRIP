@@ -1,0 +1,155 @@
+#!/bin/bash
+# grip-chain-anchor — keep the PUBLIC decision chain committed to Bitcoin.
+#
+# The chain's own anchorer lives in the published repo (scripts/anchor.py). It
+# was run by hand, and on 2026-09-10 whoever was running it stopped: 635 rows
+# accumulated over the next fortnight with no Bitcoin commitment while the site
+# still served them. A reader verifying the chain got "links consistent" for
+# every row and an anchored prefix two weeks stale.
+#
+# The moat has had a scheduled anchorer this whole time (com.grip.moat-anchor,
+# 395 manifests, nothing unstamped). This gives the chain the same treatment, so
+# it never again depends on someone remembering.
+#
+# Two steps per run, both idempotent and both no-ops when there is nothing to do:
+#   upgrade — advance pending OTS proofs to their Bitcoin blocks
+#   stamp   — commit a fresh Merkle root when enough rows have accumulated
+#             (anchor.py self-throttles via --min-new / --max-age-hours)
+#
+# Usage:  grip-chain-anchor            # upgrade + stamp + publish if changed
+#         grip-chain-anchor --dry-run  # do the work, report, never push
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+REPO="${GRIP_CHAIN_REPO:-https://github.com/CodeTonight-SA/grip-decision-chain.git}"
+CLONE="${GRIP_CHAIN_ANCHOR_CLONE:-$CLAUDE_DIR/state/grip-decision-chain-anchor}"
+# A role address, never the operator's. GitHub rejected a push carrying his
+# personal email to this public repo (GH007) and it was right to: the repo is
+# public and history is permanent. rules/operator-anonymity.md.
+AUTHOR_NAME="${GRIP_CHAIN_AUTHOR_NAME:-GRIP Chain Sync}"
+AUTHOR_EMAIL="${GRIP_CHAIN_AUTHOR_EMAIL:-development@codetonight.co.za}"
+
+DRY_RUN=0
+[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+
+say() { echo "[grip-chain-anchor] $*"; }
+die() { echo "[grip-chain-anchor] $*" >&2; exit 1; }
+
+# 0. Pre-flight. Each dependency fails with one line, not a traceback.
+command -v git >/dev/null 2>&1 || die "git not found on PATH"
+command -v ots >/dev/null 2>&1 || die "ots not found on PATH — the OpenTimestamps client is what stamps and upgrades proofs; install it or add ~/.local/bin to PATH"
+PY="$CLAUDE_DIR/bin/grip-py"
+[ -x "$PY" ] || die "grip-py not found at $PY"
+
+# 1. Serialise runs. A launchd tick overlapping a manual run would interleave a
+#    stamp with a push. mkdir is atomic on macOS and Linux; no flock dependency.
+LOCK="${GRIP_CHAIN_ANCHOR_LOCK:-${TMPDIR:-/tmp}/grip-chain-anchor.lock}"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  say "another run holds $LOCK — skipping"
+  exit 0
+fi
+trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+
+# 2. A PRISTINE mirror of origin/main before touching anything. fetch+reset with
+#    no `|| true` masking, so a network or auth failure surfaces via set -e
+#    rather than letting a stale or divergent tree reach the publish.
+if [ ! -d "$CLONE/.git" ]; then
+  mkdir -p "$(dirname "$CLONE")"
+  git clone -q -- "$REPO" "$CLONE"
+fi
+git -C "$CLONE" fetch -q origin main
+git -C "$CLONE" reset -q --hard origin/main
+git -C "$CLONE" clean -qfd
+
+# 3. SMOKE CHECK, before any later non-zero is treated as benign.
+#
+#    `upgrade` and `stamp` both exit non-zero for ORDINARY reasons — a proof
+#    still sitting in the calendars, no batch yet eligible — so their status
+#    cannot be gated on. That tolerance is exactly what made the first version
+#    of this script report "nothing to publish" and exit 0 when the interpreter
+#    was simply missing: a broken run and a quiet run were indistinguishable,
+#    which on an hourly timer means silent death.
+#
+#    `report` is read-only and MUST succeed. This is where an anchorer that
+#    cannot run at all says so, loudly, instead of passing for a no-op.
+if ! REPORT="$( cd "$CLONE" && "$PY" scripts/anchor.py report 2>&1 )"; then
+  die "the anchorer could not run — $(printf '%s' "$REPORT" | tail -2 | tr '\n' ' ')"
+fi
+say "anchorer OK — $(printf '%s' "$REPORT" | grep -c confirmed || true) confirmed anchor(s) on disk"
+
+# 4. The work. Both steps are no-ops when there is nothing eligible, so this is
+#    safe on any cadence. Output is kept — never discarded to /dev/null, which
+#    would throw away the evidence of what the run actually did.
+say "upgrade"
+( cd "$CLONE" && "$PY" scripts/anchor.py upgrade 2>&1 | sed 's/^/  /' ) || say "upgrade returned non-zero (pending proofs are normal)"
+say "stamp"
+( cd "$CLONE" && "$PY" scripts/anchor.py stamp 2>&1 | sed 's/^/  /' ) || say "stamp returned non-zero (nothing eligible is normal)"
+
+# 5. Nothing changed is the common case and is not an error.
+if [ -z "$(git -C "$CLONE" status --porcelain)" ]; then
+  say "up to date — nothing to publish"
+  exit 0
+fi
+
+# 6. GUARDS, before any push. rules/sync-mirror-safety.md: never single-step a
+#    push to a shared repo, and never let a broken producer reach the target.
+#
+# 6a. ALLOWLIST the paths. This job anchors; it has no business touching a
+#     record. Anything outside anchors/ means the producer did something
+#     unexpected, and the safe response is to stop rather than to publish it.
+OUTSIDE="$(git -C "$CLONE" status --porcelain | awk '{print $NF}' | grep -v '^anchors/' || true)"
+if [ -n "$OUTSIDE" ]; then
+  die "refusing: changes outside anchors/ — $(echo "$OUTSIDE" | tr '\n' ' ')"
+fi
+
+# 6b. Removal guard, keyed on FILE STATUS rather than on line counts.
+#
+#     An anchor is append-only history: a published manifest and its proof are
+#     what a reader already verified against, so removing one invalidates work
+#     that has already left the building. Nothing this job does legitimately
+#     deletes or renames an anchor.
+#
+#     Status, not numstat, because a line-count guard cannot see a rename-shaped
+#     wipe. A stub that deleted every anchor and wrote one small file in their
+#     place was detected by git as a RENAME, reported `+0 -0`, and sailed past a
+#     `deletions > insertions` test -- found by the test below, not by review.
+git -C "$CLONE" add -A -- anchors/
+REMOVED="$(git -C "$CLONE" diff --cached --name-status -- anchors/ | awk '$1 ~ /^[DR]/ {print $1" "$2}')"
+if [ -n "$REMOVED" ]; then
+  die "refusing: anchors removed or renamed — $(echo "$REMOVED" | tr '\n' ' ')"
+fi
+
+# 6c. Line-shape guard, kept as a second signal. A deletion-dominant delta that
+#     somehow survives the status check is still the repo-wipe signature.
+NUMSTAT="$(git -C "$CLONE" diff --cached --numstat -- anchors/)"
+INS="$(echo "$NUMSTAT" | awk '$1 ~ /^[0-9]+$/ {s+=$1} END {print s+0}')"
+DEL="$(echo "$NUMSTAT" | awk '$2 ~ /^[0-9]+$/ {s+=$2} END {print s+0}')"
+say "delta +$INS -$DEL across $(echo "$NUMSTAT" | grep -c . || true) file(s)"
+if [ "$DEL" -gt "$INS" ]; then
+  die "refusing: deletion-dominant delta (+$INS -$DEL) — the anchorer adds, it does not remove"
+fi
+
+# 6d. Assert on CONTENT, not on an exit status. The verifier must still pass
+#     over the tree we are about to publish.
+if ! ( cd "$CLONE" && node verify-anchors.js 2>&1 | tail -1 | grep -q '^anchors OK' ); then
+  die "refusing: verify-anchors.js does not report 'anchors OK' over the staged tree"
+fi
+say "verify-anchors.js: anchors OK over the tree about to be published"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  say "dry-run — verified and NOT pushed"
+  git -C "$CLONE" reset -q
+  exit 0
+fi
+
+# 7. Publish. Author and committer are the role address, set in the environment
+#    so no machine identity can replace them; the push goes through chain_push,
+#    the one gate for the public chain: as the GitHub App, or not at all.
+GIT_AUTHOR_NAME="$AUTHOR_NAME" GIT_AUTHOR_EMAIL="$AUTHOR_EMAIL" \
+  GIT_COMMITTER_NAME="$AUTHOR_NAME" GIT_COMMITTER_EMAIL="$AUTHOR_EMAIL" \
+  git -C "$CLONE" commit -q -m "anchors: scheduled stamp/upgrade (+$INS -$DEL)"
+source "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib/chain-push.sh"
+if ! chain_push "$CLONE" "$PY"; then
+  die "push refused or failed — nothing published (reason above)"
+fi
+say "published $(git -C "$CLONE" rev-parse --short HEAD) → $REPO"

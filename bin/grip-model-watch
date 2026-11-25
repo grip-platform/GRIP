@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# bin/grip-model-watch -- the nightly model watch (L1).
+#
+# Lists what every provider serves this account's key, diffs it against GRIP's
+# and HAL's catalogues (lib/model_watch.py), writes state/model-watch/<date>.json,
+# and keeps ONE GitHub issue current with a dogfood-domain checklist per new id.
+# It calls no model, writes no git and opens no PR: a row needs the vendor's
+# pages, which is the L2 pass. Replaces bin/hal-provider-refresh (2026-06-24 to
+# 2026-10-18), which called a lib/workflow_runner.py no commit ever added.
+#
+# Usage:
+#   bin/grip-model-watch                 # run now, update the issue if anything is new
+#   DRY_RUN=1 bin/grip-model-watch       # list and diff only; no issue
+#   bin/grip-model-watch --provider gemini
+# Env: HAL_HOME (default ~/.hal), GRIP_MODEL_WATCH_REPO (default grip-platform/HAL),
+#      CLAUDE_CODE_DISABLE_CRON=1 exits 0 at once.
+set -euo pipefail
+
+GRIP_HOME="${CLAUDE_DIR:-$HOME/.claude}"
+HAL_HOME="${HAL_HOME:-$HOME/.hal}"
+REPO="${GRIP_MODEL_WATCH_REPO:-grip-platform/HAL}"
+LOG="$GRIP_HOME/logs/model-watch.out.log"
+TITLE="Model watch: served ids with no catalogue row"
+
+if [[ "${CLAUDE_CODE_DISABLE_CRON:-0}" == "1" ]]; then
+  echo "[model-watch] CLAUDE_CODE_DISABLE_CRON=1, skipping." >&2
+  exit 0
+fi
+
+source "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib/venv-utils.sh"
+PY="$(resolve_venv_python "$GRIP_HOME/venv" || true)"
+if [[ "$PY" != "$GRIP_HOME/venv/"* ]]; then
+  echo "[model-watch] no GRIP venv Python in $GRIP_HOME/venv" >&2
+  exit 1
+fi
+
+mkdir -p "$(dirname "$LOG")" "$GRIP_HOME/state/model-watch"
+BODY="$(mktemp)"
+trap 'rm -f "$BODY"' EXIT
+
+DIGEST="$(cd "$GRIP_HOME" && PYTHONPATH="$GRIP_HOME" "$PY" lib/model_watch.py \
+  --hal-root "$HAL_HOME" --state-dir "$GRIP_HOME/state/model-watch" --markdown "$BODY" "$@" | tail -n 1)"
+STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "$STAMP $DIGEST" | tee -a "$LOG"
+
+NEW="$(sed -n 's/.*chat=\([0-9][0-9]*\).*/\1/p' <<<"$DIGEST")"
+if [[ "${DRY_RUN:-0}" == "1" || -z "$NEW" || "$NEW" == "0" ]]; then
+  exit 0
+fi
+
+# One standing issue, edited in place; the label is created if it is missing,
+# because `gh issue create --label` aborts on an unknown label (the defect
+# skills/dogfood-domain records against AGORA's DEFER follow-ups).
+gh label create model-watch -R "$REPO" --force --color 0E8A16 \
+  --description "opened by bin/grip-model-watch" >/dev/null 2>&1 || true
+EXISTING="$(gh issue list -R "$REPO" --label model-watch --state open --json number --jq '.[0].number' 2>/dev/null || true)"
+if [[ -n "$EXISTING" ]]; then
+  gh issue edit "$EXISTING" -R "$REPO" --body-file "$BODY" >/dev/null
+  echo "[model-watch] updated $REPO#$EXISTING" | tee -a "$LOG"
+else
+  gh issue create -R "$REPO" --title "$TITLE" --label model-watch --body-file "$BODY" | tee -a "$LOG"
+fi

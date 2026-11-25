@@ -1,0 +1,52 @@
+#!/bin/bash
+# grip-ut: GRIP wrapper with extended thinking mode
+# Enhanced version with PARAMOUNT skills auto-load
+#
+# Features:
+# - Enables extended thinking mode (GRIP_EXTENDED_THINKING=1)
+# - Generates 12k context from previous session
+# - Auto-loads PARAMOUNT skills at session start
+# - Launches claude with flow mode (skip permissions)
+#
+# Usage: Set in VS Code/Antigravity settings.json:
+#   "claudeCode.claudeProcessWrapper": "$HOME/.claude/bin/grip-ut"
+#
+# VERSION: 2.1.0
+# DATE: 2026-02-04
+
+set -euo pipefail
+
+CLAUDE_DIR="$HOME/.claude"
+LIB_DIR="$CLAUDE_DIR/lib"
+CONTEXTS_DIR="$CLAUDE_DIR/contexts"
+
+# Enable extended thinking for this session (triggers PARAMOUNT skill loading)
+export GRIP_EXTENDED_THINKING=1
+
+# Source capability detector to verify setup
+if [[ -f "$LIB_DIR/capability-detector.sh" ]]; then
+    source "$LIB_DIR/capability-detector.sh"
+fi
+
+# Encode project path (same as grip)
+PROJECT_DIR=$(pwd | sed 's|/|-|g' | sed 's|\.|-|g')
+CONTEXT_DIR="$CONTEXTS_DIR/$PROJECT_DIR"
+mkdir -p "$CONTEXT_DIR"
+
+# Get latest session and compress to 12k tokens
+SESSION_INFO=$(python3 "$LIB_DIR/session-resolver.py" resolve latest --json 2>/dev/null) || true
+if [[ -n "$SESSION_INFO" ]]; then
+    SESSION_UUID=$(echo "$SESSION_INFO" | jq -r '.session_uuid')
+    if [[ -n "$SESSION_UUID" && "$SESSION_UUID" != "null" ]]; then
+        python3 "$LIB_DIR/semantic-compressor.py" compress "$SESSION_UUID" \
+            --tokens 12000 > "$CONTEXT_DIR/resurrection.md" 2>/dev/null || true
+        echo "[gg++] Context injected: 12k tokens from $SESSION_UUID" >&2
+        echo "[gg++] PARAMOUNT skills will auto-load (extended thinking enabled)" >&2
+    fi
+fi
+
+# Launch claude directly
+# Note: hot-reload loop (expect PTY wrapper) was removed - it never worked
+# reliably with Claude Code's architecture. Fresh sessions via `grip fresh`
+# achieve the same goal without the expect dependency and restart complexity.
+exec claude --dangerously-skip-permissions "$@"

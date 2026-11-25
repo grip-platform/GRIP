@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# grip-tick-experiment -- draft, list or remove the always-on tick's approved experiments (lib/tick_experiment.py).
+# An experiment is the tick's third granted act: a measurement the operator approved for an overdue hypothesis,
+# run once under sandbox-exec with no network and no write outside its run folder, sealed as an IDR leaf, its
+# output put beside the hypothesis for the operator's verdict. draft writes the manifest the operator approves
+# with grip-tick-grant issue experiment --hypothesis <id>; remove is the act's reversal.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec "$here/bin/grip-py" "$here/lib/tick_experiment.py" "$@"

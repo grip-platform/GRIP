@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# grip-tick-grant -- the operator grants, shows or revokes one autonomous act of the tick.
+# Thin wrapper over lib/tick_grant.py: init makes the signing key (keychain, prompts on
+# every read) and pins the verifying key in the repository; issue signs one grant; show
+# verifies every grant file; revoke deletes one. Exit 0 done, 1 a grant fails, 2 refused.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec "$here/bin/grip-py" "$here/lib/tick_grant.py" "$@"

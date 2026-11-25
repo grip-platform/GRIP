@@ -1,0 +1,13 @@
+{
+  "_comment": [
+    "Jurisdiction shortcuts for the legal-mode onboarding.",
+    "Copy this file to legal-jurisdictions.local.json and list the",
+    "jurisdictions you actually work in. The .local.json copy is gitignored,",
+    "so a public release never discloses where you do business.",
+    "An empty list is a valid and safe state: the onboarding then asks for",
+    "jurisdiction as free text, which anchors nothing at all.",
+    "These shortcuts are a convenience only. Jurisdiction is never defaulted",
+    "and never pre-selected - see rules and modes/definitions/legal-mode.yaml."
+  ],
+  "jurisdictions": []
+}

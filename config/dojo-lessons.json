@@ -1,0 +1,26 @@
+{
+  "_comment": "Dojo lesson surface — the navigable mirror of skills/dojo/SKILL.md. The SKILL.md remains the pedagogical source of truth; edit there first, then keep this file in sync. lib/dojo_shell.py loads this file (with an inline fallback), and tests/test_dojo_lessons.py asserts the ids/names match the SKILL's three lessons so the two surfaces cannot drift silently.",
+  "lessons": [
+    {
+      "id": "L1",
+      "name": "prompt-coach",
+      "hook": "Vague in, sharp out — let GRIP rewrite your prompt before you run it.",
+      "try_it": "/prompt-coach",
+      "next": "Next: make work survive a /clear (save + recall)."
+    },
+    {
+      "id": "L2",
+      "name": "save + recall",
+      "hook": "Your work survives a /clear.",
+      "try_it": "/save  then  /recall \"what we just did\"",
+      "next": "Next: iterate to a criterion (converge)."
+    },
+    {
+      "id": "L3",
+      "name": "converge",
+      "hook": "Iterate to a criterion — stops at score >= 93 or max depth.",
+      "try_it": "/converge \"<your text>\" --criterion \"<=3 sentences\" --depth 1 --show-work",
+      "next": "That's the core of GRIP. Next: the six how-to commands, starting with /howto-start."
+    }
+  ]
+}

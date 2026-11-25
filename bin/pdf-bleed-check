@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""pdf-bleed-check — fail a PDF whose text is squeezed against its background.
+
+V>>, 2026-08-09, on a shipped 6-page A4 deliverable: *"never ever produce another
+background colour/image/drawable that has no padding or margin. the text looks
+squeezed. either make the background fit the whole width, or add proper
+padding/margin."*
+
+``bin/pdf-audit`` already renders the pages and prints the checklist, but it
+deliberately leaves the judging to a pair of eyes. That is exactly how this
+defect shipped: the failure class had been written down since 2026-05-31 and
+nobody applied it at the moment it mattered. This command measures the pixels
+instead, so the verdict does not depend on anyone remembering.
+
+Usage:
+    bin/pdf-bleed-check <file.pdf> [--dpi N] [--min-inset MM] [--strict]
+                                   [--pages 1,3-5] [--timeout SECONDS] [--quiet]
+
+Exit codes:
+    0  no squeezed type found on the pages that could be judged
+    1  at least one page FAILED (or, with --strict, merely warned)
+    2  bad usage or unreadable input
+    3  pdftoppm unavailable (install poppler)
+    4  rendering timed out
+
+A non-zero exit is the point: a caller that ignores it is choosing to ship
+unmeasured. Note that 0 does NOT mean every page was judged — pages with a
+photographic or gradient background are reported as NOT ASSESSED and still need
+an eye on them.
+"""
+
+from __future__ import annotations
+
+import argparse
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+from pdf_bleed import (  # noqa: E402
+    DEFAULT_MIN_INSET_MM, PpmError, Raster, analyse_page, exit_code,
+    format_report,
+)
+
+# Low by design. The measurement is of millimetre-scale gaps, so 50dpi (about
+# 0.5mm per pixel on A4) resolves them with room to spare, and a whole document
+# rasterises in well under a second.
+DEFAULT_DPI = 50
+
+# Mirrors bin/pdf-audit: an unbounded render on a malformed PDF hangs forever,
+# and the documented response to an unusable tool is to skip the check and ship.
+RENDER_TIMEOUT_S = 180.0
+
+
+def _eprint(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
+def parse_pages(raw: str) -> list:
+    """Parse ``1,3-5`` into [1, 3, 4, 5]. Raises ValueError on nonsense."""
+    pages = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token[1:]:
+            start, _, end = token.partition("-")
+            first, last = int(start), int(end)
+            if first > last:
+                raise ValueError(f"reversed page range: {token!r}")
+            pages.update(range(first, last + 1))
+        else:
+            pages.add(int(token))
+    if any(p < 1 for p in pages):
+        raise ValueError("page numbers start at 1")
+    return sorted(pages)
+
+
+def render_ppms(pdf: Path, outdir: Path, dpi: int,
+                timeout: float = RENDER_TIMEOUT_S) -> dict:
+    """Rasterise every page to PPM. Returns {page_number: path}.
+
+    PPM, not PNG: poppler writes it natively and ``lib/pdf_bleed`` decodes it
+    with no image library, so the check has no dependency that could make it
+    unavailable at the moment it is needed.
+    """
+    outdir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["pdftoppm", "-r", str(dpi), str(pdf), str(outdir / "page")],
+                   check=True, capture_output=True, timeout=timeout)
+    rendered = {}
+    for path in outdir.glob("page-*.ppm"):
+        stem = path.stem.rsplit("-", 1)[-1]
+        if stem.isdigit():
+            rendered[int(stem)] = path
+    return rendered
+
+
+def analyse_files(pages: dict, dpi: int, min_inset_mm: float) -> list:
+    """Measure each rendered page. A page that will not decode is not skipped
+    silently — it raises, because a swallowed error reads as a clean run."""
+    reports = []
+    for number in sorted(pages):
+        raster = Raster.from_ppm(pages[number].read_bytes())
+        reports.append(analyse_page(raster, page=number, dpi=dpi,
+                                    min_inset_mm=min_inset_mm))
+    return reports
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="pdf-bleed-check",
+        description="Fail a PDF whose text is squeezed against its background.")
+    parser.add_argument("pdf", help="path to the PDF to check")
+    parser.add_argument("--dpi", type=int, default=DEFAULT_DPI,
+                        help=f"render resolution (default {DEFAULT_DPI})")
+    parser.add_argument("--min-inset", type=float, default=DEFAULT_MIN_INSET_MM,
+                        metavar="MM",
+                        help=f"smallest acceptable gap between the ink and the "
+                             f"background's edge (default {DEFAULT_MIN_INSET_MM}mm)")
+    parser.add_argument("--strict", action="store_true",
+                        help="also fail when a background merely stops short of "
+                             "the sheet edge (the full-bleed preference)")
+    parser.add_argument("--pages", default=None, metavar="LIST",
+                        help="only check these pages, e.g. 1,3-5")
+    parser.add_argument("--timeout", type=float, default=RENDER_TIMEOUT_S,
+                        help=f"seconds to allow pdftoppm (default {RENDER_TIMEOUT_S:.0f})")
+    parser.add_argument("--quiet", action="store_true",
+                        help="print only the verdict line")
+    return parser
+
+
+def _validate(args) -> int:
+    """0 if the arguments and environment are usable, else the exit code."""
+    if not Path(args.pdf).expanduser().is_file():
+        _eprint(f"[pdf-bleed-check] not a file: {args.pdf}")
+        return 2
+    if args.dpi <= 0:
+        _eprint(f"[pdf-bleed-check] --dpi must be positive, got {args.dpi}")
+        return 2
+    if args.min_inset < 0:
+        _eprint(f"[pdf-bleed-check] --min-inset must not be negative")
+        return 2
+    if shutil.which("pdftoppm") is None:
+        _eprint("[pdf-bleed-check] pdftoppm not found. Install poppler "
+                "(macOS: brew install poppler). NOT checked is NOT clean.")
+        return 3
+    return 0
+
+
+def _render(args, pdf: Path):
+    """(pages, exit_code). On failure the pages dict is empty."""
+    outdir = Path(tempfile.mkdtemp(prefix="pdf-bleed-"))
+    try:
+        return render_ppms(pdf, outdir, args.dpi, args.timeout), 0
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or b"").decode("utf-8", "replace").strip()
+        _eprint(f"[pdf-bleed-check] pdftoppm failed: {detail[:300]}")
+        return {}, 2
+    except subprocess.TimeoutExpired:
+        _eprint(f"[pdf-bleed-check] pdftoppm did not finish within "
+                f"{args.timeout:.0f}s on {pdf}. Do NOT ship unchecked.")
+        return {}, 4
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    bad = _validate(args)
+    if bad:
+        return bad
+
+    pdf = Path(args.pdf).expanduser()
+    pages, rc = _render(args, pdf)
+    if rc:
+        return rc
+    if args.pages:
+        try:
+            wanted = set(parse_pages(args.pages))
+        except ValueError as exc:
+            _eprint(f"[pdf-bleed-check] bad --pages: {exc}")
+            return 2
+        pages = {n: p for n, p in pages.items() if n in wanted}
+    if not pages:
+        _eprint(f"[pdf-bleed-check] no pages rendered from {pdf}")
+        return 2
+
+    try:
+        reports = analyse_files(pages, args.dpi, args.min_inset)
+    except PpmError as exc:
+        _eprint(f"[pdf-bleed-check] could not read a rendered page: {exc}")
+        return 2
+
+    if not args.quiet:
+        print(f"[pdf-bleed-check] {pdf}  ({args.dpi} dpi)\n")
+        print(format_report(reports, args.min_inset))
+    rc = exit_code(reports, args.strict)
+    if args.quiet:
+        print("FAIL" if rc else "PASS")
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

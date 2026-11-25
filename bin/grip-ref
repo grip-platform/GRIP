@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# grip-ref -- open any GRIP reference: an issue, a pull request or a hypothesis.
+#
+#   grip-ref H926 GRIP#9173              a plain card for each (hypotheses show
+#                                        where they came from and how they were graded)
+#   grip-ref links GRIP#9173 H926        markdown links whose words say what each is
+#   grip-ref lint draft.md               references a draft leaves bare (exit 1 when any)
+#   grip-ref since 2026-11-16T20:41Z GRIP#9173 H926
+#                                        what changed for each after that time
+#   grip-ref desk export | set-url URL | url
+#                                        the Reference Desk, a private claude.ai page
+#
+# Runs lib/grip_ref.py under the GRIP venv through grip-py, never the system
+# python3 (rules/never-system-python-for-grip.md).
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$here/grip-py" "$here/../lib/grip_ref.py" "$@"

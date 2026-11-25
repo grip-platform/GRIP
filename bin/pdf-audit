@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""pdf-audit — render a PDF to page images and print the full audit checklist.
+
+``skills/professional-pdf/SKILL.md`` makes a visual audit MANDATORY before any
+PDF is shipped and names THIS command. It did not exist, so the documented
+fallback was to run ``pdftoppm`` by hand and remember the failure classes. Doing
+exactly that on 2026-08-01 still missed a real class, because the SKILL's inline
+table lists five and the canonical memory lists six — recall is the weak link,
+not the rendering.
+
+So this does two things, and the second is the point:
+  1. render every page to PNG (what the manual procedure already did), and
+  2. print the COMPLETE checklist beside the paths, plus flag any page whose
+     render is far smaller than its siblings (the automatic tell for a
+     near-empty final page).
+
+It deliberately does NOT try to judge the pages itself. Reading them is the
+agent's job via the Read tool — a pixel check is the only reliable test for a
+visual medium, and an automated "looks fine" would be exactly the theatre
+``rules/visual-artifact-leak-prevention.md`` warns about.
+
+Since 2026-08-09 it also runs the one part that CAN be judged mechanically —
+``bin/pdf-bleed-check``, which measures whether the page background reaches the
+sheet edge and whether the type on it has any gap. That failure class has been
+documented here since 2026-05-31 and shipped anyway in a PDF V>> rejected, which
+is the evidence that a checklist alone does not prevent it. Everything else in
+the list still needs eyes.
+
+Usage:
+    bin/pdf-audit <file.pdf> [--dpi N] [--outdir DIR] [--table-pages 2,5]
+                             [--timeout SECONDS] [--no-bleed-check]
+
+Exit codes: 0 audit rendered · 2 bad usage/input · 3 a required tool is
+unavailable · 4 a subprocess timed out · 5 the mechanical bleed/inset check
+FAILED.
+
+Only 0 means the audit ran. Every way the mechanical check can fail to complete
+has its own non-zero code, because a caller reads the exit status, not the
+warning printed above it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+from pdf_audit import format_report  # noqa: E402
+
+DEFAULT_DPI = 100  # Rule 8's documented resolution — legible without bloating.
+
+# A malformed or adversarial PDF can make pdftoppm spin. An audit that never
+# returns is worse than one that fails loudly, because the documented fallback
+# when the tool is unavailable is to skip the audit and ship (issue #4318).
+# Generous enough for a long document at high dpi; short enough to notice.
+RENDER_TIMEOUT_S = 180.0
+
+# Exit code when the measurable half of the audit fails. Distinct from every
+# other code so a scripted caller can tell "this PDF is wrong" from "the tool
+# could not run", and cannot read either as success.
+BLEED_FAILED_RC = 5
+
+# Codes a required tool was missing / a subprocess ran out of time. Shared with
+# the render half above, because "poppler is not installed" means the same thing
+# whichever of the two tools discovered it.
+TOOL_MISSING_RC = 3
+TIMED_OUT_RC = 4
+
+# bin/pdf-bleed-check's exit codes translated into this tool's. Its 2/3/4 are
+# documented identically in both headers (bad input · pdftoppm unavailable ·
+# render timed out), so they carry straight through; its 1 ("a page FAILED") is
+# this tool's 5. Anything unlisted is an unrecognised code from some other build
+# of the checker — it becomes 5 rather than 0, since the one thing that must
+# never happen is an unrecognised result reading as a pass.
+_CHECKER_RC = {0: 0, 1: BLEED_FAILED_RC, 2: 2, 3: TOOL_MISSING_RC,
+               4: TIMED_OUT_RC}
+
+
+def _eprint(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
+def run_bleed_check(pdf: Path, timeout: float = RENDER_TIMEOUT_S,
+                    checker: Path | None = None) -> int:
+    """Run bin/pdf-bleed-check on the same PDF and return THIS tool's exit code.
+
+    Not the checker's raw code — this returns a value from pdf-audit's own
+    documented space, so the caller can act on it without a second translation.
+
+    Every path is non-zero unless the check actually ran and passed. A missing
+    checker is 3 and a timeout is 4: neither blames the PDF (that is 5), and
+    neither reads as success (that is 0). The distinction matters both ways —
+    "the tool could not run" and "this PDF is wrong" are different facts, and a
+    caller that cannot tell them apart will either ship an unmeasured document
+    or chase a defect that is not there.
+    """
+    checker = checker or Path(__file__).resolve().parent / "pdf-bleed-check"
+    if not checker.is_file():
+        _eprint(f"[pdf-audit] {checker} is missing — the background/padding "
+                f"check did NOT run. That is not a pass; inspect by eye.")
+        return TOOL_MISSING_RC
+    print("\n" + "-" * 70)
+    try:
+        done = subprocess.run([sys.executable, str(checker), str(pdf)],
+                              timeout=timeout, capture_output=True, text=True)
+    except subprocess.TimeoutExpired:
+        _eprint(f"[pdf-audit] the background/padding check did not finish "
+                f"within {timeout:.0f}s — NOT a pass. Raise --timeout if the "
+                f"document is genuinely large; do NOT ship unchecked.")
+        return TIMED_OUT_RC
+    print(done.stdout.rstrip())
+    if done.stderr.strip():
+        _eprint(done.stderr.rstrip())
+    if done.returncode not in _CHECKER_RC:
+        _eprint(f"[pdf-audit] pdf-bleed-check exited {done.returncode}, which "
+                f"this tool does not recognise — treating it as a failure.")
+    return _CHECKER_RC.get(done.returncode, BLEED_FAILED_RC)
+
+
+def _parse_pages(raw: str | None) -> list[int]:
+    """Parse ``--table-pages 2,5`` into [2, 5]; a bad token is ignored loudly."""
+    if not raw:
+        return []
+    pages = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if token.isdigit():
+            pages.append(int(token))
+        else:
+            _eprint(f"[pdf-audit] ignoring non-numeric --table-pages entry: {token!r}")
+    return pages
+
+
+def render_pages(pdf: Path, outdir: Path, dpi: int,
+                 timeout: float = RENDER_TIMEOUT_S) -> dict[int, Path]:
+    """Render every page to ``outdir/page-N.png``. Returns {page_number: path}.
+
+    Bounded by ``timeout`` — see :data:`RENDER_TIMEOUT_S` for why an unbounded
+    render is the dangerous option here.
+    """
+    outdir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["pdftoppm", "-png", "-r", str(dpi), str(pdf), str(outdir / "page")],
+        check=True, capture_output=True, timeout=timeout,
+    )
+    rendered: dict[int, Path] = {}
+    for path in outdir.glob("page-*.png"):
+        stem = path.stem.rsplit("-", 1)[-1]
+        if stem.isdigit():
+            rendered[int(stem)] = path
+    return rendered
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="pdf-audit",
+        description="Render a PDF to page images and print the audit checklist.",
+    )
+    parser.add_argument("pdf", help="path to the PDF to audit")
+    parser.add_argument("--dpi", type=int, default=DEFAULT_DPI,
+                        help=f"render resolution (default {DEFAULT_DPI})")
+    parser.add_argument("--outdir", default=None,
+                        help="where to write page PNGs (default: a temp dir)")
+    parser.add_argument("--table-pages", default=None,
+                        help="comma-separated pages containing tables, so they "
+                             "are always flagged for inspection")
+    parser.add_argument("--timeout", type=float, default=RENDER_TIMEOUT_S,
+                        help=f"seconds to allow pdftoppm (default {RENDER_TIMEOUT_S:.0f})")
+    parser.add_argument("--no-bleed-check", action="store_true",
+                        help="skip the mechanical background/padding check. Only "
+                             "for a document that is legitimately photographic "
+                             "throughout — skipping it is a choice to ship "
+                             "unmeasured, and it is recorded in the output.")
+    args = parser.parse_args()
+
+    pdf = Path(args.pdf).expanduser()
+    if not pdf.is_file():
+        _eprint(f"[pdf-audit] not a file: {pdf}")
+        return 2
+    if args.dpi <= 0:
+        _eprint(f"[pdf-audit] --dpi must be positive, got {args.dpi}")
+        return 2
+    if shutil.which("pdftoppm") is None:
+        _eprint("[pdf-audit] pdftoppm not found. Install poppler "
+                "(macOS: brew install poppler).")
+        return TOOL_MISSING_RC
+
+    outdir = (Path(args.outdir).expanduser() if args.outdir
+              else Path(tempfile.mkdtemp(prefix="pdf-audit-")))
+
+    try:
+        rendered = render_pages(pdf, outdir, args.dpi, args.timeout)
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or b"").decode("utf-8", "replace").strip()
+        _eprint(f"[pdf-audit] pdftoppm failed: {detail[:300]}")
+        return 2
+    except subprocess.TimeoutExpired:
+        _eprint(f"[pdf-audit] pdftoppm did not finish within {args.timeout:.0f}s "
+                f"on {pdf}. The PDF may be malformed. Raise --timeout if the "
+                f"document is genuinely large; do NOT ship unaudited.")
+        return TIMED_OUT_RC
+
+    if not rendered:
+        _eprint(f"[pdf-audit] no pages rendered from {pdf}")
+        return 2
+
+    sizes = {page: path.stat().st_size for page, path in rendered.items()}
+    files = {page: str(path) for page, path in rendered.items()}
+
+    print(f"[pdf-audit] {pdf}  ({args.dpi} dpi)  -> {outdir}\n")
+    print(format_report(files, sizes, _parse_pages(args.table_pages)))
+
+    if args.no_bleed_check:
+        # 0 on purpose, and NOT the same defect as the paths above. Those had a
+        # caller who asked for the check and was told it passed when it never
+        # ran. Here the caller passed the flag that switches it off, so the
+        # command did exactly what it was asked and the opt-out is recorded in
+        # the invocation itself. A flag that always exits non-zero is a flag
+        # nobody can use, and returning 5 would claim the document is wrong
+        # when nothing was measured — the same conflation, pointing the other
+        # way. Wrong if a real CI is ever found passing this flag without
+        # meaning to; then it needs its own code, not this one.
+        print("\n[pdf-audit] --no-bleed-check: the background/padding check was "
+              "SKIPPED by request. Not a pass.")
+        return 0
+    rc = run_bleed_check(pdf, args.timeout)
+    if rc == BLEED_FAILED_RC:
+        _eprint("\n[pdf-audit] the background/padding check FAILED. Fix the CSS "
+                "and regenerate — do not ship this PDF.")
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

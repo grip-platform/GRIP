@@ -1,0 +1,576 @@
+#!/usr/bin/env bash
+# -*- mode: python -*-
+# Clones the GRIP and HAL repositories.
+# ============================================================================
+#  grip-installer  —  GRIP + HAL + HAPPI: One Install To Replace Them All.
+#
+#  CROSS-PLATFORM (macOS · Linux · Windows/Git-Bash) generalisation of the
+#  macOS-specialised installer. Polyglot one file — valid as both
+#  bash AND python3:
+#      bash grip-installer           # install
+#      python3 grip-installer        # re-execs bash on itself (same install)
+#      curl -fsSL <url> | bash       # pipe-install (bash body is self-contained)
+#
+#  WHY: Sakana Fugu's one-line install is Ubuntu+macOS only (Windows = a
+#  separate manual guide). grip-installer installs ANYWHERE — that is the gap it
+#  beats. Secrets go through bin/grip-keyring (macOS keychain / Linux
+#  secret-tool / Windows PowerShell vault) and are NEVER baked into this file.
+#  On completion it stands up a WITNESSABLE node (happiverse: "don't trust it —
+#  witness it") and wires the creator-approval unlock (bin/grip-unlock).
+#
+#  INVARIANTS: the witnessable node is MOVEMENT-first (not a uniqueness claim)
+#  and proves ONE node's OWN signed chain (NOT a connected network / Bitcoin
+#  anchor — that is roadmap). NO-STUBS: every phase below is fully implemented
+#  for the platforms it lists; deferred items are marked ROADMAP, never hollow.
+#
+#  ROADMAP (deferred from v1, NOT stubbed — see the macOS-specialised installer
+#  for the complete versions to port): RAM-tiered local-LLM pulls; AI-harness
+#  installs (codex/aider/opencode/hermes -> HAL :4010); tailnet join; the full
+#  macOS launchd gateway agent (v1 delegates the macOS gateway to the
+#  macOS-specialised installer).
+#
+#  Env overrides: GRIP_REPO, HAL_REPO, GRIP_HOME, HAL_DIR, BLACKBOOK_NONINTERACTIVE=1.
+#  Test seam: source with BLACKBOOK_XP_SOURCE_ONLY=1 to define funcs without installing.
+# ============================================================================
+""":" 2>/dev/null
+set -u
+
+GRIP_REPO="${GRIP_REPO:-https://github.com/grip-platform/GRIP.git}"
+HAL_REPO="${HAL_REPO:-https://github.com/grip-platform/HAL.git}"
+GRIP_HOME="${GRIP_HOME:-$HOME/.grip}"
+HAL_DIR="${HAL_DIR:-$HOME/.hal}"
+OS="unknown"
+PY=""
+
+if [ -t 1 ]; then
+  B=$'\033[1m'; DIM=$'\033[2m'; GRN=$'\033[32m'; YEL=$'\033[33m'; CYN=$'\033[36m'; X=$'\033[0m'
+else
+  B=""; DIM=""; GRN=""; YEL=""; CYN=""; X=""
+fi
+PHASE_N=0; PHASE_TOTAL=11
+_phase(){ PHASE_N=$((PHASE_N + 1)); printf '\n%s%s\xe2\x96\x8d [%d/%d] %s%s\n' "$B" "$CYN" "$PHASE_N" "$PHASE_TOTAL" "$1" "$X"; }
+_ok(){   printf '   %s\xe2\x9c\x94%s %s\n' "$GRN" "$X" "$1"; }
+_skip(){ printf '   %s\xe2\x80\xa2%s %s %s(already)%s\n' "$DIM" "$X" "$1" "$DIM" "$X"; }
+_warn(){ printf '   %s!%s %s\n' "$YEL" "$X" "$1"; }
+_die(){  printf '   %s\xe2\x9c\x98 %s%s\n' "$YEL" "$1" "$X" >&2; exit 1; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+
+banner(){
+  printf '%s\n' 'Clones the GRIP and HAL repositories.'
+  printf '%s%s' "$B" "$CYN"
+  cat <<'ART'
+  +------------------------------------------------------------+
+  |  grip-installer  ·  GRIP + HAL + HAPPI                        |
+  |  One Install To Replace Them All  —  macOS · Linux · Win    |
+  |  cross-platform · sovereign · witnessable                   |
+  +------------------------------------------------------------+
+ART
+  printf '%s' "$X"
+  printf '%s' "$DIM"
+  cat <<'WHAT'
+  One file installs your whole GRIP world anywhere:
+    GRIP  — the reasoning + decision system that runs the show.
+    HAL   — the any-model gateway (one local port :4010, any provider).
+    HAPPI — the open shared language all of it speaks.
+  Then it makes THIS machine its own witnessable node: don't trust it — witness it.
+WHAT
+  printf '%s\n' "$X"
+}
+
+# ---- phase 1: detect platform (the gate scripts/blackbook lacked) ----------
+detect_os(){
+  _phase "Detect platform"
+  case "$(uname -s 2>/dev/null)" in
+    Darwin)                       OS=mac ;;
+    Linux)                        OS=linux ;;
+    MINGW*|MSYS*|CYGWIN*|Windows_NT) OS=windows ;;
+    *)                            OS=unknown ;;
+  esac
+  if [ "$OS" = unknown ]; then
+    _die "unsupported platform '$(uname -s 2>/dev/null)' — need macOS, Linux, or Windows/Git-Bash"
+  fi
+  _ok "platform: $OS"
+}
+
+# ---- phase 2: toolchain (per-OS package manager) ---------------------------
+_brew_pkg(){ if have "${1%@*}"; then _skip "$1"; elif brew install "$1" >/dev/null 2>&1; then _ok "$1"; else _warn "$1 (install manually)"; fi; }
+_apt_pkg(){ if dpkg -s "$1" >/dev/null 2>&1; then _skip "$1"; elif sudo apt-get install -y -qq "$1" >/dev/null 2>&1; then _ok "$1"; else _warn "$1 (install manually)"; fi; }
+_dnf_pkg(){ if rpm -q "$1" >/dev/null 2>&1; then _skip "$1"; elif sudo dnf install -y -q "$1" >/dev/null 2>&1; then _ok "$1"; else _warn "$1 (install manually)"; fi; }
+_winget_pkg(){ if winget list --id "$1" >/dev/null 2>&1; then _skip "$1"; elif winget install -e --id "$1" --silent --accept-source-agreements --accept-package-agreements >/dev/null 2>&1; then _ok "$1"; else _warn "$1 (install manually)"; fi; }
+_choco_pkg(){ if choco list "$1" 2>/dev/null | grep -qi "^$1 "; then _skip "$1"; elif choco install -y "$1" >/dev/null 2>&1; then _ok "$1"; else _warn "$1 (install manually)"; fi; }
+
+phase_toolchain(){
+  _phase "Toolchain (git · git-crypt · python3 · node · uv)"
+  case "$OS" in
+    mac)
+      if ! have brew; then
+        _warn "installing Homebrew"
+        NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" || _warn "brew install failed"
+        eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || true)"
+      fi
+      for p in git git-crypt python@3 node uv; do _brew_pkg "$p"; done
+      ;;
+    linux)
+      if have apt-get; then
+        sudo apt-get update -qq >/dev/null 2>&1 || true
+        for p in git git-crypt python3 python3-venv nodejs; do _apt_pkg "$p"; done
+      elif have dnf; then
+        for p in git git-crypt python3 nodejs; do _dnf_pkg "$p"; done
+      else
+        _warn "no apt/dnf found — install git, git-crypt, python3, node manually"
+      fi
+      if ! have uv; then
+        if curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1; then _ok uv; else _warn "uv (optional — skipped)"; fi
+      else _skip uv; fi
+      ;;
+    windows)
+      # uv added: it downloads its own CPython, sidestepping the Windows
+      # PATH/Store-alias problems that plague a stock python.org install.
+      if have winget; then
+        for p in Git.Git GitCrypt.GitCrypt Python.Python.3.12 OpenJS.NodeJS astral-sh.uv; do _winget_pkg "$p"; done
+      elif have choco; then
+        for p in git git-crypt python nodejs uv; do _choco_pkg "$p"; done
+      elif have scoop; then
+        for p in git git-crypt python nodejs uv; do if scoop list "$p" >/dev/null 2>&1; then _skip "$p"; elif scoop install "$p" >/dev/null 2>&1; then _ok "$p"; else _warn "$p"; fi; done
+      else
+        _warn "no winget/choco/scoop found — install git, python, node manually"
+      fi
+      # winget/choco/scoop mutate the *registry* PATH, not this running Git-Bash
+      # session, so a freshly-installed Python is invisible until PATH is re-primed
+      # (mac uses `brew shellenv`; Windows has no equivalent). The `py` launcher +
+      # uv used in phase_deps don't need this, but a stock python.org install does.
+      for _d in "/c/Program Files/Python312" "/c/Program Files/Python312/Scripts" \
+                "$HOME/AppData/Local/Programs/Python/Python312" \
+                "$HOME/AppData/Local/Programs/Python/Python312/Scripts" \
+                "$HOME/.local/bin"; do
+        [ -d "$_d" ] && case ":$PATH:" in *":$_d:"*) : ;; *) PATH="$_d:$PATH" ;; esac
+      done
+      hash -r 2>/dev/null || true
+      ;;
+  esac
+}
+
+# ---- phase 3: clone GRIP + HAL --------------------------------------------
+# core.autocrlf=false: Git for Windows usually sets it to true, which checks every
+# text file out with CRLF line endings, and bash then fails on the "\r". Set in
+# the new clone's own config, so it also holds for every later pull there.
+_clone_repo(){
+  local url="$1" dir="$2" name="$3"
+  if [ -d "$dir/.git" ]; then
+    _skip "$name ($dir)"
+  elif git clone -c core.autocrlf=false "$url" "$dir" >/dev/null 2>&1; then
+    _ok "$name -> $dir"
+  else
+    _die "$name clone failed. Check your network connection, that git is on PATH and configured correctly, and that you have access to the repository."
+  fi
+}
+phase_clone(){
+  _phase "Clone GRIP -> $GRIP_HOME  +  HAL -> $HAL_DIR"
+  have git || _die "git missing (toolchain phase failed)"
+  _clone_repo "$GRIP_REPO" "$GRIP_HOME" GRIP
+  _register_merge_drivers "$GRIP_HOME"
+  _clone_repo "$HAL_REPO" "$HAL_DIR" HAL
+}
+# .gitattributes names an `ours` merge driver for the regenerated substrate
+# (data/genome-shared.json and friends) that git does not build in; without
+# it a pull or stash pop that meets a local rewrite stops with conflict
+# markers inside JSON. Runs on every install, so an existing clone gets it
+# too. Details: docs/substrate-merge-strategy.md.
+_register_merge_drivers(){
+  [ -e "$1/.git" ] || return 0
+  git -C "$1" config merge.ours.name "keep the side being merged into (regenerated substrate)"
+  git -C "$1" config merge.ours.driver true && _ok "merge driver 'ours' registered"
+}
+
+# ---- phase 4: python venv + deps (cross-platform venv layout) --------------
+phase_deps(){
+  _phase "Python venv + deps"
+  if [ ! -d "$GRIP_HOME" ]; then _warn "GRIP not present — skipping deps"; return; fi
+  # Reuse the CANONICAL venv resolver (single source of truth with install.sh):
+  # resolve_venv_python handles Windows Scripts/ + POSIX bin/ layouts and rejects
+  # nothing that is not actually executable.
+  [ -f "$GRIP_HOME/scripts/lib/venv-utils.sh" ] && . "$GRIP_HOME/scripts/lib/venv-utils.sh"
+  _resolve_py(){ command -v resolve_venv_python >/dev/null 2>&1 && resolve_venv_python "$GRIP_HOME/venv" 2>/dev/null || { [ -x "$GRIP_HOME/venv/Scripts/python.exe" ] && echo "$GRIP_HOME/venv/Scripts/python.exe" || { [ -x "$GRIP_HOME/venv/bin/python" ] && echo "$GRIP_HOME/venv/bin/python"; }; }; }
+
+  PY="$(_resolve_py)"
+  if [ -n "$PY" ] && [ -x "$PY" ] && [ -d "$GRIP_HOME/venv" ]; then
+    _skip "venv"
+  else
+    # Create the venv. On Windows the python.org installer ships a `py` launcher
+    # (always reachable system-wide via the Windows dir) but NO python3.exe, and a bare
+    # python/python3 is often a Microsoft-Store alias STUB that resolves but does
+    # nothing — so validate each candidate actually runs, and prefer uv (its own
+    # CPython) then `py -3`.
+    _mkvenv(){ "$@" -c 'import sys' >/dev/null 2>&1 || return 1; ( cd "$GRIP_HOME" && "$@" -m venv venv >/dev/null 2>&1 ); }
+    ( cd "$GRIP_HOME" && have uv && uv venv venv >/dev/null 2>&1 ) \
+      || { [ "$OS" = windows ] && _mkvenv py -3; } \
+      || _mkvenv python3 \
+      || _mkvenv python \
+      || true
+    PY="$(_resolve_py)"
+    if [ -n "$PY" ] && [ -x "$PY" ]; then _ok "venv"; else _warn "venv creation failed — install Python 3 (or 'uv'), then re-run"; PY=""; fi
+  fi
+  # _deps_from <label> <requirements-file>: install one list into the venv at $PY,
+  # falling back to uv, and say plainly which way it went. --prefer-binary keeps an
+  # Intel Mac on cryptography 48.0.1's wheel rather than compiling 50.0.2, which
+  # has no Intel Mac wheel. uv has no --prefer-binary; --only-binary :all: makes it
+  # take the newest release that has a wheel, which is the same choice.
+  _deps_from(){
+    if "$PY" -m pip install -q --prefer-binary -r "$2" >/dev/null 2>&1; then
+      _ok "$1"
+    elif have uv && VIRTUAL_ENV="$GRIP_HOME/venv" uv pip install -q --only-binary :all: -r "$2" >/dev/null 2>&1; then
+      _ok "$1 (uv)"
+    else
+      _warn "$1 incomplete — re-run: \"$PY\" -m pip install --prefer-binary -r \"$2\""
+    fi
+  }
+  if [ -n "$PY" ] && [ -x "$PY" ]; then
+    # self-heal a pip-less venv (mirrors bootstrap-semantic-rl.sh::ensure_venv_pip)
+    "$PY" -m pip --version >/dev/null 2>&1 || "$PY" -m ensurepip --upgrade >/dev/null 2>&1 || true
+    # requirements-core.txt is what every install needs (GRIP#9399). The public
+    # build ships no requirements.txt, so the full list is added only when this
+    # clone has one.
+    if [ -f "$GRIP_HOME/requirements-core.txt" ]; then
+      _deps_from "core deps" "$GRIP_HOME/requirements-core.txt"
+    else
+      _warn "requirements-core.txt not found in $GRIP_HOME (GRIP clone incomplete?)"
+    fi
+    if [ -f "$GRIP_HOME/requirements.txt" ]; then
+      _deps_from "deps" "$GRIP_HOME/requirements.txt"
+    fi
+  fi
+}
+
+# ---- phase: harness link (~/.claude -> GRIP_HOME) — cross-platform ---------
+# Makes the Claude Code harness dir (~/.claude) resolve to GRIP_HOME so the
+# harness and the GRIP repo are the same tree (POSIX symlink / Windows junction).
+# CONSERVATIVE: no --force-backup, so a REAL ~/.claude is never clobbered here;
+# if it refuses (exit 3), we print the one-line migrate command and move on.
+phase_harness_link(){
+  _phase "Harness link (~/.claude -> GRIP_HOME)"
+  local hl="$GRIP_HOME/bin/grip-harness-link" cd="$HOME/.claude"
+  if [ ! -f "$hl" ]; then
+    _warn "grip-harness-link not found at $hl (GRIP clone incomplete?)"
+    return
+  fi
+  local out rc
+  out="$(bash "$hl" --grip-home "$GRIP_HOME" --claude-dir "$cd" 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ]; then
+    _ok "$cd resolves to $GRIP_HOME — the harness sees GRIP"
+  elif [ "$rc" -eq 3 ]; then
+    _warn "$cd is a real directory — left untouched (nothing clobbered)"
+    _warn "to migrate it into GRIP: bash $hl --grip-home $GRIP_HOME --claude-dir $cd --force-backup"
+  else
+    _warn "harness link skipped (rc=$rc): $out"
+  fi
+}
+
+# ---- phase 5: secrets via grip-keyring (CROSS-PLATFORM — the key win) -------
+phase_secrets(){
+  _phase "Secrets (cross-platform keystore via grip-keyring)"
+  local gk="$GRIP_HOME/bin/grip-keyring"
+  if [ -f "$gk" ]; then
+    if sh "$gk" status >/dev/null 2>&1; then
+      _ok "grip-keyring ready (macOS keychain / Linux secret-tool / Windows vault)"
+    else
+      _warn "grip-keyring present but status check failed (Linux needs secret-tool + a running keyring daemon)"
+    fi
+    _ok "provision provider keys (idempotent; values never touch disk): sh $gk install"
+  else
+    _warn "grip-keyring not found at $gk (GRIP clone incomplete?)"
+  fi
+}
+
+# ---- phase 6: HAL gateway autostart (per-OS) -------------------------------
+phase_gateway(){
+  _phase "HAL gateway autostart (:4010)"
+  if [ ! -x "$PY" ]; then _warn "no venv python — skipping gateway autostart"; return; fi
+  case "$OS" in
+    mac)
+      # v1 delegates the macOS launchd agent to the macOS-specialised
+      # installer's proven phase (ROADMAP: inline it here). Honest pointer,
+      # not a stub.
+      if [ -x "$GRIP_HOME/scripts/blackbook" ]; then
+        _ok "macOS launchd gateway: run 'bash $GRIP_HOME/scripts/blackbook' (its gateway phase installs the launchd agent)"
+      else
+        _warn "macOS gateway: start manually -> ( cd $HAL_DIR && $PY -m lib.hal.gateway --port 4010 )"
+      fi
+      ;;
+    linux)
+      local unit="$HOME/.config/systemd/user/hal-gateway.service"
+      mkdir -p "$(dirname "$unit")"
+      cat > "$unit" <<UNIT
+[Unit]
+Description=HAL gateway (GRIP Suite) on :4010
+[Service]
+ExecStart=$PY -m lib.hal.gateway --port 4010
+WorkingDirectory=$HAL_DIR
+Environment=HAL_HOME=$HAL_DIR
+Environment=HAL_GATEWAY_MULTIPROVIDER=1
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=default.target
+UNIT
+      if have systemctl; then
+        systemctl --user daemon-reload >/dev/null 2>&1 || true
+        if systemctl --user enable --now hal-gateway.service >/dev/null 2>&1; then
+          _ok "systemd --user hal-gateway enabled + started"
+        else
+          _warn "systemd enable failed (unit written: $unit; may need: loginctl enable-linger for your user)"
+        fi
+      else
+        _warn "systemd absent — unit written ($unit); start manually"
+      fi
+      ;;
+    windows)
+      if have schtasks; then
+        # schtasks is a NATIVE Windows program: MSYS paths (/c~) are
+        # invalid at logon (outside Git-Bash) and it has no working-dir option,
+        # so `-m lib.hal.gateway` would fail with 'No module named lib'. Wrap in
+        # cmd /c with cygpath'd paths + cd /d + the multiprovider env.
+        pyw="$(cygpath -w "$PY" 2>/dev/null || echo "$PY")"
+        halw="$(cygpath -w "$HAL_DIR" 2>/dev/null || echo "$HAL_DIR")"
+        if schtasks /Create /TN "GRIP HAL Gateway" /TR "cmd /c cd /d \"$halw\" && set HAL_GATEWAY_MULTIPROVIDER=1&& \"$pyw\" -m lib.hal.gateway --port 4010" /SC ONLOGON /F >/dev/null 2>&1; then
+          _ok "Windows Scheduled Task 'GRIP HAL Gateway' (ONLOGON)"
+        else
+          _warn "schtasks create failed — start manually: ( cd \"$HAL_DIR\" && \"$PY\" -m lib.hal.gateway --port 4010 )"
+        fi
+      else
+        _warn "schtasks absent — start manually: ( cd \"$HAL_DIR\" && \"$PY\" -m lib.hal.gateway --port 4010 )"
+      fi
+      ;;
+  esac
+}
+
+# ---- phase 7: WITNESSABLE NODE (happiverse — don't trust it, witness it) ----
+phase_witness(){
+  _phase "Witnessable node (happiverse proof)"
+  if [ ! -x "$PY" ]; then _warn "no venv python — skipping witnessable node"; return; fi
+  if ( cd "$GRIP_HOME" && "$PY" -m lib.happiverse_proof gen-sample --out-dir "$GRIP_HOME/apps/happiverse-proof" >/dev/null 2>&1 ); then
+    _ok "node-001-style witnessable proof generated (apps/happiverse-proof)"
+    _ok "this install is now its OWN witnessable node: open apps/happiverse-proof/index.html"
+    _ok "don't trust it -- witness it (Ed25519, in-browser, no account)"
+    _ok "movement-first; proves THIS node's own chain (network / Bitcoin anchor = roadmap)"
+  else
+    _warn "witnessable node: gen-sample failed (needs venv 'cryptography') — run: ( cd $GRIP_HOME && $PY -m lib.happiverse_proof gen-sample --out-dir apps/happiverse-proof )"
+  fi
+}
+
+# ---- phase 8: creator-approval unlock (the founder's handshake) ------------
+phase_unlock(){
+  _phase "Creator-approval unlock (the founder's handshake)"
+  if [ -x "$GRIP_HOME/bin/grip-unlock" ]; then
+    _ok "admin unlock ready: grip-unlock request  (press the button -> the creator personally approves -> you're unlocked)"
+  else
+    _warn "bin/grip-unlock not found (GRIP clone incomplete?)"
+  fi
+}
+
+# ---- phase 9: launch config (PATH + CLAUDE_DIR) ----------------------------
+phase_launch(){
+  _phase "Launch config"
+  local rc=""
+  case "$OS" in
+    windows) rc="$HOME/.bashrc" ;;   # Git-Bash
+    *)       rc="$HOME/.zshrc"; [ -f "$rc" ] || rc="$HOME/.bashrc" ;;
+  esac
+  if [ -n "$rc" ]; then
+    # QUOTE every path: a home dir with a space (e.g. "<Your Name>") breaks a
+    # bare `export CLAUDE_DIR=/c/Users/<Your Name>/.grip` (assigns .../Andre,
+    # then runs "Theart/.grip" as a command). Also put the venv on PATH so the
+    # GRIP interpreter resolves (Windows Scripts/ + POSIX bin/).
+    grep -qF "$GRIP_HOME/bin" "$rc" 2>/dev/null || printf '\nexport PATH="%s/bin:%s/venv/Scripts:%s/venv/bin:$PATH"  # GRIP Suite\n' "$GRIP_HOME" "$GRIP_HOME" "$GRIP_HOME" >> "$rc"
+    grep -qF 'CLAUDE_DIR=' "$rc" 2>/dev/null || printf 'export CLAUDE_DIR="%s"\nexport CLAUDE_CONFIG_DIR="%s"\n' "$GRIP_HOME" "$GRIP_HOME" >> "$rc"
+    # Shell FUNCTIONS, which PATH alone cannot provide: `gogrip`/`gg++` cd the
+    # parent shell, and `py` runs GRIP's venv python rather than the system one.
+    # Without this an install here got `grip-py` on PATH but no `py` and no
+    # `gg++` at all -- silently, since nothing announces a missing function.
+    #
+    # AFTER the CLAUDE_DIR export on purpose: shell-functions.sh resolves
+    # ${CLAUDE_DIR:-$HOME/.claude}, and this installer's GRIP_HOME is often
+    # ~/.grip, so sourcing it first would bind every function to the wrong tree.
+    grep -qF 'shell-functions.sh' "$rc" 2>/dev/null || printf '\n# GRIP SHELL FUNCTIONS\nsource "%s/lib/shell-functions.sh"\nalias gg++="gogrip"\n' "$GRIP_HOME" >> "$rc"
+    _ok "shell init updated ($rc): PATH + CLAUDE_DIR + functions -> $GRIP_HOME"
+  fi
+}
+
+# ---- phase 10: verify ------------------------------------------------------
+phase_verify(){
+  _phase "Verify"
+  [ -d "$GRIP_HOME" ] && _ok "GRIP at $GRIP_HOME" || _warn "GRIP dir missing"
+  [ -d "$HAL_DIR" ] && _ok "HAL at $HAL_DIR" || _warn "HAL dir missing"
+  [ -x "$PY" ] && _ok "venv python" || _warn "venv python missing"
+  [ -f "$GRIP_HOME/apps/happiverse-proof/index.html" ] && _ok "witnessable node page present" || _warn "witnessable node page missing"
+  if [ -f "$GRIP_HOME/scripts/verify-install.sh" ]; then
+    if bash "$GRIP_HOME/scripts/verify-install.sh" >/dev/null 2>&1; then _ok "verify-install passed"; else _warn "verify-install reported issues"; fi
+  fi
+}
+
+online(){
+  printf '\n%s%s  \xe2\x96\x8d grip-installer ONLINE  —  GRIP+HAL+HAPPI on %s  ·  sovereign · witnessable%s\n' "$B" "$GRN" "$OS" "$X"
+  printf '   %sopen a new shell, then:%s  %sgrip%s   ·   witness:  %sapps/happiverse-proof/index.html%s\n\n' "$DIM" "$X" "$B" "$X" "$DIM" "$X"
+}
+
+main(){
+  banner
+  detect_os
+  phase_toolchain
+  phase_clone
+  phase_deps
+  phase_harness_link
+  phase_secrets
+  phase_gateway
+  phase_witness
+  phase_unlock
+  phase_launch
+  phase_verify
+  online
+}
+
+# Test seam: source with BLACKBOOK_XP_SOURCE_ONLY=1 to define functions without
+# installing (tests/test_blackbook_xp.py exercises detect_os + phase presence).
+[ -n "${BLACKBOOK_XP_SOURCE_ONLY:-}" ] && return 0 2>/dev/null || true
+main "$@"
+exit 0
+# --------------------------- END BASH BODY ----------------------------------
+":"""
+# ----------------------------- PYTHON BODY ----------------------------------
+# Only reached when invoked as `python3 blackbook-xp` (bash exits 0 above and
+# never gets here). Hand off to bash on this very file — one source of truth.
+import os
+import sys
+import shutil
+
+# Guard the bash hand-off: on Windows the interpreter is often native python.org
+# Python with NO bash on the Windows PATH (Git-Bash's bash is not exported to
+# CMD/PowerShell). A bare os.execvp("bash",...) then raises FileNotFoundError
+# with a raw traceback. Resolve bash explicitly and give a useful message.
+_bash = shutil.which("bash") or shutil.which("bash.exe")
+if not _bash and os.path.exists(r"C:\Program Files\Git\bin\bash.exe"):
+    _bash = r"C:\Program Files\Git\bin\bash.exe"
+if not _bash:
+    sys.exit("grip-installer needs Git Bash. On Windows: install Git for Windows, "
+             "then run it from a Git-Bash shell -> bash grip-installer")
+os.execv(_bash, [_bash, os.path.abspath(__file__)] + sys.argv[1:])
+
+
+_HAPPI_DOC = r'''
+# GRIP + HAL + HAPPI
+### One Install To Replace Them All
+
+> **Don't trust it — witness it.**
+
+One file. One line. Your whole reasoning stack — on any machine you own.
+
+---
+
+## Install
+
+```sh
+curl -fsSL https://your-gateway.example.com | sh
+```
+
+That is the one true line. The very same file is **name-agnostic** — one source of truth, however you reach for it:
+
+```sh
+bash    grip-installer        # run it as bash
+python3 grip-installer        # re-execs bash on itself — identical install
+bash    grip-installer.md     # rename it anything — still the same installer
+```
+
+The bytes above this README are a working bash **and** python program. The bytes you are reading now are Markdown. **One file. Three readers.**
+
+---
+
+## What lands on your machine
+
+| Layer | What it is |
+|-------|-----------|
+| **GRIP**  | the reasoning + decision system that runs the show |
+| **HAL**   | the any-model gateway — one local port `:4010`, any provider |
+| **HAPPI** | the open shared language all of it speaks |
+
+Then it turns **this machine into its own witnessable node**.
+
+---
+
+## Runs anywhere
+
+|                  | macOS | Linux | Windows · Git Bash |
+|------------------|:-----:|:-----:|:------------------:|
+| **blackbook-xp** |   ✓   |   ✓   |         ✓          |
+| Sakana Fugu      |   ✓   | ✓ *(Ubuntu)* |     —       |
+
+Sakana Fugu's one-liner is Ubuntu + macOS only; Windows is a separate manual guide. **blackbook-xp installs ANYWHERE** — that is the gap it beats.
+
+---
+
+## Sovereign by default
+
+The HAL gateway on `:4010` routes **DeepSeek · Gemini · Groq · xAI** with **no Anthropic in the path**. Claude is right there the moment you want it — and a weekly cap on any single provider **never blocks you**. Your stack, your providers, your call.
+
+---
+
+## Secrets never touch the file
+
+Provider keys flow through **`bin/grip-keyring`** — never baked into this installer, never written to disk in the clear:
+
+| Platform | Keystore |
+|----------|----------|
+| macOS    | Keychain |
+| Linux    | secret-tool |
+| Windows  | Credential Vault |
+
+---
+
+## The witnessable node
+
+When the install finishes it stands up a **happiverse** proof — open `apps/happiverse-proof/index.html` in any browser. No account, no sign-in.
+
+> **Don't trust it — witness it.** Ed25519 signatures you verify yourself.
+
+Read the invariants **honestly**:
+
+- It is **movement-first** — not a uniqueness claim.
+- It proves **one node's OWN signed chain** — *this* machine's record, checkable on the spot.
+- It is **not** a connected network and **not** a Bitcoin anchor. Those are **ROADMAP**, not today. No overclaiming.
+
+---
+
+## The founder's handshake
+
+Some doors open by a person, not a paywall.
+
+```sh
+grip-unlock request "Your Name"
+```
+
+The installer **wires** the unlock; the request **notifies the creator (V>>) personally**. He approves you in — or out. A handshake, not a transaction.
+
+---
+
+## HAPPI 1.3
+
+The open language, grown one auditable primitive at a time:
+
+| Version  | Primitive | What it gives you |
+|---------:|-----------|-------------------|
+| **v1.1** | IDR | the audit primitive — tamper-evident decision records |
+| **v1.2** | signed memory-chain | what was believed, and when — signed |
+| **v1.3** | cite.verify | deterministic citation-provenance — claims you can re-check |
+
+Together the three form **cryptographic causation**: *what* GRIP decided (IDR), *what* it believed when it decided (memory-chain), and every outward claim backed by deterministic provenance (cite.verify) — bound together, falsifiable by math, verifiable by anyone, never by self-assertion.
+
+---
+
+## Two links, everything follows
+
+- **Spec** — https://happi.md
+- **Install** — https://your-gateway.example.com
+
+---
+
+*GRIP + HAL + HAPPI — cross-platform · sovereign · witnessable · cryptographic causation.*
+*One install to replace them all.*
+'''

@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""grip-next-step -- arm, disarm or inspect the next-step continuation on this machine.
+
+  grip-next-step status    whether this machine is armed, and what decides it
+  grip-next-step arm       write the switch: from the next Stop, a session that
+                           ends its turn on "RECOMMENDED NEXT STEP (mine)" carries
+                           on with that step instead of stopping
+  grip-next-step disarm    remove the switch
+
+The switch is <claude dir>/state/next-step-armed.json: one per machine, ignored
+by git, read by hooks/next-step-recorder.py at every Stop, so it reaches
+sessions that are already running. Arming is the operator's decision; nothing
+in GRIP runs this command on his behalf (lib/next_step_router.py, "arming").
+GRIP_NEXT_STEP_ARMED=1 or =0 in a process's environment overrides the switch
+for that process only, and `status` says when that is the case.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from lib.next_step_router import ARM_ENV, arm_path, is_armed  # noqa: E402
+
+
+def _status() -> str:
+    path = arm_path()
+    lines = [
+        f"This machine is {'armed' if is_armed() else 'not armed'}.",
+        f"Switch: {path} ({'present' if path.exists() else 'absent'}).",
+    ]
+    if os.environ.get(ARM_ENV) is not None:
+        lines.append(f"{ARM_ENV}={os.environ[ARM_ENV]!r} is set in this environment "
+                     "and overrides the switch for this process when it reads as on or off.")
+    return "\n".join(lines)
+
+
+def main(argv: list[str]) -> int:
+    command = argv[1] if len(argv) > 1 else "status"
+    path = arm_path()
+    if command == "arm":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        path.write_text(json.dumps({"armed": True, "armed_at": stamp}) + "\n")
+    elif command == "disarm":
+        path.unlink(missing_ok=True)
+    elif command != "status":
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    print(_status())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

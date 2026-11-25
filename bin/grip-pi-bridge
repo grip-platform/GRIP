@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""grip-pi-bridge — mirror GRIP slash commands into pi prompt templates.
+
+pi loads prompt templates from ~/.pi/agent/prompts/*.md (filename = command
+name, so afk.md becomes /afk). GRIP's canonical command source is commands/*.md.
+This bridge keeps the two in sync, idempotently and fenced:
+
+  - writes ONLY files it manages (tracked in a manifest next to the templates)
+  - never touches pi's own templates or anything not in the manifest
+  - --check exits 1 when the mirror is stale (regression gate)
+
+USAGE
+  bin/grip-pi-bridge          # sync commands/ -> ~/.pi/agent/prompts/
+  bin/grip-pi-bridge --check  # diff only, exit 1 if stale
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+GRIP_DIR = Path(__file__).resolve().parent.parent
+COMMANDS_DIR = GRIP_DIR / "commands"
+PI_PROMPTS = Path.home() / ".pi" / "agent" / "prompts"
+MANIFEST = PI_PROMPTS / ".grip-manifest.json"
+
+SKIP = {"CLAUDE.md"}  # not a pi-invocable command
+
+
+def collect() -> dict[str, Path]:
+    return {
+        f.stem: f
+        for f in sorted(COMMANDS_DIR.glob("*.md"))
+        if f.name not in SKIP
+    }
+
+
+def load_manifest() -> dict[str, str]:
+    if not MANIFEST.exists():
+        return {}
+    try:
+        data = json.loads(MANIFEST.read_text())
+        return data.get("managed", {}) if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def sync(check_only: bool) -> int:
+    commands = collect()
+    managed = load_manifest()
+    stale = sorted(set(managed) - set(commands))          # deleted in GRIP
+    to_write = []
+    for name, src in commands.items():
+        dst = PI_PROMPTS / f"{name}.md"
+        if managed.get(name) != src.name or not dst.exists():
+            to_write.append(name)
+            continue
+        if dst.read_text(encoding="utf-8", errors="replace") != \
+                src.read_text(encoding="utf-8", errors="replace"):
+            to_write.append(name)
+
+    problems = sorted(set(to_write) | set(stale))
+    if check_only:
+        if problems:
+            print(f"pi bridge stale: {len(problems)} commands out of sync — "
+                  f"{', '.join(problems[:8])}"
+                  f"{'...' if len(problems) > 8 else ''}")
+            return 1
+        print(f"pi bridge clean: {len(commands)} commands mirrored")
+        return 0
+
+    for name in stale:
+        p = PI_PROMPTS / f"{name}.md"
+        if p.exists():
+            p.unlink()
+        # Forget it too: a removed name left in the manifest made every later
+        # --check report it stale, so the bridge could never be clean again
+        # once any command was deleted (GRIP#9509).
+        managed.pop(name, None)
+    for name in to_write:
+        (PI_PROMPTS / f"{name}.md").write_text(
+            commands[name].read_text(encoding="utf-8", errors="replace"),
+            encoding="utf-8",
+        )
+        managed[name] = commands[name].name
+    manifest = {
+        "generated_by": "grip-pi-bridge",
+        "source": "commands/*.md",
+        "managed": dict(sorted(managed.items())),
+    }
+    MANIFEST.write_text(json.dumps(manifest, indent=2) + "\n")
+    print(f"pi bridge synced: {len(commands)} commands -> {PI_PROMPTS} "
+          f"(wrote {len(to_write)}, removed {len(stale)})")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--check", action="store_true")
+    args = ap.parse_args()
+    if not COMMANDS_DIR.is_dir():
+        print(f"commands dir missing: {COMMANDS_DIR}", file=sys.stderr)
+        return 2
+    PI_PROMPTS.mkdir(parents=True, exist_ok=True)
+    return sync(args.check)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

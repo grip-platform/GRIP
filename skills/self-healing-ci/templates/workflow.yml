@@ -1,0 +1,63 @@
+name: Self-Healing Nightly
+
+on:
+  schedule:
+    - cron: '{{SCHEDULE_CRON}}'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Report only, do not commit fixes or open PRs'
+        type: boolean
+        default: true
+
+concurrency:
+  group: self-healing-nightly
+  cancel-in-progress: false
+
+jobs:
+  nightly-heal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      GH_TOKEN: ${{ secrets.{{BOT_TOKEN_SECRET}} }}
+      DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+      NIGHT_DATE: ${{ github.run_id }}-$(date -u +%Y%m%d)
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.{{BOT_TOKEN_SECRET}} }}
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Install yq (config parser)
+        run: sudo snap install yq || (sudo apt-get update && sudo apt-get install -y jq && wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq)
+
+      - name: Validate config
+        run: |
+          test -f .claude/self-healing-ci/config.yml
+          yq e '.version' .claude/self-healing-ci/config.yml | grep -q "^1\."
+
+      - name: Run outer converge loop
+        run: |
+          claude-code --headless \
+            --prompt-file .claude/self-healing-ci/outer-loop.md \
+            --max-tokens $(yq e '.limits.max_total_tokens_per_night' .claude/self-healing-ci/config.yml) \
+            --context-file .claude/self-healing-ci/config.yml
+
+      - name: Upload run summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-summary-${{ env.NIGHT_DATE }}
+          path: |
+            .claude/self-healing-ci/runs/${{ env.NIGHT_DATE }}/
+          retention-days: 30

@@ -1,0 +1,94 @@
+name: demo
+description: Live demonstration and capability showcase. Use when presenting GRIP to prospects, teams, or recording tutorials.
+version: 1.0.0
+effort: high
+triggers:
+- /mode demo
+- demo
+- showcase
+- walkthrough
+- live presentation
+- show capabilities
+skills:
+  always:
+  - concise-communication
+  - asking-users
+  optional:
+  - professional-pdf
+  - mode
+  - pr-automation
+token_budget: ~2500
+foundation: true
+stacks_with:
+- ut++
+- asking-users
+- creating-wizards
+- hitl
+- context-gate
+prompt_injection: '[MODE: DEMO]
+
+
+  Live demonstration mode active. Optimise for visual clarity and audience engagement.
+
+
+  ## Demo Protocols
+
+
+  1. **Visual Clarity**: Use tables, bullet points, and clear formatting
+
+  2. **Pause Points**: After each major feature, offer Q&A opportunity
+
+  3. **Live Proof**: Let enforcement hooks demonstrate themselves (tool substitution)
+
+  4. **Takeaway Ready**: Be prepared to generate PDF summaries
+
+
+  ## Feature Showcase Order (Recommended)
+
+
+  1. Session Resurrection - "I remember"
+
+  2. Efficiency Protocols - Watch blocking in action
+
+  3. Skill System - 95 skills, 16 agents
+
+  4. AskUserQuestion - Confidence gates
+
+  5. Modes System - Context-aware loading
+
+  6. RSI Loop - Ralph PR review
+
+
+  ## MANDATORY AskUserQuestion when:
+
+
+  - Transitioning between demo sections
+
+  - Audience wants to explore a specific feature
+
+  - Before generating takeaway materials
+
+
+  ## Output Style
+
+
+  - Short, punchy sentences
+
+  - Impact statements after each demo
+
+  - "What you just saw: X" summaries
+
+  - Metrics where applicable (tokens saved, time saved)
+
+  '
+wave:
+  category: orthogonal
+broly:
+  enabled: false
+context:
+- Prospect demonstrations
+- Team onboarding sessions
+- Tutorial recordings
+- Conference presentations
+- Sales calls with technical buyers
+welcome_message: Demo mode active. Live demonstration protocols ready. Showcase features with confidence.

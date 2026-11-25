@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""GRIP Sovereign Demo — N non-Anthropic providers, fired IN PARALLEL.
+
+Proves GRIP's moat live: one prompt answered concurrently by several
+non-Anthropic providers, using the exact config HAL manages (base_urls +
+Keychain keys from ~/.hal/config/providers.yaml). Zero Anthropic egress.
+
+Concurrency is PROVEN, not asserted: total wall-clock is compared against the
+sum of per-call latencies. Sequential => total ~= sum. Parallel => total ~=
+max(individual). That is the falsifiable test.
+
+Usage:
+  grip-sovereign-demo ["prompt"]
+  grip-sovereign-demo --providers deepseek,gemini,groq ["prompt"]
+
+Keys never printed; read inside this process scope only (syscall hygiene).
+"""
+from __future__ import annotations
+
+# Windows consoles default to cp1252, which cannot encode the glyphs below.
+# Located from __file__, not sys.path[0]: the tests load these commands with
+# SourceFileLoader, which does not put bin/ on the path.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from _grip_console import ensure_utf8_stdio  # noqa: E402
+
+ensure_utf8_stdio()
+
+import json
+import os
+import pathlib
+import sys
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+# Ensure repo root + lib/ are on sys.path so the provider_secret shim resolves
+# when this bin runs directly (not via pytest).
+_ROOT = pathlib.Path(__file__).resolve().parent.parent
+for _p in (str(_ROOT), str(_ROOT / "lib")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+# CI-vs-Mac key ladder: env (DEEPSEEK_API_KEY...) -> GRIP_<P>_API_KEY -> Keychain
+# -> Linux /proc — so this demo runs unchanged on Mac dev AND in Linux CI.
+from provider_secret import resolve_provider_key_or_raise  # noqa: E402
+
+# name -> (OpenAI-compatible chat endpoint, model, keychain service)
+REGISTRY = {
+    "deepseek": ("https://api.deepseek.com/v1/chat/completions", "deepseek-v4-pro", "grip-deepseek"),
+    "openai":   ("https://api.openai.com/v1/chat/completions", "gpt-4o-mini", "grip-openai"),
+    "gemini":   ("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "gemini-3.5-flash-lite", "grip-gemini"),
+    "gemini-pro": ("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "gemini-3.1-pro-preview", "grip-gemini"),
+    "groq":     ("https://api.groq.com/openai/v1/chat/completions", "openai/gpt-oss-120b", "grip-groq"),
+    "xai":      ("https://api.x.ai/v1/chat/completions", "grok-4.5", "grip-xai"),
+}
+# The sovereign council's own speakers (lib/sovereign_council.DEFAULT_SPEAKERS)
+# that this table can seat. "openai" stays out: the opt-in guard below skips it,
+# so as a default it quietly left a council of one (GRIP#9374).
+DEFAULT = ["deepseek", "xai", "groq"]
+
+
+def provider_key(service: str) -> str:
+    """Resolve a provider API key via the env -> Keychain -> /proc ladder.
+
+    Env-first (the provider vars CI sets), Keychain as the local-dev fallback —
+    so this demo is not Mac-only. Key read in-process; never printed.
+    """
+    return resolve_provider_key_or_raise(service)
+
+
+# Seat limits, copied from lib/sovereign_council.py (_READ_TIMEOUT_S,
+# _SPEAKER_MAX_TOKENS, _TRUNCATED_FINISH_REASONS) rather than imported, because
+# the council writes signed records; tests/test_sovereign_demo.py pins the copies.
+READ_TIMEOUT_S = {"deepseek": 90, "xai": 90}
+DEFAULT_READ_TIMEOUT_S = 45
+MAX_TOKENS = 3000
+TRUNCATED_FINISH_REASONS = frozenset({"length", "max_tokens", "model_length", "MAX_TOKENS"})
+
+
+def shielded(prompt: str) -> str:
+    """The prompt as it may leave this machine; raises ShieldFailed when it cannot."""
+    from review_redaction import shield_text
+    return shield_text(prompt)
+
+
+def answer_of(data: dict) -> tuple[str, str]:
+    """(final answer, problem): a seat counts only when it gave a complete answer.
+
+    Reasoning text is not an answer, and a reply cut off by its budget is not a
+    stated position, so neither counts towards the council.
+    """
+    choices = data.get("choices") or []
+    if not choices:
+        return "", "no choices in the reply"
+    reason = choices[0].get("finish_reason")
+    content = ((choices[0].get("message") or {}).get("content") or "").strip()
+    if reason in TRUNCATED_FINISH_REASONS:
+        return content, f"cut off by its budget, finish_reason={reason}"
+    if not content:
+        return "", f"no final answer, finish_reason={reason}"
+    return content, ""
+
+
+def _post(name: str, text: str) -> dict:
+    """One chat request to the seat's endpoint; raises on any transport error."""
+    url, model, service = REGISTRY[name]
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": text}],
+        "max_tokens": MAX_TOKENS,
+        "temperature": 0.4,
+    }).encode()
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Authorization": f"Bearer {provider_key(service)}", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=READ_TIMEOUT_S.get(name, DEFAULT_READ_TIMEOUT_S)) as resp:
+        return json.load(resp)
+
+
+def call(name: str, prompt: str, t0: float) -> dict:
+    """One provider call. Returns timing + text, or a clean error — never raises.
+
+    The prompt passes the redaction shield first and nothing is sent when the
+    shield fails; only a complete final answer counts as ok.
+    """
+    model = REGISTRY[name][1]
+    start = time.time() - t0
+    try:
+        answer, problem = answer_of(_post(name, shielded(prompt)))
+        ok, text = not problem, (f"({problem}) {answer}".strip() if problem else answer)
+    except urllib.error.HTTPError as e:
+        ok, text = False, f"HTTP {e.code}: {e.read().decode(errors='replace')[:160]}"
+    except Exception as e:  # noqa: BLE001 — demo must degrade gracefully per provider
+        ok, text = False, f"{type(e).__name__}: {e}"
+    return {"name": name, "model": model, "ok": ok, "text": text,
+            "start": start, "end": time.time() - t0}
+
+
+def parse_args(argv: list[str]) -> tuple[list[str], str]:
+    names, rest = DEFAULT, argv[1:]
+    if rest and rest[0] == "--providers":
+        names = [n.strip() for n in rest[1].split(",") if n.strip() in REGISTRY]
+        rest = rest[2:]
+    # The openai seat bills the per-token key; GPT runs on the ChatGPT subscription
+    # (rules/gpt-on-the-subscription-never-credits.md), so it sits only on the opt-in.
+    if "openai" in names and os.environ.get("GRIP_CODEX_ALLOW_PAID") != "1":
+        print("skipping openai: it bills OpenAI per token; set GRIP_CODEX_ALLOW_PAID=1 to allow paid spend")
+        names = [n for n in names if n != "openai"]
+    prompt = rest[0] if rest else (
+        "In one sentence: why is running on multiple independent AI providers a "
+        "strategic moat, not just a backup?"
+    )
+    return names, prompt
+
+
+def main() -> int:
+    names, prompt = parse_args(sys.argv)
+    print("=" * 72)
+    print(f"GRIP SOVEREIGN DEMO — {' ∥ '.join(names)}, in parallel, zero Anthropic")
+    print("=" * 72)
+    print(f"PROMPT: {prompt}\n")
+
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=len(names)) as ex:
+        results = [f.result() for f in [ex.submit(call, n, prompt, t0) for n in names]]
+    total = time.time() - t0
+
+    for r in results:
+        flag = "OK" if r["ok"] else "FAIL"
+        print(f"--- {r['name']} ({r['model']}) [{flag}]  "
+              f"t={r['start']:.2f}s->{r['end']:.2f}s ({r['end'] - r['start']:.2f}s) ---")
+        print(r["text"])
+        print()
+
+    ok = [r for r in results if r["ok"]]
+    lats = [r["end"] - r["start"] for r in results]
+    sum_lat, max_lat = sum(lats), (max(lats) if lats else 0.0)
+    # Truly parallel => wall-clock ~= max(lat); sequential => wall-clock ~= sum(lat).
+    # Measure the fraction of the MAXIMUM achievable overlap (sum - max) we recovered.
+    # This is correct even when one provider's latency dominates (e.g. a reasoning model).
+    denom = sum_lat - max_lat
+    overlap_ratio = (sum_lat - total) / denom if denom > 0.05 else 1.0
+    parallel = len(ok) >= 2 and overlap_ratio > 0.7
+
+    print("=" * 72)
+    print(f"providers fired : {', '.join(r['name'] for r in results)}  (Anthropic calls: 0)")
+    print(f"succeeded       : {', '.join(r['name'] for r in ok) or 'none'}  ({len(ok)}/{len(results)})")
+    print(f"sequential cost : {sum_lat:.2f}s   |   wall-clock paid: {total:.2f}s   |   overlap recovered: {overlap_ratio * 100:.0f}%")
+    print(f"H-SOVEREIGN-1 (>=2 non-Anthropic providers answer in parallel): "
+          f"{'CONFIRMED' if parallel else 'NOT MET'}")
+    print("=" * 72)
+    return 0 if parallel else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

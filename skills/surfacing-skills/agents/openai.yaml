@@ -1,0 +1,4 @@
+interface:
+  display_name: "Surfacing Skills"
+  short_description: "Index Codex and GRIP skills"
+  default_prompt: "Use -skills to build a slash-command catalogue for Codex and GRIP skills."

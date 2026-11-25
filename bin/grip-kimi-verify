@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# grip-kimi-verify — prove an installed Kimi Code CLI boots headless through the HAL route.
+#
+# A composed ~/.kimi-code/config.toml does not prove the CLI accepts it, exits after
+# one `kimi -p` answer, or reaches the gateway (GRIP#5010: verify a profile can
+# actually BOOT, not merely compose). This separate command performs a real,
+# bounded run while keeping verification off the normal launcher path.
+#
+# This is the operator's opt-in step AFTER installing the CLI themselves:
+#   curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash
+#   grip-kimi -p "hello"          # writes the hal route into config.toml, then runs
+#   grip-kimi-verify              # PASS / FAIL / NOT-INSTALLED, in plain words
+#
+# Exit codes: 0 PASS, 1 FAIL, 2 NOT-INSTALLED (from lib/kimi_boot_probe.py);
+# 3 when the verifier itself could not run (no GRIP venv, probe unreadable) — kept
+# distinct so "kimi is missing" and "the verifier is broken" never share a code.
+#
+# Usage: grip-kimi-verify            GRIP_KIMI_VERIFY_TIMEOUT=<seconds> bounds the headless run (default 90)
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROBE="$SCRIPT_DIR/../lib/kimi_boot_probe.py"
+
+# GRIP's dependencies live in its venv. The shared-tree fallbacks matter when
+# CLAUDE_DIR names a worktree, because worktrees do not carry their own venv.
+# resolve_venv_python knows both layouts (Windows Scripts/python.exe, POSIX
+# bin/python3) but falls back to the SYSTEM python, so a candidate counts only
+# inside its own venv.
+source "$SCRIPT_DIR/../scripts/lib/venv-utils.sh"
+for venv in "$CLAUDE_DIR/venv" "$HOME/.grip/venv" "$HOME/.claude/venv"; do
+    candidate="$(resolve_venv_python "$venv" || true)"
+    [[ "$candidate" == "$venv/"* ]] && PY="$candidate" && break
+done
+if [[ -z "${PY:-}" ]]; then
+    >&2 echo "[grip-kimi-verify] no GRIP venv found; system python3 is not used."
+    >&2 echo "[grip-kimi-verify] looked in: \$CLAUDE_DIR/venv, ~/.grip/venv, ~/.claude/venv"
+    exit 3
+fi
+
+if [[ ! -r "$PROBE" ]]; then
+    >&2 echo "[grip-kimi-verify] boot probe is not readable: $PROBE"
+    exit 3
+fi
+
+exec "$PY" "$PROBE" "$@"

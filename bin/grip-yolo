@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# grip-yolo — manual activation of the unified autonomous loop bypass.
+#
+# Flips the marker file at ~/.claude/state/session/yolo-mode.json, which
+# the GRIP gate pipeline consults at fire-time for every Bash / Write /
+# Edit / Agent call. While the marker is active, halting gates
+# (approach-verification, confidence-gate, pre-check-dispatch,
+# plan-review, code-write, stash-safety, push-to-main)
+# pass through without interrupting the flow.
+#
+# Secrets detection (Gate 3) is NOT in that list and was removed from it on
+# 2026-08-18. It used to be, on the rationale "git-crypt encrypts these
+# anyway" -- measured false (git-crypt matches PATHS, the gate matches
+# FILENAMES; 0 of 22 patterns encrypted at realistic staging paths), so a
+# yolo run could stage and commit a dotenv or a private key. Staging a
+# secret still denies while yolo is on, at every preset.
+#
+# By default, quality gates (DRY/KISS/BIG-O/YAGNI/CC) still fire so code
+# keeps auto-optimising. With --quality, the gate switches to differential
+# enforcement: violations introduced by the edit STILL deny, but pre-existing
+# violations in the touched file pass through with an audit advisory.
+#
+# Force push NEVER passes yolo — rewriting remote history still needs
+# GRIP_AUTONOMOUS L2 or manual approval. Secrets detection is never passed
+# by yolo OR by GRIP_AUTONOMOUS at any level: there is no route that stages
+# a secret unattended.
+#
+# This wrapper is for MANUAL operator use outside a /ultrado or
+# /rsi-optimal invocation. Those slash commands activate yolo
+# automatically (see their SKILL.md files).
+#
+# Usage
+#   grip-yolo on   --reason "quick .env edit for staging"  [--ttl 3600]
+#   grip-yolo on   --reason "land hotfix in legacy file"   --quality
+#   grip-yolo off
+#   grip-yolo status
+#   grip-yolo log            # tail the yolo audit log
+#
+# A --reason string is required for `on` so the audit log captures intent.
+# TTL defaults to 1 hour for manual activation, max 12 hours.
+
+set -euo pipefail
+
+# Code root (PYTHONPATH + venv default) is SELF-LOCATED from this script's
+# own path; CLAUDE_DIR governs ONLY state (the marker + audit log, resolved
+# inside lib/gates/yolo_mode.py via get_claude_dir). Conflating the two let
+# a test that pointed CLAUDE_DIR at the repo-under-test for imports write a
+# REAL yolo marker into the live repo (issue #3822).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GRIP_ROOT="$(dirname "$SCRIPT_DIR")"
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+source "$GRIP_ROOT/scripts/lib/venv-utils.sh"
+# $GRIP_PYTHON still wins; otherwise resolve the venv (any platform layout).
+PY="${GRIP_PYTHON:-}"
+if [[ ! -x "$PY" ]]; then
+    if ! PY="$(resolve_venv_python "$GRIP_ROOT/venv")"; then
+        echo "[grip-yolo] no Python interpreter found (searched $GRIP_ROOT/venv, then PATH)" >&2
+        exit 1
+    fi
+fi
+
+ACTION="${1:-status}"
+shift || true
+
+case "$ACTION" in
+    on)
+        REASON=""
+        TTL=3600
+        PRESET="yolo_l1"
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --reason)
+                    REASON="${2:-}"
+                    shift 2
+                    ;;
+                --ttl)
+                    TTL="${2:-3600}"
+                    shift 2
+                    ;;
+                --quality)
+                    PRESET="yolo_quality"
+                    shift
+                    ;;
+                *)
+                    echo "grip-yolo: unknown flag '$1'" >&2
+                    exit 1
+                    ;;
+            esac
+        done
+        if [[ -z "$REASON" ]]; then
+            echo "grip-yolo: --reason is required for manual activation." >&2
+            echo "Example: grip-yolo on --reason 'patching staging .env' --ttl 1800" >&2
+            exit 2
+        fi
+        PYTHONPATH="$GRIP_ROOT" "$PY" - "$TTL" "$PRESET" "$REASON" <<'PY'
+import sys
+from lib.gates.yolo_mode import activate_yolo
+ttl, preset, reason = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+path = activate_yolo("grip-yolo-manual", ttl_seconds=ttl, bypass_set=preset, reason=reason)
+print(f"yolo: ACTIVE | preset={preset} | marker={path} | ttl={ttl}s | reason={reason!r}")
+PY
+        ;;
+    off)
+        PYTHONPATH="$GRIP_ROOT" "$PY" - <<'PY'
+from lib.gates.yolo_mode import deactivate_yolo
+removed = deactivate_yolo("grip-yolo-manual")
+print(f"yolo: DEACTIVATED" + ("" if removed else " (no active marker)"))
+PY
+        ;;
+    status)
+        PYTHONPATH="$GRIP_ROOT" "$PY" - <<'PY'
+from lib.gates.yolo_mode import is_yolo_active, active_marker_path, session_key
+active, preset = is_yolo_active()
+if not active:
+    print("yolo: INACTIVE")
+else:
+    import json
+    # Read the marker that ACTUALLY governs this session, not the global path.
+    # Reading YOLO_MARKER_PATH directly is how another session's bypass could
+    # be reported as your own (GRIP#5740).
+    marker = active_marker_path()
+    data = json.loads(marker.read_text())
+    owner = data.get("session") or ""
+    if owner and owner == session_key():
+        who = "this session"
+    elif not owner:
+        who = "legacy/global marker — no session recorded"
+    else:
+        who = "ANOTHER SESSION"
+    print(f"yolo: ACTIVE | preset={preset}")
+    print(f"  marker:     {marker}")
+    print(f"  owner:      {who} (session={owner or 'unkeyed'}, pid={data.get('pid')})")
+    print(f"  activator:  {data.get('activator')}")
+    print(f"  reason:     {data.get('reason')}")
+    print(f"  started:    {data.get('started_at')}")
+    print(f"  deadline:   {data.get('deadline')}")
+    print(f"  ttl:        {data.get('ttl_seconds')}s")
+PY
+        ;;
+    log)
+        LOG="$CLAUDE_DIR/logs/yolo-mode.log"
+        if [[ ! -f "$LOG" ]]; then
+            echo "grip-yolo: no audit log at $LOG yet."
+            exit 0
+        fi
+        tail -n 50 "$LOG"
+        ;;
+    *)
+        cat <<HELP
+grip-yolo — manual yolo-mode toggle for halting-gate bypass.
+
+Usage:
+  grip-yolo on --reason "text" [--ttl 3600] [--quality]
+  grip-yolo off
+  grip-yolo status
+  grip-yolo log
+
+  --quality   Differential quality enforcement. PRE-EXISTING DRY/KISS/BIG-O/
+              YAGNI/ISP and CC errors in a file stop blocking edits to it;
+              errors this edit INTRODUCES still deny, always. Reach for it when
+              unrelated debt in a file refuses the very edit that would fix it.
+              e.g. grip-yolo on --reason "land hotfix in legacy file" --quality
+
+Force push is NEVER bypassed. Use GRIP_AUTONOMOUS L2 for that.
+See plans/yolo-mode-unified-autonomous.md for the full gate matrix.
+HELP
+        exit 1
+        ;;
+esac

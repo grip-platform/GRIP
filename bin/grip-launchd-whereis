@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# grip-launchd-whereis — answer "where is this launchd agent defined, and is it running?"
+#
+# Why this exists: on 2026-08-01 an audit concluded the rsi-witness publisher was
+# "described nowhere in the repo". It was wrong. The agent was generated inline by
+# scripts/install-witness-sync.sh, and the search had only listed config/launchd/ —
+# one of NINE directories that hold plist definitions, holding 7 of 36. A definition
+# can live in a committed file OR be written by a script, and looking in one place
+# answers neither question. That wrong negative created two disagreeing definitions
+# of the same agent on main.
+#
+# So this reports all four places an agent can exist, side by side:
+#   1. committed plist files       — what the repo says
+#   2. scripts that generate one   — what the repo BUILDS but does not store
+#   3. ~/Library/LaunchAgents      — what is actually installed on this machine
+#   4. launchctl                   — what launchd is actually running
+# Disagreement between them is the finding; a single row is not the whole truth.
+#
+# Read-only. Never loads, unloads, edits or installs anything.
+#
+# Usage:
+#   grip-launchd-whereis                  # inventory: every definition, by directory
+#   grip-launchd-whereis rsi-witness      # everything matching a label fragment
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+QUERY="${1:-}"
+AGENTS_DIR="$HOME/Library/LaunchAgents"
+
+cd "$REPO"
+
+# Fail loudly if this is not a git checkout, BEFORE reporting any count. Without this the
+# tool answered "0 launchd agents" when `git ls-files` failed — the `|| true` below swallows
+# git's exit status, so a broken invocation and a genuinely empty repo produce the identical
+# confident output. That is a command failure dressed up as a legitimate negative, which is
+# the exact class this tool exists to prevent, reproduced inside it. Caught by running the
+# merged copy of #4337 from outside the repo, where REPO resolves to a non-git directory.
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+    echo "grip-launchd-whereis: $REPO is not a git checkout, so the committed-definition" >&2
+    echo "  search cannot run. Refusing to report a count that would read as 'none found'." >&2
+    exit 2
+fi
+
+# git ls-files, not a filesystem walk: tracked files are the canonical definition set,
+# and it cannot be fooled by an untracked stray or a missing `fd` binary silently
+# returning nothing (which is how the first version of tonight's audit read "0").
+#
+# The `|| true` here is for grep, which exits 1 on zero matches — a repo with no plists is
+# a legitimate empty result. git's own failure is caught by the guard above, so the two
+# cases can no longer be confused.
+_tracked_plists() {
+    git ls-files | grep -E '\.plist(\.template)?$' || true
+}
+
+# Read the label with a real plist parser, falling back to text scraping only if that
+# fails. Matching the filename alone would miss any plist whose label and filename
+# disagree, which is precisely the drift worth finding.
+#
+# The fallback exists because the scrape is genuinely fragile and the AGORA review of
+# #4337 was right about it: `grep -A1` assumes <string> sits on the line immediately
+# after <key>Label</key>, and returns EMPTY on a plist that separates them with a blank
+# line, where plutil reads it correctly (measured, not assumed). plutil is also already a
+# hard dependency of scripts/install-witness-sync.sh, so preferring it costs nothing —
+# but it cannot read a binary or malformed plist, and reporting a partial answer beats
+# reporting none, so the scrape stays as the second attempt rather than being deleted.
+_label_of() {
+    local label=""
+    if command -v plutil >/dev/null 2>&1; then
+        label="$(plutil -extract Label raw -- "$1" 2>/dev/null || true)"
+    fi
+    if [[ -z "$label" ]]; then
+        # Decode the five XML entities on the way out. Raised by the AGORA review of
+        # #4337 and measured: a Label of `com.example.a&lt;b` comes back from plutil as
+        # `com.example.a<b` but from the raw scrape as the undecoded `com.example.a&lt;b`,
+        # which then silently fails every comparison against the real label. A subtly
+        # wrong value is worse than an empty one, because empty is visibly a miss.
+        # &amp; is decoded last so that an encoded `&amp;lt;` does not become `<`.
+        label="$(grep -A2 '<key>Label</key>' -- "$1" 2>/dev/null \
+            | grep -o '<string>[^<]*</string>' \
+            | sed 's|</*string>||g' \
+            | sed 's|&lt;|<|g; s|&gt;|>|g; s|&quot;|"|g; s|&apos;|'"'"'|g; s|&amp;|\&|g' \
+            | head -1 || true)"
+    fi
+    printf '%s' "$label"
+}
+
+_inventory() {
+    echo "== committed launchd definitions =="
+    # Counted by whether the file declares a Label, not by extension. An app bundle's
+    # Info.plist is a .plist and is not a launchd agent; folding it into the agent count
+    # would ship exactly the sort of slightly-wrong number this tool exists to prevent.
+    local agents=0 other=0
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        if grep -q '<key>Label</key>' -- "$f" 2>/dev/null; then
+            agents=$((agents + 1))
+        else
+            other=$((other + 1))
+        fi
+    done < <(_tracked_plists)
+    echo "$agents launchd agents ($other other .plist file(s) excluded), filed under:"
+    _tracked_plists | sed 's|/[^/]*$||' | sort | uniq -c | sort -rn
+    echo
+    echo "There is no single canonical directory. Searching only one of these is how"
+    echo "an agent gets reported as missing when it is merely filed elsewhere, and a"
+    echo "script that writes a plist inline appears in none of them — pass a label to"
+    echo "search generators, installed files and running jobs as well."
+}
+
+_find_in_repo() {
+    echo "== 1. committed definitions matching '$QUERY' =="
+    local hit=0
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        local label
+        label="$(_label_of "$f")"
+        if [[ "$f" == *"$QUERY"* || "$label" == *"$QUERY"* ]]; then
+            printf '  %s\n      label: %s\n' "$f" "${label:-<none declared>}"
+            hit=$((hit + 1))
+        fi
+    done < <(_tracked_plists)
+    # `if` rather than `[[ ]] && echo`: the && form evaluates to 1 when the condition is
+    # false, and under `set -e` that exits the script mid-report — so a SUCCESSFUL match
+    # would truncate the very output it found.
+    if [[ $hit -eq 0 ]]; then
+        echo "  (none — this alone does NOT mean the agent is undefined; see section 2)"
+    fi
+    echo
+
+    # A script that writes a plist is a definition too. This is the section whose
+    # absence produced the wrong negative on 2026-08-01.
+    echo "== 2. scripts that GENERATE a matching plist =="
+    local gen=0
+    # Exclude plist files themselves. `scripts/*` legitimately matches a committed
+    # scripts/*.plist.template, which is a definition (section 1), not a script that
+    # builds one — listing it here would claim a generator that does not exist, the same
+    # category error in the opposite direction.
+    local candidates=()
+    while IFS= read -r f; do
+        [[ -n "$f" ]] && candidates+=("$f")
+    done < <(git ls-files -- '*.sh' '*.py' 'bin/*' 'scripts/*' 2>/dev/null \
+        | grep -v '^tests/' | grep -vE '\.plist(\.template)?$' || true)
+
+    # One grep across every candidate instead of one grep PER candidate. Measured on
+    # this repo (~2,200 candidates): the old loop below spent ~3.1s of the tool's ~4s
+    # total runtime here, almost all of it process-spawn overhead rather than matching
+    # work — Python reading the same files takes ~0.22s. Collecting the Label-bearing
+    # subset in a single pass, then checking $QUERY only on that handful of real
+    # generators, keeps the same AND condition (the set of files reaching the print
+    # below is unchanged) while cutting roughly 2 grep spawns per candidate down to
+    # about 1 spawn total plus 2 per actual generator.
+    local generators=()
+    while IFS= read -r f; do
+        [[ -n "$f" ]] && generators+=("$f")
+    done < <(grep -l '<key>Label</key>' -- "${candidates[@]:-}" 2>/dev/null || true)
+
+    for f in "${generators[@]:-}"; do
+        [[ -n "$f" ]] || continue
+        # -F: the query is a launchd label, always a literal string, never a pattern.
+        # Without it grep reads it as a regex, so the dots in com.grip.doctor match any
+        # character, and an unbalanced bracket makes the match silently fail rather than
+        # error — measured: `grip-launchd-whereis 'com.grip.['` reported "(none)" and
+        # exited 0. A wrong negative from a malformed query, in the tool built to stop
+        # wrong negatives. Raised by the AGORA review of #4337.
+        if grep -qF -- "$QUERY" "$f" 2>/dev/null; then
+            printf '  %s\n' "$f"
+            grep -nF -- "$QUERY" "$f" 2>/dev/null | head -3 | sed 's/^/      /'
+            gen=$((gen + 1))
+        fi
+    done
+    if [[ $gen -eq 0 ]]; then
+        echo "  (none)"
+    fi
+    echo
+}
+
+_find_installed() {
+    echo "== 3. installed on this machine ($AGENTS_DIR) =="
+    if [[ ! -d "$AGENTS_DIR" ]]; then
+        echo "  (no LaunchAgents directory — nothing installed)"
+        echo
+        return
+    fi
+    # Match on filename OR declared label, the same rule section 1 uses. Matching only
+    # the filename made the two sections asymmetric: an agent whose installed file is
+    # named differently from its label would show up in the repo and appear absent from
+    # the machine — a manufactured disagreement, in a tool whose entire output is read as
+    # a disagreement report. Raised by the AGORA review of #4337 and kept because the
+    # asymmetry is real in the code, even though no true divergence exists on this
+    # machine today (the only two filename/label mismatches here are Google plists that
+    # plutil cannot read at all, which is a different problem and is reported as such).
+    local found=0
+    for p in "$AGENTS_DIR"/*.plist; do
+        [[ -e "$p" ]] || continue
+        local base label
+        base="$(basename "$p" .plist)"
+        label="$(_label_of "$p")"
+        if [[ "$base" == *"$QUERY"* || "$label" == *"$QUERY"* ]]; then
+            printf '  %s\n' "$p"
+            if [[ -n "$label" && "$label" != "$base" ]]; then
+                printf '      label: %s  (DIFFERS from filename)\n' "$label"
+            fi
+            found=$((found + 1))
+        fi
+    done
+    if [[ $found -eq 0 ]]; then
+        echo "  (none installed)"
+    fi
+    echo
+}
+
+_find_running() {
+    echo "== 4. what launchd is actually running =="
+    if ! command -v launchctl >/dev/null 2>&1; then
+        echo "  (launchctl unavailable — not macOS)"
+        return
+    fi
+    local uid found=0
+    uid="$(id -u)"
+    while IFS= read -r label; do
+        [[ -n "$label" ]] || continue
+        found=$((found + 1))
+        # runs / last exit / state are the behavioural truth. A job can be installed and
+        # valid and still never fire; only `runs` distinguishes that from a healthy idle
+        # job, and a "pended nondemand spawn" line does NOT indicate a fault.
+        printf '  %s\n' "$label"
+        launchctl print "gui/$uid/$label" 2>/dev/null \
+            | grep -E '^\s+(state|runs|last exit code) ' \
+            | sed 's/^/      /' || echo "      (not loaded in gui/$uid)"
+    done < <(launchctl list 2>/dev/null | awk 'NR>1 {print $3}' | grep -F -- "$QUERY" || true)
+    if [[ $found -eq 0 ]]; then
+        echo "  (no loaded job matches '$QUERY')"
+    fi
+}
+
+# Sourcing defines the helpers without running a report, so _label_of can be tested
+# directly on a hostile plist rather than only through the tool's whole output. The
+# AGORA review of #4337 named that exact falsifier — a plist whose Label and value are
+# separated by blank lines — and a structural "does the source mention plutil" assertion
+# would pass even if the extraction were dead, so the test needs to call the function.
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+    return 0
+fi
+
+if [[ -z "$QUERY" ]]; then
+    _inventory
+    exit 0
+fi
+
+_find_in_repo
+_find_installed
+_find_running

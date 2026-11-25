@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""grip-mob-doctor -- read-only checks for the Guild mob-programming session
+prerequisites (https://aicraftspeopleguild.github.io/mob-programming-onboarding.html#before).
+
+Usage:
+    bin/grip-mob-doctor [--repo-path DIR] [--repo-url URL] [--json]
+
+Exit codes:
+    0  every check is PASS or NEEDS INPUT
+    1  at least one check FAILed
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+from mob_doctor import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

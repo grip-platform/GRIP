@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+"""grip-lexicon — measure, lint, encode and expand KERN instruction files.
+
+  grip-lexicon measure [--tokenizers o200k,cl100k,gpt2,bytes] [--claude MODEL]
+                       [--json | --markdown] [--annotate] [--check]
+  grip-lexicon ratchet              lower each ratchet in config/rules-scope.json (never raises one)
+  grip-lexicon lint [--strict] [--json]
+  grip-lexicon encode [FILE]        English -> defined terms (stdin when FILE is omitted)
+  grip-lexicon expand [FILE]        defined terms -> English: the Rosetta view
+  grip-lexicon normalise [--write]  put the LEXICON at its own fixed point
+  grip-lexicon ledger --write|--check
+
+Every subcommand takes --root, which defaults to the checkout this script lives
+in -- never the shared tree -- so a figure always describes the files you are
+editing. The implementation lives in lib/lexicon/ (see its package docstring).
+"""
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_ROOT))
+
+from lib.lexicon.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

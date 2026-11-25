@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""grip-hal-default — make GRIP's programmatic AI calls default to a Pool-B
+provider (non-Anthropic, ~$0, OFF the Anthropic weekly limit), sparing Pool A.
+
+Two-pool doctrine (rules/pool-a-offload-routing.md):
+  Pool A = the Anthropic harness (this Claude Code REPL, `claude -p`, CC
+           Task/Agent/Workflow subagents) — THIS is the weekly limit.
+  Pool B = HAL grip_infer -> groq/gemini/deepseek/qwen/xai/local — $0, no cap.
+
+GRIP's programmatic LLM calls resolve their default provider from the global
+cold-start /llm marker (state/session/active-llm.json). When that marker is
+UNSET, grip_infer can fall back to `anthropic-cch` (Pool A) — a silent
+weekly-limit leak. This script pins that marker to a Pool-B provider so the
+default is non-Anthropic, and PROVES the effect (live probe + signed usage
+ledger) rather than asserting it.
+
+  grip-hal-default                 # pin default -> groq/openai/gpt-oss-120b, probe, report
+  grip-hal-default --provider deepseek/deepseek-chat
+  grip-hal-default --status        # show current default + usage share, change nothing
+  grip-hal-default --unset         # remove the pin (revert to prior fallback)
+
+Idempotent. The interactive REPL itself is Opus/Anthropic and CANNOT be moved
+off Pool A by this or any script — only GRIP's *programmatic* calls move. This
+script never claims otherwise.
+"""
+from __future__ import annotations
+
+import argparse
+import pathlib
+import sys
+
+_ROOT = pathlib.Path(__file__).resolve().parent.parent
+for _p in (str(_ROOT), str(_ROOT / "lib")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import active_llm  # noqa: E402
+
+# A durable default must not silently expire; pin ~10 years out.
+_DEFAULT_TTL = 10 * 365 * 24 * 3600
+_DEFAULT_PROVIDER = "groq/openai/gpt-oss-120b"
+
+
+def set_default(address: str) -> dict:
+    """Write the GLOBAL cold-start marker to `address` with the canonical
+    schema (reuses active_llm's own payload builder + committer, so the
+    statusline and grip_infer read it unchanged)."""
+    payload = active_llm._solo_payload(address, "solo", None, _DEFAULT_TTL)
+    return active_llm._commit(active_llm.GLOBAL_STATE_FILE, payload)
+
+
+def unset_default() -> bool:
+    sf = active_llm.GLOBAL_STATE_FILE
+    if sf.exists():
+        sf.unlink()
+        return True
+    return False
+
+
+def current_default() -> str:
+    payload = active_llm._read_state(active_llm.GLOBAL_STATE_FILE)
+    if not payload:
+        return "(unset — grip_infer may fall back to anthropic-cch / Pool A)"
+    member = (payload.get("members") or [{}])[0] if payload.get("members") else payload
+    return member.get("address") or member.get("model") or str(payload.get("mode", "?"))
+
+
+def probe_served_provider() -> str:
+    """Fail-open live probe: one trivial grip_infer call; report which provider
+    actually served it. Never raises — a probe failure is reported, not fatal."""
+    try:
+        from lib.hal_llm_adapter import LlamaEngine  # documented-stable seam
+        res = LlamaEngine().infer("Reply with the single word: OK")
+        prov = getattr(res, "provider", None) or getattr(res, "model", None)
+        if prov is None and isinstance(res, dict):
+            prov = res.get("provider") or res.get("model")
+        return prov or "(served — provider field not surfaced)"
+    except Exception as exc:  # noqa: BLE001 — probe is diagnostic, never blocking
+        return f"(probe unavailable: {type(exc).__name__}: {str(exc)[:80]})"
+
+
+def usage_line() -> str:
+    """Verdict from the tamper-evident signed usage ledger, via its own CLI —
+    no import-shape guessing; the CLI is the stable seam."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            [sys.executable, "-m", "lib.llm_usage_ledger", "verify"],
+            capture_output=True, text=True, timeout=30, cwd=str(_ROOT),
+        )
+        out = (r.stdout or r.stderr or "").strip().splitlines()
+        tail = out[-1] if out else "(no output)"
+        return f"usage ledger: {tail[:100]}"
+    except Exception as exc:  # noqa: BLE001
+        return f"usage ledger: (unavailable: {type(exc).__name__})"
+
+
+#: Exit codes for --check. Distinct because the two faults need different
+#: remedies: nothing pinned at all, versus pinned at a Pool-A provider.
+CHECK_OK = 0
+CHECK_UNSET = 1
+CHECK_POOL_A = 2
+
+
+def _is_anthropic(address: str) -> bool:
+    """True if `address` names an Anthropic-served model.
+
+    Reuses lib/model_attribution's two classifiers rather than adding a third
+    vendor table: `normalise_provider` knows provider-shaped strings
+    ('anthropic-cch', bare 'cch'), `vendor_of` knows model-shaped ones
+    ('claude-opus-5'). A marker can legitimately hold either shape, so both
+    are consulted and either verdict is decisive.
+    """
+    try:
+        from model_attribution import ANTHROPIC, normalise_provider, vendor_of
+    except ImportError:
+        # Fail toward NOISE, never toward silence: if the classifier is
+        # unavailable we cannot clear the address, so treat a leading
+        # claude/anthropic token as Anthropic on a literal check.
+        low = address.strip().lower()
+        return low.startswith(("claude", "anthropic", "cch"))
+    first = address.split("/", 1)[0]
+    return ANTHROPIC in (normalise_provider(first), vendor_of(first), vendor_of(address))
+
+
+def check_default() -> int:
+    """Gate-able verdict on whether programmatic calls default OFF Pool A.
+
+    `--status` prints the same fact and always returns 0, so nothing can act
+    on it -- an exit status with no reader positioned to use it. This is the
+    readable form: a health check, a CI step or a session hook can branch on
+    the code without parsing prose.
+    """
+    payload = active_llm._read_state(active_llm.GLOBAL_STATE_FILE)
+    if not payload:
+        print("check:  FAIL — no default pinned; grip_infer may fall back to "
+              "anthropic-cch (Pool A). Fix: grip-hal-default")
+        return CHECK_UNSET
+    address = current_default()
+    if _is_anthropic(address):
+        print(f"check:  FAIL — default {address!r} is Anthropic (Pool A), which is "
+              "the weekly-capped pool. Fix: grip-hal-default")
+        return CHECK_POOL_A
+    print(f"check:  OK — default {address!r} is non-Anthropic (Pool B).")
+    return CHECK_OK
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--provider", default=_DEFAULT_PROVIDER,
+                    help=f"Pool-B provider/model to default to (default: {_DEFAULT_PROVIDER})")
+    ap.add_argument("--status", action="store_true", help="show current default + usage, change nothing")
+    ap.add_argument("--check", action="store_true",
+                    help="exit 0 if the default is Pool-B, 1 if unset, 2 if Pool-A; changes nothing")
+    ap.add_argument("--unset", action="store_true", help="remove the default pin")
+    ap.add_argument("--no-probe", action="store_true", help="skip the live grip_infer probe")
+    ns = ap.parse_args(argv)
+
+    print(f"before: default = {current_default()}")
+
+    if ns.check:
+        return check_default()
+    if ns.status:
+        print(usage_line())
+        return 0
+    if ns.unset:
+        removed = unset_default()
+        print(f"unset: {'removed the pin' if removed else 'no pin was set'}")
+        return 0
+
+    set_default(ns.provider)
+    print(f"after:  default = {current_default()}")
+    print(f"        Pool B ({ns.provider.split('/')[0]}) is non-Anthropic — OFF the weekly limit.")
+    if not ns.no_probe:
+        print(f"probe:  a live grip_infer call was served by -> {probe_served_provider()}")
+    print(usage_line())
+    print("note:   the interactive REPL stays Anthropic/Pool A — only GRIP's programmatic calls moved.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

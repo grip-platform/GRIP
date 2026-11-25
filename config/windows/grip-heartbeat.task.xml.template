@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!--
+  GRIP heartbeat — Windows Task Scheduler template (#23 scaffold).
+  Parallels config/heartbeat (macOS launchd). Placeholders are substituted by
+  scripts/install.ps1 BEFORE `schtasks /create /tn GripHeartbeat /xml <rendered>`:
+    __GRIP_HOME__   -> $env:CLAUDE_DIR  (fallback: "$env:USERPROFILE\.claude")
+    __GRIP_PYTHON__ -> (Get-Command python).Source  (fallback: python3)
+  NEVER bake an operator path/username here — portability is enforced by
+  tests/test_no_hardcoded_operator_paths.py. A>> + F>> validate on real Windows.
+-->
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>GRIP autonomous learning heartbeat (every 2 hours)</Description>
+    <URI>\GripHeartbeat</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <Repetition>
+        <Interval>PT2H</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+      <StartBoundary>2026-01-01T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>__GRIP_PYTHON__</Command>
+      <Arguments>"__GRIP_HOME__\scripts\grip-heartbeat.py"</Arguments>
+      <WorkingDirectory>__GRIP_HOME__</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>

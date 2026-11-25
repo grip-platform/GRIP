@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# agora-tick-launchd — install / uninstall the launchd schedule for the AGORA
+# convergence tick. macOS-only (launchd is the macOS init system).
+#
+# Why launchd: CronCreate in this environment is session-bound. For "runs
+# without fault" — survives Claude restart, machine reboot, terminal close —
+# launchd is the durable native scheduler. Per V>>'s 2026-05-26 ask.
+#
+# Usage:
+#   bin/agora-tick-launchd install    # template → ~/Library/LaunchAgents/, bootstrap
+#   bin/agora-tick-launchd uninstall  # bootout + remove
+#   bin/agora-tick-launchd status     # is the agent loaded?
+#   bin/agora-tick-launchd run-now    # one-off invocation (for testing)
+#
+# Idempotent: install replaces an existing plist; uninstall is no-op if absent.
+
+set -uo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+LABEL="com.codetonight.agora-convergence-tick"
+TEMPLATE="$CLAUDE_DIR/launchd/$LABEL.plist"
+TARGET="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOG_DIR="$CLAUDE_DIR/logs"
+
+usage() { echo "Usage: $(basename "$0") {install|uninstall|status|run-now}"; exit 1; }
+log() { echo "[agora-tick-launchd] $*" >&2; }
+err() { echo "[agora-tick-launchd] ERROR: $*" >&2; }
+
+if [[ "$(uname -s)" != "Darwin" ]]; then
+    err "launchd is macOS-only. On Linux use systemd (see docs/agora-convergence-loop.md)."
+    exit 2
+fi
+
+cmd="${1:-}"
+case "$cmd" in
+    install)
+        if [[ ! -f "$TEMPLATE" ]]; then
+            err "template not found: $TEMPLATE"
+            exit 1
+        fi
+        mkdir -p "$LOG_DIR" "$(dirname "$TARGET")"
+        # Substitute __CLAUDE_DIR__ placeholder with the actual path; idempotent
+        # because we always overwrite TARGET from TEMPLATE.
+        sed "s|__CLAUDE_DIR__|$CLAUDE_DIR|g" "$TEMPLATE" > "$TARGET"
+        log "installed plist → $TARGET"
+        # Bootstrap into the user's gui domain. Bootout first to clear any
+        # stale registration (safe even if not loaded).
+        launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
+        if launchctl bootstrap "gui/$UID" "$TARGET" 2>&1; then
+            log "bootstrapped $LABEL into gui/$UID"
+            log "schedule: every 15 min (:04 :19 :34 :49)"
+            log "logs: $LOG_DIR/agora-tick.{log,err}"
+        else
+            err "launchctl bootstrap failed — plist syntax OK? check 'launchctl print gui/$UID/$LABEL'"
+            exit 3
+        fi
+        ;;
+    uninstall)
+        launchctl bootout "gui/$UID/$LABEL" 2>/dev/null && \
+            log "booted out $LABEL" || log "$LABEL was not loaded"
+        if [[ -f "$TARGET" ]]; then
+            rm -f "$TARGET"
+            log "removed $TARGET"
+        fi
+        ;;
+    status)
+        if launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; then
+            launchctl print "gui/$UID/$LABEL" | head -25
+        else
+            log "$LABEL is NOT loaded"
+            exit 1
+        fi
+        ;;
+    run-now)
+        # One-off invocation, surfacing exit code + tail of logs.
+        log "kickstarting $LABEL once"
+        launchctl kickstart -k "gui/$UID/$LABEL" 2>&1 || {
+            err "kickstart failed — is the agent installed? bin/agora-tick-launchd install first"
+            exit 4
+        }
+        log "kickstart issued; recent log tail:"
+        sleep 2
+        tail -10 "$LOG_DIR/agora-tick.log" 2>/dev/null || true
+        ;;
+    *)
+        usage
+        ;;
+esac

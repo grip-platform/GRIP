@@ -1,0 +1,444 @@
+#!/usr/bin/env python3
+"""grip-iterm-labels -- label every inactive iTerm2 pane with its session's topic.
+
+  grip-iterm-labels install [--no-launch]   copy the AutoLaunch script into iTerm2, then start it
+  grip-iterm-labels status                  installed? same bytes? prerequisites met? running?
+  grip-iterm-labels uninstall               remove the copy, its labels and its pictures
+
+The script itself is integrations/iterm2/grip_pane_labels.py, and the README
+beside it explains what it does and how to tune it. On a machine that is not
+macOS, or that has no iTerm2, every command prints one line and exits 0.
+GRIP_ITERM_APP names the iTerm2 app to look for instead of the usual places.
+"""
+from __future__ import annotations
+
+# Windows consoles default to cp1252, which cannot encode the glyphs below.
+# Located from __file__, not sys.path[0]: the tests load this command with
+# SourceFileLoader, which does not put bin/ on the path.
+import sys as _sys
+from pathlib import Path as _Path
+
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from _grip_console import ensure_utf8_stdio  # noqa: E402
+
+ensure_utf8_stdio()
+
+import argparse
+import hashlib
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+SCRIPT_NAME = "grip_pane_labels.py"
+REPO_SCRIPT = Path(__file__).resolve().parent.parent / "integrations" / "iterm2" / SCRIPT_NAME
+BUNDLE_ID = "com.googlecode.iterm2"
+LAUNCH_WAIT_SECONDS = 6.0
+# The first bytes of every version of the script; only such a file is removed.
+OWN_MARKER = b'"""GRIP pane labels: an iTerm2 AutoLaunch script.'
+# Run the script once with this flag to remove its labels and pictures.
+CLEAR_FLAG = "--clear"
+# The folder of label pictures, under ~/Library/Caches. It must match
+# default_image_dir() in integrations/iterm2/grip_pane_labels.py; a test checks.
+IMAGE_DIR_NAME = "grip-pane-labels"
+
+# The script path and its arguments travel as arguments, never inside the
+# AppleScript text. iTerm2 launches a script named by an absolute path
+# directly (iTermLaunchAPIScriptCommand) and passes the arguments on to it;
+# the check on "running" keeps this command from starting iTerm2 itself.
+LAUNCH_APPLESCRIPT = """on run argv
+    if application id "com.googlecode.iterm2" is running then
+        tell application id "com.googlecode.iterm2" to launch API script named (item 1 of argv) arguments (rest of argv)
+        return "requested"
+    end if
+    return "iterm2-not-running"
+end run"""
+
+
+def is_macos() -> bool:
+    return sys.platform == "darwin"
+
+
+def iterm_app() -> Path | None:
+    """Find iTerm2: $GRIP_ITERM_APP when set, else ~/Applications, else /Applications."""
+    override = os.environ.get("GRIP_ITERM_APP", "").strip()
+    if override:
+        candidates = [Path(override)]
+    else:
+        candidates = [Path.home() / "Applications" / "iTerm.app", Path("/Applications/iTerm.app")]
+    return next((path for path in candidates if path.is_dir()), None)
+
+
+def unavailable_reason() -> str | None:
+    """Say why this machine cannot run the labels, or None when it can."""
+    if not is_macos():
+        return "iTerm2 pane labels are macOS-only"
+    if iterm_app() is None:
+        return "iTerm2 is not installed here (GRIP_ITERM_APP can point at it)"
+    return None
+
+
+def support_dir() -> Path:
+    return Path.home() / "Library" / "Application Support" / "iTerm2"
+
+
+def defaults_read(key: str) -> str:
+    """Read one iTerm2 setting with ``defaults``; "" when it is unset or unreadable."""
+    try:
+        result = subprocess.run(
+            ["defaults", "read", BUNDLE_ID, key], capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def custom_scripts_folder() -> Path | None:
+    """The scripts folder chosen under iTerm2 > Settings > General, if one is in use.
+
+    iTerm2 uses it only when UseCustomScriptsFolder is on and the folder
+    exists (customScriptsFolder in NSFileManager+iTerm.m); otherwise it uses
+    the default folder.
+    """
+    if defaults_read("UseCustomScriptsFolder") != "1":
+        return None
+    folder = defaults_read("CustomScriptsFolder")
+    if not folder:
+        return None
+    path = Path(folder).expanduser()
+    return path if path.is_dir() else None
+
+
+def installed_copy() -> Path:
+    scripts = custom_scripts_folder() or support_dir() / "Scripts"
+    return scripts / "AutoLaunch" / SCRIPT_NAME
+
+
+def candidate_copies() -> list[Path]:
+    """Every place a copy of the script can be, the folder iTerm2 uses now first.
+
+    The default folder and a chosen custom folder both count, even when iTerm2
+    does not use them now, so a copy made before the user switched scripts
+    folders is still found and removed.
+    """
+    places = [installed_copy(), support_dir() / "Scripts" / "AutoLaunch" / SCRIPT_NAME]
+    custom = defaults_read("CustomScriptsFolder")
+    if custom:
+        places.append(Path(custom).expanduser() / "AutoLaunch" / SCRIPT_NAME)
+    return list(dict.fromkeys(places))
+
+
+def is_ours(path: Path) -> bool:
+    """True when ``path`` is a copy of this script, of any version."""
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(len(OWN_MARKER)) == OWN_MARKER
+    except OSError:
+        return False
+
+
+def stray_copies() -> list[Path]:
+    """Copies of the script in a scripts folder iTerm2 no longer uses."""
+    return [path for path in candidate_copies()[1:] if is_ours(path)]
+
+
+def image_dir() -> Path:
+    return Path.home() / "Library" / "Caches" / IMAGE_DIR_NAME
+
+
+def delete_pictures(folder: Path) -> int:
+    """Delete the label pictures, then the folder if nothing else is in it; return how many."""
+    pictures = list(folder.glob("label-*.png"))
+    for picture in pictures:
+        picture.unlink(missing_ok=True)
+    try:
+        folder.rmdir()
+    except OSError:
+        pass  # not there, or something else is in it: either way, leave it
+    return len(pictures)
+
+
+def digest(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return None
+
+
+def runtime_present() -> bool:
+    """True when iTerm2's Python runtime is installed, in either of its layouts.
+
+    Builds that provision the runtime with uv (iTerm2 3.7.7 here) keep one
+    shared venv per Python minor version, uv/venvs/<minor>/bin/python3, and
+    launch a basic script with that interpreter. Older builds unpack an
+    iterm2env folder instead.
+    """
+    folder = support_dir()
+    if not folder.is_dir():
+        return False
+    legacy = any(item.name.startswith("iterm2env") for item in folder.iterdir())
+    return legacy or any((folder / "uv" / "venvs").glob("*/bin/python3"))
+
+
+def api_enabled() -> bool:
+    """True when iTerm2's Python API is on (Settings > General > Magic)."""
+    return defaults_read("EnableAPIServer") == "1"
+
+
+def separate_images_on() -> bool:
+    """True unless iTerm2 draws one background image for a whole window.
+
+    The labels are per-pane background images, so they need iTerm2's
+    "Separate background images per pane" (Settings > Appearance > Panes),
+    which is on unless the user turned it off.
+    """
+    return defaults_read("PerPaneBackgroundImage") != "0"
+
+
+# A Python interpreter, perhaps with flags, just before the script path.
+_PYTHON_BEFORE_SCRIPT = re.compile(r"(?:^|/)python[0-9.]*(?:\s+-\S+)*$", re.IGNORECASE)
+
+
+def runs_script(command: str, path: Path) -> bool:
+    """True when ``command`` runs ``path`` as a Python script, the path last.
+
+    A process that merely names the file, such as an editor or a pager open
+    on it, does not count.
+    """
+    target = str(path)
+    if not command.endswith(target):
+        return False
+    return bool(_PYTHON_BEFORE_SCRIPT.search(command[: -len(target)].rstrip()))
+
+
+def running_pids(path: Path) -> list[int]:
+    """Return the ids of processes running ``path`` as a Python script (read-only)."""
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    pids = []
+    for line in result.stdout.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        if pid.isdigit() and runs_script(command.strip(), path):
+            pids.append(int(pid))
+    return pids
+
+
+def request_launch(path: Path, *arguments: str) -> str:
+    """Ask a running iTerm2 to start the script: "requested", "iterm2-not-running" or why it failed."""
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", LAUNCH_APPLESCRIPT, str(path), *arguments],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"failed: {exc}"
+    if result.returncode != 0:
+        return f"failed: {result.stderr.strip()}"
+    return result.stdout.strip()
+
+
+def wait_for_new_pid(path: Path, before: set[int], seconds: float = LAUNCH_WAIT_SECONDS) -> int | None:
+    """Wait until a process not in ``before`` runs ``path``; return its id, or None."""
+    deadline = time.monotonic() + seconds
+    while True:
+        fresh = sorted(set(running_pids(path)) - before)
+        if fresh or time.monotonic() >= deadline:
+            return fresh[0] if fresh else None
+        time.sleep(0.5)
+
+
+def copy_atomically(source: Path, dest: Path) -> None:
+    """Write ``dest`` through a temporary file, so iTerm2 never reads half a script."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=dest.parent, prefix=".grip_pane_labels.", suffix=".tmp")
+    try:
+        with os.fdopen(handle, "wb") as out:
+            out.write(source.read_bytes())
+        os.replace(temporary, dest)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+
+def _tilde(path: Path) -> str:
+    home, text = str(Path.home()), str(path)
+    return "~" + text[len(home):] if text.startswith(home + os.sep) else text
+
+
+def report_prerequisites() -> bool:
+    """Print whether each prerequisite is met; True when all of them are."""
+    checks = [
+        (api_enabled(), "the iTerm2 Python API is on",
+         "turn it on: iTerm2 > Settings > General > Magic > Enable Python API"),
+        (runtime_present(), "the iTerm2 Python runtime is installed",
+         "install it once: in iTerm2's menu bar, Scripts > Manage > Install Python Runtime"),
+        (separate_images_on(), "iTerm2 gives each pane its own background image",
+         "turn it on: iTerm2 > Settings > Appearance > Panes > Separate background images per pane"),
+    ]
+    for ok, label, remedy in checks:
+        print(f"  ✓ {label}" if ok else f"  ✗ not yet: {label}\n    ↳ {remedy}")
+    return all(ok for ok, _, _ in checks)
+
+
+def install_copy() -> bool:
+    """Copy the script into AutoLaunch unless it is already there; True when written."""
+    dest = installed_copy()
+    if digest(dest) == digest(REPO_SCRIPT):
+        print(f"  ✓ already installed, same bytes as the repository: {_tilde(dest)}")
+        return False
+    copy_atomically(REPO_SCRIPT, dest)
+    print(f"  ✓ installed {_tilde(dest)}")
+    return True
+
+
+def start(dest: Path, written: bool) -> bool:
+    """Start the installed copy, unless the same bytes already run.
+
+    After an update the old copy notices its file changed and stops by
+    itself, so the new copy starts even while the old one still runs.
+    Returns False when the start failed; a closed iTerm2 is not a failure,
+    because iTerm2 starts the script when it opens.
+    """
+    before = set(running_pids(dest))
+    if before and not written:
+        print(f"  ✓ already running (pid {min(before)})")
+        return True
+    outcome = request_launch(dest)
+    if outcome == "iterm2-not-running":
+        print("  · iTerm2 is not running; the labels start with it next time.")
+        return True
+    if outcome != "requested":
+        print(f"  ✗ could not start the script: {outcome}")
+        return False
+    pid = wait_for_new_pid(dest, before)
+    print(f"  ✓ running (pid {pid})" if pid else
+          "  ✗ iTerm2 was asked to start the script, but it is not running yet;"
+          " its errors show in iTerm2's Scripts > Manage > Console")
+    return pid is not None
+
+
+def cmd_install(launch: bool) -> int:
+    """Install and start the labels; 1 when the copy could not be made or did not start."""
+    if digest(REPO_SCRIPT) is None:
+        print(f"  ✗ the repository copy is missing: {REPO_SCRIPT}")
+        return 1
+    print("\n  iTerm2 pane labels: install")
+    dest = installed_copy()
+    if dest.exists() and not is_ours(dest):
+        print(f"  ✗ {_tilde(dest)} is another script with the same name;"
+              " move it elsewhere, then run install again.\n")
+        return 1
+    written = install_copy()
+    ready = report_prerequisites()
+    started = True
+    if not ready:
+        print("  When the steps marked ✗ are done, run bin/grip-iterm-labels install again"
+              " to start the labels now;\n  iTerm2 also starts them each time it starts.")
+    elif launch:
+        started = start(dest, written)
+    print()
+    return 0 if started else 1
+
+
+def cmd_status() -> int:
+    """Report the install; 0 only when it is current and every prerequisite is met.
+
+    Whether the script runs right now is reported but does not decide the
+    result, because it does not run while iTerm2 is closed.
+    """
+    dest = installed_copy()
+    have, want = digest(dest), digest(REPO_SCRIPT)
+    print("\n  iTerm2 pane labels: status")
+    if have is None:
+        print("  ✗ not installed (run: bin/grip-iterm-labels install)")
+    elif have == want:
+        print(f"  ✓ installed, same bytes as the repository: {_tilde(dest)}")
+    else:
+        print(f"  ✗ the installed copy differs from the repository (run install again): {_tilde(dest)}")
+    strays = stray_copies()
+    for stray in strays:
+        print(f"  ✗ another copy is in a scripts folder iTerm2 no longer uses"
+              f" (run uninstall, then install): {_tilde(stray)}")
+    ready = report_prerequisites()
+    pids = running_pids(dest)
+    print(f"  ✓ running (pid {pids[0]})\n" if pids else "  · not running\n")
+    return 0 if have is not None and have == want and ready and not strays else 1
+
+
+def cmd_uninstall() -> int:
+    """Remove every copy of the script, and the labels and pictures it made.
+
+    A running copy removes its labels and pictures itself at its next check.
+    When none runs, this command deletes the pictures, and asks a running
+    iTerm2 to run the script once with --clear to take the labels off the panes.
+    Exits 1 when that request fails.
+    """
+    copies = [path for path in candidate_copies() if is_ours(path)]
+    running = any(running_pids(path) for path in copies)
+    for path in copies:
+        path.unlink()
+        print(f"  ✓ removed {_tilde(path)}")
+    if not copies:
+        print("  · not installed; nothing to remove.")
+    if running:
+        print("  · the running script removes its labels and pictures at its next check.")
+        return 0
+    return 0 if clean_up_leftovers(force=bool(copies)) else 1
+
+
+def clean_up_leftovers(force: bool) -> bool:
+    """With no copy running, remove the labels and pictures an earlier run left.
+
+    The panes are cleared whenever a copy was just removed (``force``), even
+    when macOS has already purged the picture folder, because a pane can still
+    point into it. Returns False only when iTerm2 could not be asked.
+    """
+    folder = image_dir()
+    if not (force or folder.exists()):
+        return True
+    if folder.exists():
+        print(f"  ✓ deleted {delete_pictures(folder)} label pictures from {_tilde(folder)}")
+    outcome = request_launch(REPO_SCRIPT, CLEAR_FLAG)
+    if outcome == "requested":
+        print("  ✓ asked iTerm2 to take the labels off the panes")
+    elif outcome != "iterm2-not-running":
+        print(f"  ✗ could not ask iTerm2 to take the labels off the panes: {outcome}")
+        return False
+    return True
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="grip-iterm-labels",
+        description="Label every inactive iTerm2 pane with its session's topic.",
+    )
+    commands = parser.add_subparsers(dest="command")
+    install = commands.add_parser("install", help="copy the AutoLaunch script into iTerm2, then start it")
+    install.add_argument("--no-launch", action="store_true", help="copy the script but do not start it")
+    commands.add_parser("status", help="report the install, its prerequisites and whether it runs")
+    commands.add_parser("uninstall", help="remove the copy, its labels and its pictures")
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    args = build_parser().parse_args(argv)
+    reason = unavailable_reason()
+    if reason:
+        print(f"grip-iterm-labels: {reason}; nothing to do.")
+        return 0
+    if args.command == "install":
+        return cmd_install(launch=not args.no_launch)
+    if args.command == "uninstall":
+        return cmd_uninstall()
+    return cmd_status()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

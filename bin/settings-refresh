@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# settings-refresh — disciplined re-pin of ~/.claude/settings.json SHA.
+#
+# Closes the silent-baseline-rollforward attack class on the W1 integrity
+# gate (bin/settings-integrity-monitor.sh). Whereas the monitor's --accept
+# silently overwrites the whitelist, this wrapper enforces the full
+# discipline:
+#
+#   1. SHOW the diff between current settings.json and the last-pinned
+#      snapshot in state/security/settings-pinned.json.
+#   2. CONFIRM via tty prompt "Pin new SHA? [y/N]:"
+#      (or --non-interactive --acknowledge "<reason>").
+#   3. WRITE new pinned snapshot + prev_sha + ISO timestamp to
+#      state/security/settings-pinned.json.
+#   4. AUDIT-LOG one JSON line to
+#      state/security/settings-refresh-audit.jsonl with operator user,
+#      hostname, prev_sha, new_sha, reason, tty/non-tty flag, timestamp.
+#   5. RE-PIN the monitor's whitelist so the daily drift check passes
+#      until the next legitimate edit.
+#
+# Refuses to pin without showing the diff. Refuses non-interactive runs
+# unless --acknowledge is given. Per syscall doctrine: this is the only
+# sanctioned path for moving the settings.json baseline forward.
+#
+# Hypothesis H-SETREFRESH-1 (registered separately):
+#   "Operator-facing settings.json refresh discipline (mandatory diff +
+#   explicit confirmation + audit log) eliminates the silent-baseline-
+#   rollforward attack class. Verifiable via: any refresh in
+#   settings-refresh-audit.jsonl lacking a populated `acknowledge` field
+#   = falsification."
+#
+# Exit codes:
+#   0 — refresh applied (new SHA pinned, audit line written).
+#   1 — operator declined or no changes to pin.
+#   2 — internal error (missing settings.json, missing tools).
+#   3 — non-interactive run without --acknowledge.
+
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+SETTINGS="$CLAUDE_DIR/settings.json"
+STATE_DIR="$CLAUDE_DIR/state/security"
+PINNED="$STATE_DIR/settings-pinned.json"
+AUDIT="$STATE_DIR/settings-refresh-audit.jsonl"
+MONITOR_WHITELIST="$STATE_DIR/settings-integrity.whitelist"
+
+mkdir -p "$STATE_DIR"
+
+usage() {
+  cat <<'EOF' >&2
+settings-refresh — disciplined re-pin of settings.json SHA
+
+Usage:
+  bin/settings-refresh                                # interactive (tty)
+  bin/settings-refresh --non-interactive \
+      --acknowledge "<reason>"                        # CI / scripted
+  bin/settings-refresh --status                       # show pinned state
+  bin/settings-refresh --help
+
+Options:
+  --non-interactive       Skip tty prompt. Requires --acknowledge.
+  --acknowledge "REASON"  Free-text reason captured in audit log.
+  --status                Print pinned snapshot + last audit line.
+  --help                  Show this help.
+
+Exit codes: 0=refreshed, 1=declined/no-op, 2=error, 3=non-interactive
+without --acknowledge.
+EOF
+}
+
+compute_sha() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    echo "settings-refresh: no shasum or sha256sum available" >&2
+    return 2
+  fi
+}
+
+read_prev_sha() {
+  # Parse prev SHA from settings-pinned.json (graceful if missing/empty).
+  if [[ -f "$PINNED" ]]; then
+    awk -F'"' '/"sha"/ {print $4; exit}' "$PINNED" 2>/dev/null
+  fi
+}
+
+show_status() {
+  if [[ -f "$PINNED" ]]; then
+    echo "[pinned]"; cat "$PINNED"; echo
+  else
+    echo "[pinned] (no snapshot yet — first refresh will bootstrap)"
+  fi
+  if [[ -f "$AUDIT" ]]; then
+    echo "[last audit line]"; tail -1 "$AUDIT"
+  else
+    echo "[audit] (no audit log yet)"
+  fi
+}
+
+show_diff() {
+  local prev_sha="$1"
+  if [[ -z "$prev_sha" ]]; then
+    echo "[diff] no prior pinned SHA — first refresh bootstraps the baseline." >&2
+    return 0
+  fi
+  local current_sha
+  current_sha=$(compute_sha "$SETTINGS") || return 2
+  echo "[diff] prev pinned SHA: $prev_sha" >&2
+  echo "[diff] current SHA:    $current_sha" >&2
+  if [[ "$prev_sha" == "$current_sha" ]]; then
+    echo "[diff] settings.json unchanged since last pin — nothing to refresh." >&2
+    return 1
+  fi
+  # Word-level diff against the SHA-tagged historical content is not
+  # tractable without an external blob store; the monitor's whitelist
+  # only stores the SHA. Surface the *current* settings.json content
+  # so the operator sees what they are pinning. Use the env BAT / less
+  # paginator if available; fall back to head.
+  echo "[diff] current settings.json content (review before pinning):" >&2
+  if command -v bat >/dev/null 2>&1; then
+    bat --paging=never --style=plain "$SETTINGS" >&2 || cat "$SETTINGS" >&2
+  else
+    cat "$SETTINGS" >&2
+  fi
+  return 0
+}
+
+write_pinned() {
+  local new_sha="$1" prev_sha="$2" ts="$3"
+  local tmp
+  tmp=$(mktemp)
+  cat >"$tmp" <<EOF
+{
+  "sha": "$new_sha",
+  "prev_sha": "$prev_sha",
+  "ts": "$ts",
+  "settings_path": "$SETTINGS"
+}
+EOF
+  mv "$tmp" "$PINNED"
+}
+
+write_audit() {
+  local new_sha="$1" prev_sha="$2" ts="$3" reason="$4" tty_flag="$5"
+  local user host
+  user="${USER:-$(id -un)}"
+  host="$(hostname -s 2>/dev/null || hostname)"
+  # Escape any embedded double quotes in reason for safe JSON.
+  local r_esc=${reason//\"/\\\"}
+  printf '{"ts":"%s","user":"%s","host":"%s","prev_sha":"%s","new_sha":"%s","acknowledge":"%s","tty":%s}\n' \
+    "$ts" "$user" "$host" "$prev_sha" "$new_sha" "$r_esc" "$tty_flag" >>"$AUDIT"
+}
+
+repin_monitor_whitelist() {
+  local sha="$1" ts="$2"
+  if [[ -f "$MONITOR_WHITELIST" ]]; then
+    cp "$MONITOR_WHITELIST" "$MONITOR_WHITELIST.prev"
+  fi
+  printf '%s  # refreshed %s via bin/settings-refresh\n' "$sha" "$ts" >"$MONITOR_WHITELIST"
+}
+
+# --- argument parsing ------------------------------------------------------
+
+NON_INTERACTIVE=0
+ACKNOWLEDGE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --non-interactive) NON_INTERACTIVE=1; shift ;;
+    --acknowledge)
+      [[ $# -ge 2 ]] || { echo "settings-refresh: --acknowledge requires a value" >&2; exit 2; }
+      ACKNOWLEDGE="$2"; shift 2 ;;
+    --status) show_status; exit 0 ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "settings-refresh: unknown option: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+# --- preconditions ---------------------------------------------------------
+
+if [[ ! -f "$SETTINGS" ]]; then
+  echo "settings-refresh: $SETTINGS not found" >&2
+  exit 2
+fi
+
+if [[ "$NON_INTERACTIVE" == "1" && -z "$ACKNOWLEDGE" ]]; then
+  echo "settings-refresh: --non-interactive requires --acknowledge \"<reason>\"" >&2
+  exit 3
+fi
+
+# --- main flow -------------------------------------------------------------
+
+PREV_SHA=$(read_prev_sha || true)
+PREV_SHA=${PREV_SHA:-""}
+
+DIFF_RC=0
+show_diff "$PREV_SHA" || DIFF_RC=$?
+if [[ "$DIFF_RC" == "1" ]]; then
+  # No changes to pin.
+  exit 1
+elif [[ "$DIFF_RC" == "2" ]]; then
+  exit 2
+fi
+
+NEW_SHA=$(compute_sha "$SETTINGS")
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+if [[ "$NON_INTERACTIVE" == "0" ]]; then
+  # Read confirmation from /dev/tty if available; refuse silent run.
+  if [[ ! -t 0 ]] && [[ ! -r /dev/tty ]]; then
+    echo "settings-refresh: stdin is not a tty and /dev/tty unavailable; rerun with --non-interactive --acknowledge \"<reason>\"" >&2
+    exit 3
+  fi
+  if [[ -r /dev/tty ]]; then
+    printf 'Pin new SHA? [y/N]: ' >&2
+    read -r REPLY </dev/tty || REPLY=""
+  else
+    printf 'Pin new SHA? [y/N]: ' >&2
+    read -r REPLY || REPLY=""
+  fi
+  case "$REPLY" in
+    y|Y|yes|YES) ;;
+    *) echo "settings-refresh: operator declined; baseline unchanged." >&2; exit 1 ;;
+  esac
+  TTY_FLAG="true"
+  REASON=${ACKNOWLEDGE:-"interactive confirm"}
+else
+  TTY_FLAG="false"
+  REASON="$ACKNOWLEDGE"
+fi
+
+write_pinned "$NEW_SHA" "$PREV_SHA" "$TS"
+write_audit "$NEW_SHA" "$PREV_SHA" "$TS" "$REASON" "$TTY_FLAG"
+repin_monitor_whitelist "$NEW_SHA" "$TS"
+
+echo "settings-refresh: pinned new SHA"
+echo "  prev: ${PREV_SHA:-<bootstrap>}"
+echo "  new:  $NEW_SHA"
+echo "  ts:   $TS"
+echo "  audit: $AUDIT"
+echo "  pinned snapshot: $PINNED"
+exit 0

@@ -1,0 +1,424 @@
+#!/usr/bin/env bash
+# grip-hal — multi-provider LiteLLM proxy launcher for GRIP.
+#
+# HAL (Harness Abstraction Layer) proxy: routes Claude Code to any provider
+# configured in config/litellm-config.yaml. Fetches API keys from macOS
+# Keychain, exports them as env vars, then starts the LiteLLM proxy and
+# launches claude (or a custom target) via ANTHROPIC_BASE_URL.
+#
+# Supported providers (--provider flag):
+#   groq, gemini, deepseek, qwen, moonshot, zhipu, mistral, openrouter,
+#   openai, soruxgpt, ollama, vllm, lmstudio, mlx_vlm, lemonade
+#   all (default) — every available key; openai's only with GRIP_CODEX_ALLOW_PAID=1
+#
+# Usage:
+#   grip-hal                           # all providers, launch claude
+#   grip-hal --provider groq           # only use Groq models
+#   grip-hal --provider deepseek       # only use DeepSeek models
+#   grip-hal --provider gemini         # Gemini-only (same as grip-gemini)
+#   grip-hal --provider ollama         # local Ollama only (no key needed)
+#   grip-hal --keep-alive              # leave proxy running after claude exits
+#   grip-hal --port 4001               # override port (default 4000)
+#   grip-hal -- grip latest            # launch a different target
+#   grip-hal proxy                     # start proxy in foreground (Ctrl-C to stop)
+#   grip-hal proxy --provider groq     # foreground proxy, Groq keys only
+#   grip-hal status                    # show proxy pid / port / health
+#   grip-hal stop                      # kill the background proxy
+#
+# Security: requires LiteLLM >= 1.82.9 (supply chain incident floor, Mar 2026).
+# See docs/litellm-proxy.md for full documentation.
+
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+CONFIG="${GRIP_HAL_CONFIG:-$CLAUDE_DIR/config/litellm-config.yaml}"
+LITELLM_BIN="${LITELLM_BIN:-/opt/homebrew/bin/litellm}"
+PORT="${LITELLM_PORT:-4000}"
+MIN_LITELLM_VERSION="1.82.9"
+LOG_DIR="$CLAUDE_DIR/logs"
+LOG="$LOG_DIR/litellm-proxy.log"
+STATE_DIR="$CLAUDE_DIR/state"
+PID_FILE="$STATE_DIR/litellm-proxy.pid"
+
+# Cloud providers: name → keychain-service, env-var-name
+# Local providers need no API key; they are always attempted if server is up.
+CLOUD_PROVIDERS="groq gemini qwen deepseek moonshot zhipu mistral openrouter openai soruxgpt"
+LOCAL_PROVIDERS="lemonade ollama vllm lmstudio mlx_vlm"
+
+provider_keychain() {
+    case "$1" in
+        groq)       printf 'grip-groq' ;;
+        gemini)     printf 'grip-gemini' ;;
+        qwen)       printf 'grip-dashscope' ;;
+        deepseek)   printf 'grip-deepseek' ;;
+        moonshot)   printf 'grip-moonshot' ;;
+        zhipu)      printf 'grip-zhipu' ;;
+        mistral)    printf 'grip-mistral' ;;
+        openrouter) printf 'grip-openrouter' ;;
+        openai)     printf 'grip-openai' ;;
+        soruxgpt)   printf 'grip-soruxgpt' ;;
+        *)          printf '' ;;
+    esac
+}
+
+provider_envvar() {
+    case "$1" in
+        groq)       printf 'GROQ_API_KEY' ;;
+        gemini)     printf 'GEMINI_API_KEY' ;;
+        qwen)       printf 'DASHSCOPE_API_KEY' ;;
+        deepseek)   printf 'DEEPSEEK_API_KEY' ;;
+        moonshot)   printf 'MOONSHOT_API_KEY' ;;
+        zhipu)      printf 'ZHIPU_API_KEY' ;;
+        mistral)    printf 'MISTRAL_API_KEY' ;;
+        openrouter) printf 'OPENROUTER_API_KEY' ;;
+        openai)     printf 'OPENAI_API_KEY' ;;
+        soruxgpt)   printf 'SORUXGPT_API_KEY' ;;
+        *)          printf '' ;;
+    esac
+}
+
+err()  { printf '[grip-hal] ERROR: %s\n' "$*" >&2; }
+info() { printf '[grip-hal] %s\n' "$*"; }
+
+# OpenAI's API key bills per token, and LiteLLM sends it straight to
+# api.openai.com, past HAL's spend guard. GRIP runs GPT on the ChatGPT
+# subscription, so this key loads only when the operator sets
+# GRIP_CODEX_ALLOW_PAID=1 (rules/gpt-on-the-subscription-never-credits.md,
+# GRIP#9477). Other providers bill on their own hosts and are unaffected.
+paid_key_refused() {
+    [[ "$1" == "openai" && "${GRIP_CODEX_ALLOW_PAID:-}" != "1" ]]
+}
+
+# Minimum context window for each provider (tokens).
+# Used to set CONTEXT_GATE_MAX so GRIP's context gate fires at the correct threshold
+# for non-1M models (Groq 128K, DeepSeek 64K, Mistral 32K, etc.).
+# Conservative estimate: use smallest model in the provider's pool.
+provider_min_context() {
+    case "$1" in
+        groq)       printf '32768' ;;    # Qwen3-32B on Groq = 32K
+        gemini)     printf '1000000' ;;  # Gemini 2.5 Flash/Pro = 1M
+        deepseek)   printf '65536' ;;    # DeepSeek Chat/Reasoner = 64K
+        qwen)       printf '32768' ;;    # Qwen3.5 Flash = 32K
+        moonshot)   printf '131072' ;;   # Moonshot v1-128k = 128K
+        zhipu)      printf '131072' ;;   # GLM-5.1 = 128K
+        mistral)    printf '32768' ;;    # Mistral Small = 32K
+        openrouter) printf '32768' ;;    # Conservative minimum across routed models
+        openai)     printf '131072' ;;   # GPT-4o = 128K
+        soruxgpt)   printf '1000000' ;;  # Gemini Flash proxy = 1M
+        lemonade)   printf '32768' ;;    # Local models vary; conservative
+        ollama)     printf '32768' ;;    # Local models vary; conservative
+        vllm)       printf '32768' ;;    # Local models vary; conservative
+        lmstudio)   printf '32768' ;;    # Local models vary; conservative
+        mlx_vlm)    printf '32768' ;;    # Local models vary; conservative
+        *)          printf '1000000' ;;  # Default: assume 1M (native Anthropic)
+    esac
+}
+
+# LitM-calibrated warning percentage per provider.
+# Sources: Databricks 2024, RULER benchmark, Chroma Context Rot 2025.
+provider_warning_pct() {
+    case "$1" in
+        groq)       printf '30' ;;  # Llama 70B: RULER effective 64K, onset at 25% fill
+        gemini)     printf '45' ;;  # Gemini 2.5 Flash: Chroma variability at long contexts
+        deepseek)   printf '50' ;;  # DeepSeek V3 self-reported; conservative
+        qwen)       printf '50' ;;  # Qwen3 DashScope hosted; moderate
+        moonshot)   printf '40' ;;  # Moonshot v1-128k; no independent benchmark
+        zhipu)      printf '40' ;;  # GLM-5.1; no independent benchmark
+        mistral)    printf '40' ;;  # Mistral Large RULER: effective 64K of 128K
+        openrouter) printf '35' ;;  # Mixed pool; conservative
+        openai)     printf '55' ;;  # GPT-4o Databricks flat to 125K
+        soruxgpt)   printf '45' ;;  # Gemini Flash proxy
+        lemonade|ollama|vllm|lmstudio|mlx_vlm) printf '30' ;;  # Local models
+        *)          printf '50' ;;  # Default: same as Anthropic native
+    esac
+}
+
+# LitM-calibrated critical percentage per provider.
+provider_critical_pct() {
+    case "$1" in
+        groq)       printf '55' ;;
+        gemini)     printf '70' ;;
+        deepseek)   printf '75' ;;
+        qwen)       printf '75' ;;
+        moonshot)   printf '65' ;;
+        zhipu)      printf '65' ;;
+        mistral)    printf '65' ;;
+        openrouter) printf '60' ;;
+        openai)     printf '80' ;;
+        soruxgpt)   printf '70' ;;
+        lemonade|ollama|vllm|lmstudio|mlx_vlm) printf '55' ;;
+        *)          printf '70' ;;
+    esac
+}
+
+require_litellm() {
+    if [[ ! -x "$LITELLM_BIN" ]]; then
+        err "LiteLLM binary not found at $LITELLM_BIN"
+        err "Install: pip3 install 'litellm[proxy]>=$MIN_LITELLM_VERSION'"
+        err "Or: LITELLM_BIN=/path/to/litellm grip-hal ..."
+        exit 1
+    fi
+    local ver
+    ver="$("$LITELLM_BIN" --version 2>&1 | awk -F'= ' '/Current Version/ {print $2; exit}')"
+    if [[ -z "$ver" ]]; then
+        err "Could not read LiteLLM version from $LITELLM_BIN"
+        exit 1
+    fi
+    if [[ "$(printf '%s\n%s\n' "$MIN_LITELLM_VERSION" "$ver" | sort -V | head -1)" != "$MIN_LITELLM_VERSION" ]]; then
+        err "LiteLLM $ver is below floor $MIN_LITELLM_VERSION (CVE: 1.82.7, 1.82.8)"
+        err "Upgrade: pip3 install --upgrade 'litellm[proxy]>=$MIN_LITELLM_VERSION'"
+        exit 1
+    fi
+}
+
+require_config() {
+    if [[ -f "$CONFIG" ]]; then
+        return 0
+    fi
+    local example="${CONFIG}.example"
+    if [[ -f "$example" ]]; then
+        info "config not found — bootstrapping from $(basename "$example")"
+        cp "$example" "$CONFIG"
+        return 0
+    fi
+    err "Config not found at $CONFIG"
+    err "Bootstrap: cp '$CLAUDE_DIR/config/litellm-config.yaml.example' '$CONFIG'"
+    exit 1
+}
+
+# Fetch all (or filtered) provider keys from Keychain; export as env vars.
+# Missing keys are logged as skipped — those provider entries will fail in
+# LiteLLM and the router falls back to the next healthy deployment.
+load_keys() {
+    local filter="${1:-all}"
+    local loaded=0
+    local p
+
+    # Clear a refused key inherited from the shell, whatever the filter: LiteLLM
+    # reads the whole environment and the whole config, not only the provider
+    # asked for (AGORA on GRIP#9644: --provider groq kept it exported).
+    for p in $CLOUD_PROVIDERS; do
+        if paid_key_refused "$p"; then unset "$(provider_envvar "$p")"; fi
+    done
+
+    # Validate non-local provider filter
+    if [[ "$filter" != "all" ]]; then
+        local is_cloud=0 is_local=0
+        for p in $CLOUD_PROVIDERS; do [[ "$p" == "$filter" ]] && is_cloud=1; done
+        for p in $LOCAL_PROVIDERS; do [[ "$p" == "$filter" ]] && is_local=1; done
+        if [[ $is_local -eq 1 ]]; then
+            info "local provider: $filter — no API key required"
+            return 0
+        fi
+        if [[ $is_cloud -eq 0 ]]; then
+            err "Unknown provider '$filter'"
+            err "Valid cloud: $CLOUD_PROVIDERS"
+            err "Valid local: $LOCAL_PROVIDERS"
+            exit 1
+        fi
+        if paid_key_refused "$filter"; then
+            err "The $filter key bills per token; GRIP runs GPT on the ChatGPT subscription."
+            err "Set GRIP_CODEX_ALLOW_PAID=1 to load it for this run."
+            exit 1
+        fi
+    fi
+
+    for p in $CLOUD_PROVIDERS; do
+        [[ "$filter" != "all" && "$filter" != "$p" ]] && continue
+        if paid_key_refused "$p"; then
+            info "key skipped: $p (bills per token; GRIP_CODEX_ALLOW_PAID=1 loads it)"
+            continue
+        fi
+
+        local svc envvar key
+        svc="$(provider_keychain "$p")"
+        envvar="$(provider_envvar "$p")"
+        [[ -z "$svc" || -z "$envvar" ]] && continue
+
+        if key=$(security find-generic-password -s "$svc" -w 2>/dev/null) && [[ -n "$key" ]]; then
+            export "$envvar=$key"
+            info "key loaded: $p"
+            loaded=$((loaded + 1))
+        else
+            info "key absent: $p (keychain '$svc' — provider skipped by router)"
+        fi
+    done
+
+    if [[ $loaded -eq 0 && "$filter" != "all" ]]; then
+        local svc
+        svc="$(provider_keychain "$filter")"
+        err "No key found for '$filter' in keychain service '${svc:-grip-$filter}'"
+        err "Add it: security add-generic-password -U -s '${svc:-grip-$filter}' -a \"\$USER\" -w '<your-key>'"
+        exit 1
+    fi
+
+    info "keys: $loaded loaded"
+}
+
+port_in_use() {
+    lsof -iTCP:"$PORT" -sTCP:LISTEN -t >/dev/null 2>&1
+}
+
+wait_for_ready() {
+    local pid="$1" url="http://127.0.0.1:$PORT/health/readiness"
+    for _ in $(seq 1 60); do
+        if curl -fsS -o /dev/null -m 1 "$url" 2>/dev/null; then
+            return 0
+        fi
+        if ! kill -0 "$pid" 2>/dev/null; then
+            err "Proxy (pid $pid) died before readiness"
+            err "Last 20 log lines:"
+            tail -n 20 "$LOG" >&2 || true
+            return 1
+        fi
+        sleep 0.5
+    done
+    err "Timed out waiting for proxy at $url"
+    return 1
+}
+
+start_proxy_bg() {
+    mkdir -p "$LOG_DIR" "$STATE_DIR"
+    if port_in_use; then
+        err "Port $PORT already in use — run: grip-hal stop"
+        exit 1
+    fi
+    info "starting proxy on 127.0.0.1:$PORT (log: $LOG)"
+    "$LITELLM_BIN" --config "$CONFIG" --port "$PORT" --host 127.0.0.1 \
+        >"$LOG" 2>&1 &
+    local pid=$!
+    printf '%s\n' "$pid" > "$PID_FILE"
+    if ! wait_for_ready "$pid"; then
+        kill "$pid" 2>/dev/null || true
+        rm -f "$PID_FILE"
+        exit 1
+    fi
+    info "proxy ready (pid $pid)"
+    printf '%s' "$pid"
+}
+
+stop_proxy() {
+    local pid=""
+    [[ -f "$PID_FILE" ]] && pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        info "stopping proxy (pid $pid)"
+        kill "$pid" 2>/dev/null || true
+        for _ in 1 2 3 4 5; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.2
+        done
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+}
+
+cmd_run() {
+    local keep_alive=0 provider="all"
+    local target=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --keep-alive)  keep_alive=1; shift ;;
+            --port)        PORT="$2"; shift 2 ;;
+            --provider)    provider="$2"; shift 2 ;;
+            --)            shift; target=("$@"); break ;;
+            -h|--help)     print_help; exit 0 ;;
+            *)             err "unknown flag: $1"; exit 2 ;;
+        esac
+    done
+    [[ ${#target[@]} -eq 0 ]] && target=(claude)
+
+    require_litellm
+    require_config
+    load_keys "$provider"
+
+    local pid
+    pid="$(start_proxy_bg)"
+
+    cleanup_run() {
+        if [[ $keep_alive -eq 0 ]]; then
+            stop_proxy
+        else
+            info "proxy left running on port $PORT (pid $pid) — stop with: grip-hal stop"
+        fi
+    }
+    trap cleanup_run EXIT INT TERM
+
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT"
+
+    # Set CONTEXT_GATE_MAX to the provider's minimum context window so GRIP's
+    # context gate fires at the correct threshold. Skipped for 'all' (mixed pool)
+    # since LiteLLM's failover may route to a 1M model; left at default in that case.
+    if [[ "$provider" != "all" ]]; then
+        local ctx_max warn_pct critical_pct
+        ctx_max="$(provider_min_context "$provider")"
+        warn_pct="$(provider_warning_pct "$provider")"
+        critical_pct="$(provider_critical_pct "$provider")"
+        export CONTEXT_GATE_MAX="$ctx_max"
+        export CONTEXT_GATE_WARNING="$(( ctx_max * warn_pct / 100 ))"
+        export CONTEXT_GATE_CRITICAL="$(( ctx_max * critical_pct / 100 ))"
+        info "context gate: max=${ctx_max} warn=${warn_pct}% critical=${critical_pct}% (provider: $provider)"
+    fi
+
+    info "launching: ${target[*]} (provider=$provider, ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL)"
+    set +e
+    "${target[@]}"
+    local rc=$?
+    set -e
+    exit "$rc"
+}
+
+cmd_proxy_fg() {
+    local provider="all"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --provider) provider="$2"; shift 2 ;;
+            *) break ;;
+        esac
+    done
+    require_litellm
+    require_config
+    if port_in_use; then
+        err "Port $PORT already in use"
+        exit 1
+    fi
+    mkdir -p "$LOG_DIR" "$STATE_DIR"
+    load_keys "$provider"
+    info "LiteLLM proxy on 127.0.0.1:$PORT (provider=$provider, Ctrl-C to stop)"
+    exec "$LITELLM_BIN" --config "$CONFIG" --port "$PORT" --host 127.0.0.1
+}
+
+cmd_status() {
+    if [[ ! -f "$PID_FILE" ]]; then
+        info "status: STOPPED (no pid file)"
+        return 0
+    fi
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+        info "status: STOPPED (stale pid file — removing)"
+        rm -f "$PID_FILE"
+        return 0
+    fi
+    info "status: RUNNING  pid=$pid  port=$PORT  log=$LOG"
+    if curl -fsS -o /dev/null -m 1 "http://127.0.0.1:$PORT/health/readiness" 2>/dev/null; then
+        info "health:  READY"
+    else
+        info "health:  NOT READY"
+    fi
+}
+
+print_help() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# Run only when executed, so a test can source the functions and call one.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    ACTION="${1:-run}"
+    case "$ACTION" in
+        run)         shift || true; cmd_run "$@" ;;
+        proxy)       shift || true; cmd_proxy_fg "$@" ;;
+        status)      shift || true; cmd_status ;;
+        stop)        shift || true; stop_proxy; info "stopped" ;;
+        -h|--help|help) print_help ;;
+        --*|-*)      cmd_run "$@" ;;
+        *)           err "unknown action: $ACTION"; print_help; exit 1 ;;
+    esac
+fi

@@ -1,0 +1,21 @@
+{
+  "enabled": true,
+  "schedule_hour": 2,
+  "schedule_minute": 15,
+  "products": ["grasp", "happi", "hal", "grip"],
+  "speakers": ["deepseek", "xai", "astra", "groq"],
+  "draft_pr_products": ["grasp", "happi"],
+  "max_prs_per_run": 1,
+  "escalation": {
+    "grasp": {
+      "repo": "CodeTonight-SA/grasp",
+      "workdir": "~/CodeTonight/grasp",
+      "test_cmd": ".venv/bin/python -m pytest -q tests"
+    },
+    "happi": {
+      "repo": "CodeTonight-SA/HAPPI",
+      "workdir": "~/CodeTonight/HAPPI",
+      "gate_profile": "docs"
+    }
+  }
+}

@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# grip-promote — upstream a generic enhancement from isolation/<user>-personal to main via PR.
+#
+# Takes a path or commit-range, creates a fresh feature branch off main,
+# applies the change, pushes, opens a PR with the from-isolation template,
+# and returns the PR URL.
+#
+# Usage
+#   grip-promote <commit-sha>                       # promote a single commit
+#   grip-promote <range>                            # promote a commit range, e.g. abc123..HEAD
+#   grip-promote --paths skills/foo/SKILL.md        # promote current state of files (cherry-picks last touching commit)
+#   grip-promote <commit> --branch feat/my-thing    # explicit feature branch name (default: feat/promote-<sha>)
+#   grip-promote <commit> --dry-run                 # show plan, no mutation
+#   grip-promote --help
+#
+# Falsifies the doctrine that personal isolation branches become shadow GRIPs
+# by making upstreaming the path of least resistance.
+
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+DRY_RUN=0
+COMMIT_OR_RANGE=""
+PATHS=""
+FEAT_BRANCH=""
+
+usage() { sed -n '2,21p' "$0"; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --paths)    PATHS="$2"; shift 2 ;;
+        --branch)   FEAT_BRANCH="$2"; shift 2 ;;
+        --dry-run)  DRY_RUN=1; shift ;;
+        --help|-h)  usage; exit 0 ;;
+        --*)        echo "grip-promote: unknown arg '$1'" >&2; exit 2 ;;
+        *)          COMMIT_OR_RANGE="$1"; shift ;;
+    esac
+done
+
+if [[ -z "$COMMIT_OR_RANGE" && -z "$PATHS" ]]; then
+    echo "grip-promote: must pass a commit/range or --paths" >&2
+    usage >&2
+    exit 2
+fi
+
+cd "$CLAUDE_DIR"
+
+CURRENT_BRANCH="$(git symbolic-ref --short HEAD 2>/dev/null || echo 'detached')"
+if [[ ! "$CURRENT_BRANCH" =~ ^isolation/(.*)-personal$ ]]; then
+    echo "grip-promote: refusing — current branch '$CURRENT_BRANCH' is not isolation/<user>-personal" >&2
+    exit 1
+fi
+USER_SLUG="${BASH_REMATCH[1]}"
+
+# Default feature branch
+if [[ -z "$FEAT_BRANCH" ]]; then
+    if [[ -n "$COMMIT_OR_RANGE" ]]; then
+        SHORT="$(echo "$COMMIT_OR_RANGE" | head -c 8)"
+        FEAT_BRANCH="feat/promote-${USER_SLUG}-${SHORT}"
+    else
+        FEAT_BRANCH="feat/promote-${USER_SLUG}-$(date +%s)"
+    fi
+fi
+
+# Resolve files for denylist sanity check
+DIFF_FILES=""
+if [[ -n "$COMMIT_OR_RANGE" ]]; then
+    DIFF_FILES="$(git diff --name-only "$COMMIT_OR_RANGE" 2>/dev/null || echo '')"
+elif [[ -n "$PATHS" ]]; then
+    DIFF_FILES="$PATHS"
+fi
+
+# Personal-artefact leak check (local pre-flight before opening PR)
+DENYLIST="${CLAUDE_DIR}/.github/personal-artefact-paths.txt"
+LEAKS=""
+if [[ -f "$DENYLIST" && -n "$DIFF_FILES" ]]; then
+    while IFS= read -r pattern; do
+        [[ -z "$pattern" || "$pattern" =~ ^# ]] && continue
+        # Match path against denylist entry (trailing / => directory; * => glob)
+        for f in $DIFF_FILES; do
+            case "$f" in
+                $pattern|$pattern/*) LEAKS="${LEAKS}${f} (matches '$pattern')\n" ;;
+            esac
+        done
+    done < "$DENYLIST"
+fi
+
+if [[ -n "$LEAKS" ]]; then
+    echo "grip-promote: PERSONAL-ARTEFACT LEAK DETECTED — promotion would include:" >&2
+    echo -e "$LEAKS" >&2
+    echo "  these paths are denied by .github/personal-artefact-paths.txt." >&2
+    echo "  reduce scope, then re-run grip-promote." >&2
+    exit 1
+fi
+
+PR_TITLE="promote: ${COMMIT_OR_RANGE:-$PATHS} from ${CURRENT_BRANCH}"
+PR_BODY_FILE="$(mktemp)"
+{
+    echo "## Origin"
+    echo ""
+    echo "Promoted from \`${CURRENT_BRANCH}\` by \`${USER_SLUG}\`."
+    echo ""
+    echo "## Source"
+    echo ""
+    if [[ -n "$COMMIT_OR_RANGE" ]]; then
+        echo "Commit/range: \`${COMMIT_OR_RANGE}\`"
+        echo ""
+        echo "### Affected files"
+        echo ""
+        echo '```'
+        echo "$DIFF_FILES"
+        echo '```'
+    else
+        echo "Paths: \`${PATHS}\`"
+    fi
+    echo ""
+    echo "## Scope declaration"
+    echo ""
+    echo "This PR contains generic GRIP enhancements suitable for main."
+    echo "It has been pre-flight checked against \`.github/personal-artefact-paths.txt\` — no leaks detected."
+    echo ""
+    echo "## Test plan"
+    echo ""
+    echo "- [ ] CI passes"
+    echo "- [ ] personal-artefact-leak-check: green"
+    echo "- [ ] CODEOWNERS review obtained"
+} > "$PR_BODY_FILE"
+
+cat <<PLAN
+grip-promote — plan
+  user:         $USER_SLUG
+  source:       $CURRENT_BRANCH
+  target:       main
+  feat-branch:  $FEAT_BRANCH
+  commit/range: ${COMMIT_OR_RANGE:-(via --paths)}
+  paths:        ${PATHS:-(derived from commit)}
+  dry-run:      $DRY_RUN
+
+steps:
+  1. git fetch origin main
+  2. git checkout -b $FEAT_BRANCH origin/main
+  3. apply changes (cherry-pick or path-copy)
+  4. git push -u origin $FEAT_BRANCH
+  5. gh pr create --base main --title "$PR_TITLE"
+  6. git checkout $CURRENT_BRANCH
+PLAN
+
+if [[ $DRY_RUN -eq 1 ]]; then
+    echo ""
+    echo "—— PR body preview ——"
+    cat "$PR_BODY_FILE"
+    echo "————————————————————"
+    rm "$PR_BODY_FILE"
+    echo "grip-promote: --dry-run — exiting without mutation"
+    exit 0
+fi
+
+git fetch origin main --quiet
+git checkout -b "$FEAT_BRANCH" origin/main
+
+if [[ -n "$COMMIT_OR_RANGE" ]]; then
+    if [[ "$COMMIT_OR_RANGE" == *..* ]]; then
+        git cherry-pick "$COMMIT_OR_RANGE"
+    else
+        git cherry-pick "$COMMIT_OR_RANGE"
+    fi
+elif [[ -n "$PATHS" ]]; then
+    # Copy current state of paths from isolation branch
+    git checkout "$CURRENT_BRANCH" -- $PATHS
+    git commit -m "promote: $PATHS from $CURRENT_BRANCH"
+fi
+
+git push -u origin "$FEAT_BRANCH"
+
+PR_URL="$(gh pr create --base main --head "$FEAT_BRANCH" --title "$PR_TITLE" --body-file "$PR_BODY_FILE")"
+rm "$PR_BODY_FILE"
+
+git checkout "$CURRENT_BRANCH"
+
+echo ""
+echo "grip-promote: ✓ PR opened — $PR_URL"

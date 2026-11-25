@@ -1,0 +1,71 @@
+name: upskilling
+description: Meta-skill creation mode with recursive learning. Use when creating skills, detecting learning patterns, or building
+  skills that create skills.
+version: 1.0.0
+effort: high
+triggers:
+- /mode upskilling
+- /learn
+- '[GRIP LEARNING]'
+- create a skill
+- teach me to create skills
+- skill from pattern
+- make this permanent
+auto_trigger:
+  enabled: true
+  signals:
+  - '[GRIP LEARNING]'
+  - pattern_novelty_threshold: 0.7
+  periodic_check:
+    enabled: true
+    scanner: lib/periodic_scanner.py
+    state_file: .operation-state.json
+    thresholds:
+      pattern_scan: 15
+skills:
+  always:
+  - skill-creation-best-practices
+  - creating-skills
+  - recursive-learning
+  - autonomous-learning
+  - self-improvement-engine
+  - meta-improvement-switch
+  optional:
+  - agent-auto-creator
+token_budget: ~5500
+foundation: true
+stacks_with:
+- ut++
+- asking-users
+- creating-wizards
+- hitl
+- context-gate
+prompt_injection: "[MODE: UPSKILLING]\n\nMeta-skill creation mode active. This mode is RECURSIVE - it creates skills\nthat\
+  \ create skills that follow best practices.\n\n## Periodic Self-Check Protocol\n\nEvery 15-20 operations, AUTOMATICALLY\
+  \ scan for:\n1. Repeated patterns (3x threshold for YSH)\n2. Novel problem-solving approaches\n3. Workarounds that should\
+  \ be permanent\n4. User corrections that indicate missing skills\n\nWhen pattern detected:\n- Emit \"[PATTERN DETECTED:\
+  \ {description}]\"\n- Assess novelty score (0.0 - 1.0)\n- If novelty >= 0.7: Propose skill creation\n- If novelty < 0.7\
+  \ but useful: Log for future consideration\n\n## Skill Creation Pipeline\n\n1. **Detect**: Pattern emerges from conversation\n\
+  2. **Validate**: Check against skill-creation-best-practices\n3. **Propose**: AskUserQuestion for approval (Gate A)\n4.\
+  \ **Generate**: Create SKILL.md with quality score >= 70%\n5. **Integrate**: Add to COWORK_SKILLS.md registry\n6. **Meta-Learn**:\
+  \ Update own detection heuristics\n\n## Recursive Learning Loop\n\n```\npattern.detect → skill.propose → user.approve →\
+  \ skill.create\n     ↓                                              ↓\nheuristic.update ←←←←←←←←←←←←←←←←←←←←←←←← pattern.generalize\n\
+  ```\n\n## Integration with RSI Pipeline\n\nThis mode activates the full Recursive Self-Improvement pipeline:\n- `self-improvement-engine`:\
+  \ Detects and generates skills\n- `recursive-learning`: Learns from own learning process\n- `meta-improvement-switch`: Pauses\
+  \ work to capture permanent improvements\n\n## Quality Gates (PARAMOUNT)\n\nAll skill creation passes through skill-creation-best-practices:\n\
+  - Gate A: Proposal (AskUserQuestion MANDATORY)\n- Gate B: Auto-Generation (quality >= 70%)\n- Gate C: Autonomous Discovery\
+  \ (quality >= 70% + review)\n\n## When to Trigger Pattern Scan\n\n- After completing a multi-step task\n- When user says\
+  \ \"that was useful\"\n- When a workaround is repeated\n- At session checkpoints (15-20 ops)\n- When [GRIP LEARNING] signal\
+  \ detected\n\nThe chain improves itself. ⛓⟿∞\n"
+wave:
+  category: meta_loop
+broly:
+  enabled: false
+context:
+- Creating new GRIP skills
+- Building skills that create skills
+- Recursive self-improvement
+- Pattern detection and capture
+- Meta-learning and heuristic updates
+- Auto-triggering on learning signals
+welcome_message: Upskilling mode active. Meta-skill creation with recursive learning.

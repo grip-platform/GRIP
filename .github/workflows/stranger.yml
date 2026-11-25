@@ -1,0 +1,102 @@
+name: Stranger check
+
+# A stranger clones each public repository anonymously, runs the install and
+# test lines its own README prints, in order and with input closed, and reports
+# what failed (lib/stranger_check.py). A red here means a newcomer following
+# the README hits the same failure.
+#
+# Every job is guarded to the public grip-platform organisation, where
+# GitHub-hosted runners are free for public repositories. In any other
+# organisation every job is skipped and uses no runner, which is why
+# tests/test_ci_cost_controls.py allows these two jobs a hosted runner.
+# HAL calls this file through workflow_call, so the check lives in one place.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "41 1 * * *"
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: 'A JSON list of targets, for example ["hal"]'
+        required: false
+        default: '["grip","hal","happi","grasp"]'
+  workflow_call:
+    inputs:
+      targets:
+        type: string
+        required: false
+        default: '["grip","hal","happi","grasp"]'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stranger-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hosted:
+    if: github.repository_owner == 'grip-platform'
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(inputs.targets || '["grip","hal","happi","grasp"]') }}
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        exclude:
+          - target: grasp
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Fetch the checker
+        uses: actions/checkout@v4
+        with:
+          repository: grip-platform/GRIP
+          path: checker
+          sparse-checkout: lib/stranger_check.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Follow the README as a stranger
+        env:
+          TARGET: ${{ matrix.target }}
+        run: python checker/lib/stranger_check.py "$TARGET" --where here --files --timeout 1500
+
+  container:
+    # ubuntu:24.04 is the Python 3.12 floor. The checker runs as a non-root user.
+    if: github.repository_owner == 'grip-platform'
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(inputs.targets || '["grip","hal","happi","grasp"]') }}
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install what a fresh Ubuntu lacks
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git python3 python3-venv python3-pip curl ca-certificates
+      - name: Fetch the checker
+        uses: actions/checkout@v4
+        with:
+          repository: grip-platform/GRIP
+          path: checker
+          sparse-checkout: lib/stranger_check.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Follow the README as a stranger, as a non-root user
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          case "$TARGET" in grip|hal|happi|grasp) ;; *) echo "unknown target: $TARGET" >&2; exit 2 ;; esac
+          useradd -m stranger
+          install -m 644 checker/lib/stranger_check.py /tmp/stranger_check.py
+          su stranger -c "python3 /tmp/stranger_check.py $TARGET --where here --files --timeout 1500"

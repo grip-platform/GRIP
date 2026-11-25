@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# holistic — synthesised memory kernel CLI (thin wrapper over the
+# lib/holistic_synthesiser.py syscall; stable command surface so docs,
+# rules, and the /holistic skill reference one name, not a long path).
+set -uo pipefail
+
+GRIP="${CLAUDE_DIR:-$HOME/.claude}"
+source "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib/venv-utils.sh" || {
+  echo "[holistic] scripts/lib/venv-utils.sh missing — broken GRIP checkout" >&2
+  exit 1
+}
+if ! PY="$(resolve_venv_python "$GRIP/venv")"; then
+  echo "[holistic] no Python interpreter found (searched $GRIP/venv, then PATH)" >&2
+  exit 1
+fi
+SYNTH="$GRIP/lib/holistic_synthesiser.py"
+
+need_synth() {
+  [ -f "$SYNTH" ] || {
+    echo "[holistic] synthesiser not found: $SYNTH (is CLAUDE_DIR correct?)" >&2
+    exit 1
+  }
+}
+
+cmd="${1:-update}"
+case "$cmd" in
+  verify)
+    need_synth
+    exec env PYTHONPATH="$GRIP" "$PY" "$SYNTH" --verify
+    ;;
+  update|refresh|sync)
+    # All three regenerate: compare-and-skip + atomic write + (on change)
+    # digest-bearing mesh broadcast. `sync` is the same op — the broadcast
+    # IS the cross-session sync.
+    need_synth
+    exec env PYTHONPATH="$GRIP" "$PY" "$SYNTH"
+    ;;
+  inherit)
+    kernel="$GRIP/rules/HOLISTIC.md"
+    if [ ! -f "$kernel" ]; then
+      echo "[holistic] no kernel yet — run: holistic update" >&2
+      exit 1
+    fi
+    if [ "$(wc -l < "$kernel" | tr -d ' ')" -lt 1 ]; then
+      echo "[holistic] kernel is empty/corrupt: $kernel — run: holistic update" >&2
+      exit 3
+    fi
+    sed -n '1,40p' "$kernel"
+    ;;
+  save|advisory|evo)
+    # Composed W1/W2/W3 verbs route through the router dispatch table
+    # (lib/holistic_router.py). Keeps the synthesiser surface above
+    # untouched; the router lazy-imports so an unmerged verb-lib never
+    # breaks the others.
+    ROUTER="$GRIP/lib/holistic_router.py"
+    [ -f "$ROUTER" ] || {
+      echo "[holistic] router not found: $ROUTER (is CLAUDE_DIR correct?)" >&2
+      exit 1
+    }
+    # Forward the full arg vector ("$@" = verb + any trailing args) so the
+    # documented `holistic save [achievement]` surface works; bare verb is
+    # still valid (every router handler defaults via kw.get()).
+    exec env PYTHONPATH="$GRIP" "$PY" "$ROUTER" "$@"
+    ;;
+  *)
+    echo "usage: holistic [update|refresh|sync|verify|inherit|save|advisory|evo]" >&2
+    exit 2
+    ;;
+esac

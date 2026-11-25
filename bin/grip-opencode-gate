@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""CLI shim for the OpenCode safety-gate bridge.
+
+Reads an OpenCode tool-call event as JSON on stdin
+(``{"tool": "...", "args": {...}, "directory": "..."}``), runs the bridged GRIP
+hard-DENY safety gates, and:
+  * exit 2 + a plain-language ``[GRIP-SAFETY/opencode] BLOCKED: ...`` on stderr
+    when a gate denies (the OpenCode plugin turns this into a thrown Error);
+  * exit 0 otherwise.
+
+Fail-open by construction: a malformed payload or any internal error exits 0 so
+the bridge can never block a tool call except on a real gate deny.
+"""
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from opencode_gate_bridge import decide  # noqa: E402
+
+
+def main() -> int:
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except (ValueError, TypeError):
+        return 0  # malformed input -> fail-open (never block on a parse error)
+    try:
+        result = decide(payload)
+    except Exception:
+        return 0  # any bridge error -> fail-open
+    if result.get("decision") == "deny":
+        reason = " | ".join(result.get("reasons") or []) or "GRIP safety gate denied this action"
+        sys.stderr.write("[GRIP-SAFETY/opencode] BLOCKED: " + reason[:1000] + "\n")
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

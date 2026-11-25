@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# grip-cache — PromptFoldCache operator surface (status / prove / clear / simulate)
+set -euo pipefail
+GRIP_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+source "$(dirname "${BASH_SOURCE[0]}")/../scripts/lib/venv-utils.sh"
+if ! PY="$(resolve_venv_python "$GRIP_DIR/venv")"; then
+    echo "[grip-cache] no Python interpreter found (searched $GRIP_DIR/venv, then PATH)" >&2
+    exit 1
+fi
+exec "$PY" "$GRIP_DIR/lib/prompt_fold_cache_cli.py" "$@"

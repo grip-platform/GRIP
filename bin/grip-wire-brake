@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""grip-wire-brake — the operator's brake on the HAL wire's open tunnel (GRIP#7460).
+
+The wire (HAL, lib/hal/wire_proxy.py) decrypts api.anthropic.com only and
+tunnels every other host blind. Engaging this brake makes it refuse the hosts it
+does not know again, from the next connection, with a 403 that names the marker;
+the API and Claude Code's own hosts keep working. Bash commands in a wired
+session normally go direct; while the brake is engaged they keep the wire
+(lib/grip_infinite.py BASH_ENV_SCRIPT), so they are refused as well.
+
+    grip-wire-brake on [reason...]   # engage
+    grip-wire-brake off              # release
+    grip-wire-brake status           # show state, and what the wire reports
+
+Two readers must see the marker: the wire, and the Bash-env script in each
+session. The wire reports the marker it reads on GET /health, so this tool asks
+it. The script resolves $HAL_WIRE_EGRESS_BRAKE_MARKER, else
+${CLAUDE_DIR:-~/.claude}/state/session/wire-egress-brake.json. When the two
+differ, both are written and both removed, so neither reader can miss the
+brake. A distinct file from grip-stop's and grip-infinite-stop's markers: no
+brake trips another.
+"""
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import os
+import sys
+import urllib.request
+from pathlib import Path
+from typing import Optional
+
+DEFAULT_WIRE_URL = "http://127.0.0.1:4011"
+_PROBE_TIMEOUT_S = 0.5
+
+
+def local_marker() -> Path:
+    """The marker this shell's sessions read (the Bash-env script's rule)."""
+    explicit = (os.environ.get("HAL_WIRE_EGRESS_BRAKE_MARKER") or "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    base = (os.environ.get("CLAUDE_DIR") or "").strip() or str(Path.home() / ".claude")
+    return Path(base) / "state" / "session" / "wire-egress-brake.json"
+
+
+def wire_url() -> str:
+    return (os.environ.get("GRIP_WIRE_URL") or "").strip() or DEFAULT_WIRE_URL
+
+
+def wire_report() -> Optional[dict]:
+    """The wire's egress_brake block from GET /health, or None.
+
+    None means no wire answered as hal-wire, or the one that did predates the
+    egress brake (HAL#658) and so refuses unknown hosts whatever the marker says.
+    Never through a proxy: the wire is loopback, and a proxy would be itself.
+    """
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(wire_url().rstrip("/") + "/health", timeout=_PROBE_TIMEOUT_S) as resp:
+            health = json.loads(resp.read())
+    except Exception:  # noqa: BLE001 -- an absent wire is an answer, not an error
+        return None
+    if not isinstance(health, dict) or health.get("service") != "hal-wire":
+        return None
+    block = health.get("egress_brake")
+    return block if isinstance(block, dict) and block.get("marker") else None
+
+
+def markers(report: Optional[dict]) -> list:
+    """Every marker a reader looks at: the wire's first, then this shell's."""
+    found = [Path(report["marker"])] if report else []
+    local = local_marker()
+    if local not in found:
+        found.append(local)
+    return found
+
+
+def _write(marker: Path, body: str) -> None:
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    tmp = marker.with_name(f".{marker.name}.{os.getpid()}")
+    tmp.write_text(body)
+    os.replace(tmp, marker)
+
+
+def engage(reason: str) -> int:
+    body = json.dumps({
+        "engaged_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+        "by": "grip-wire-brake",
+        "reason": reason or "manual",
+    }, indent=2)
+    report = wire_report()
+    for marker in markers(report):
+        _write(marker, body)
+        print(f"grip-wire-brake: wrote {marker}")
+    print("grip-wire-brake: ENGAGED — the wire refuses hosts it does not know from the "
+          "next connection, and Bash commands in wired sessions keep the wire, so they "
+          "are refused too. The API and Claude Code's own hosts keep working. Release: "
+          "`grip-wire-brake off`")
+    if report is None:
+        print(f"grip-wire-brake: note — no wire at {wire_url()} reports an egress brake; "
+              "a wire that predates HAL#658 refuses unknown hosts anyway")
+    return 0
+
+
+def release() -> int:
+    removed = 0
+    for marker in markers(wire_report()):
+        if marker.exists():
+            marker.unlink()
+            removed += 1
+            print(f"grip-wire-brake: removed {marker}")
+    print("grip-wire-brake: RELEASED — unknown hosts are tunnelled blind again"
+          if removed else "grip-wire-brake: already released (no marker)")
+    return 0
+
+
+def _describe(marker: Path) -> str:
+    if not marker.exists():
+        return f"released ({marker})"
+    try:
+        detail = json.loads(marker.read_text())
+    except Exception:  # noqa: BLE001 -- unreadable still brakes: presence is the state
+        return f"ENGAGED ({marker}; unreadable, and still brakes)"
+    return f"ENGAGED ({marker}; {detail.get('reason', 'no reason given')})"
+
+
+def status() -> int:
+    report = wire_report()
+    for marker in markers(report):
+        print(f"grip-wire-brake: {_describe(marker)}")
+    if report is None:
+        print(f"grip-wire-brake: no wire at {wire_url()} reports an egress brake "
+              "(none running, or one that predates HAL#658)")
+    else:
+        state = "ENGAGED" if report.get("engaged") else "released"
+        print(f"grip-wire-brake: the wire at {wire_url()} reports {state}")
+    return 0
+
+
+def main(argv: list) -> int:
+    cmd = argv[0] if argv else "status"
+    if cmd == "on":
+        return engage(" ".join(argv[1:]))
+    if cmd == "off":
+        return release()
+    if cmd == "status":
+        return status()
+    sys.stderr.write(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

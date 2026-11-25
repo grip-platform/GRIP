@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""grip-kern-probe — ask Claude Code whether it behaves the way KERN v2 relies on.
+
+  grip-kern-probe [chunks|brief|files|all] --label LABEL [--root CHECKOUT] [--json]
+
+Each probe runs claude -p in an empty Claude Code directory, signed in with a
+stored token, and has a control that must fail. Exit 0 only when every probe
+passes with its control failing. The implementation is lib/kern_probes.py.
+"""
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_ROOT / "lib"))
+
+from kern_probes import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

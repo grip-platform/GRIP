@@ -1,0 +1,1412 @@
+#!/usr/bin/env bash
+# grip-pr-monitor — bounded, verdict-aware background merge monitor.
+#
+# Claude Code has native background monitors (Workflow / agent teams) that keep
+# watching a PR between turns and merge-on-green. OpenCode and other harnesses
+# do not, so an agent waiting on AGORA — or any GitHub Action — stalls forever
+# unless it sets up an explicit poller. This is that poller, generalised.
+#
+# Usage:
+#   grip-pr-monitor <PR> --subject "fix(scope): … (#N)"
+#   grip-pr-monitor <PR> --subject "…" --ttl 28800 --poll 90 --log <file>
+#   grip-pr-monitor <PR> --subject "…" --auto    # GitHub auto-merge (waits for neither AGORA, Codex nor any non-required check)
+#   grip-pr-monitor --sweep [--log <file>]       # durable: merge-or-hold MY open PRs
+#   grip-pr-monitor --codex-hold <PR>            # why <PR> waits for Codex; nothing when it may merge
+#   grip-pr-monitor --self-test                  # verdict-gate regression anchor
+#
+# Behaviour:
+#   - polls every --poll seconds up to --ttl seconds (default 8h)
+#   - reads the AGORA verdict comment and merges only on MERGE, DEFER CHANGES or
+#     PASS; REQUEST_CHANGES, NO_QUORUM, JUDGE_UNAVAILABLE and any token it does
+#     not recognise HOLD (never auto-merges a requested-changes or unratified PR)
+#   - trusts a verdict only for the PR's CURRENT head commit, matched on its
+#     full 40-character SHA and never a prefix: a verdict for an older commit
+#     counts as no verdict yet (GRIP#7107)
+#   - pins every merge to the head commit its verdict was read for
+#     (--match-head-commit): GitHub refuses the merge when a push lands between
+#     that read and the merge, so a commit no reviewer saw never merges under a
+#     verdict for an older one (GRIP#9067)
+#   - waits for the Codex reviewer too (V>> 2026-10-06): holds while Codex has
+#     not reviewed, for up to GRIP_PR_MONITOR_CODEX_WAIT_S (default 1200s) after
+#     the PR opened or left draft, and while any thread Codex opened is
+#     unresolved. Resolving a thread once its point is tested is the release.
+#     It also holds while Codex's review-state marker shows a review still
+#     running, for up to that wait after the marker last changed (GRIP#9283).
+#     When Codex says it is out of review quota, or has touched none of the
+#     repository's last 10 merged PRs, it goes ahead without the wait (see
+#     codex_hold). --codex-hold prints the same judgement for one PR, so a merge
+#     a session types is held the same way (hooks/red-check-merge-gate.py)
+#   - never auto-merges a PR that touches the merge machinery (MERGE_MACHINERY_RE),
+#     in every mode: a gate never ratifies a change to itself. Who then merges it
+#     by hand depends on what it changes, not on its paths (see machinery_hold)
+#   - never auto-merges a PR whose changed files include a git-crypt-encrypted
+#     path, in every mode: AGORA and Codex only ever see ciphertext there, so a
+#     human who can decrypt it must read the change before it merges by hand
+#     (CLAUDE.md "AGORA could not READ the diff"; see crypt_hold, GRIP#8376)
+#   - holds while a GitHub Actions job on the PR's head commit is red, unless
+#     that job is red on main too (V>> 2026-10-15): GitHub refuses a merge only
+#     for a red REQUIRED check, and GRIP#8230 merged past its own red sweep.
+#     Both sides come from the Actions API by workflow id; main's reading walks
+#     back through up to GRIP_PR_MONITOR_MAIN_RUNS (default 50) runs of the
+#     job's workflow to the newest in which it finished, one gh call per run it
+#     skips, and the reads need a token that can read Actions (see red_check_hold)
+#   - holds while a GitHub Actions run on the PR's head commit has not finished
+#     (V>> 2026-10-26, GRIP#8682): GitHub waits only for the required checks, so
+#     GRIP#8678 merged while a slower job was still running, and that job then
+#     failed. A cancelled run has finished (see pending_check_hold)
+#   - otherwise merges --squash; GitHub still refuses while a required check is red
+#   - never force-pushes; never --admin (no admin-merge past a red required check)
+#   - logs every decision to --log (default ~/.claude/logs/grip-pr-monitor.log)
+#
+# --sweep is the DURABLE, idempotent entry point: it discovers the authenticated
+# user's open GRIP PRs and applies the same verdict-aware merge-or-hold to each
+# in ONE pass, then exits 0. A scheduler (launchd on macOS / systemd --user or
+# cron on the VPS) fires it every few minutes; each fire re-reads the real state
+# from GitHub, so a killed fire costs nothing and the next one resumes. This is
+# the OpenCode-safe shape: no long-lived `nohup … &` process to be reaped when
+# the tool session tears down.
+#
+# Launch a single-PR watch detached:
+#   nohup grip-pr-monitor 6777 --subject "fix(scope): … (#6777)" >/dev/null 2>&1 &
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+
+usage() { grep '^#' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+PR=""
+SUBJECT=""
+TTL=28800
+POLL=90
+LOG="$CLAUDE_DIR/logs/grip-pr-monitor.log"
+AUTO=0
+SWEEP=0
+SELFTEST=0
+CODEXHOLD=""
+
+while [[ $# -gt 0 ]]; do
+  # A value flag given last made `shift 2` fail under set -e, so the script
+  # exited 1 and said nothing (AGORA on GRIP#9091); it now names the flag.
+  case "$1" in
+    --subject|--ttl|--poll|--log|--codex-hold)
+      [[ $# -ge 2 ]] || { echo "grip-pr-monitor: $1 needs a value" >&2; exit 2; } ;;
+  esac
+  case "$1" in
+    --subject)  SUBJECT="${2:-}"; shift 2 ;;
+    --ttl)      TTL="${2:-28800}"; shift 2 ;;
+    --poll)     POLL="${2:-90}"; shift 2 ;;
+    --log)      LOG="${2:-}"; shift 2 ;;
+    --auto)     AUTO=1; shift ;;
+    --sweep)    SWEEP=1; shift ;;
+    --self-test) SELFTEST=1; shift ;;
+    --codex-hold) CODEXHOLD="${2:-}"; shift 2 ;;
+    -h|--help)  usage ;;
+    *)
+      if [[ -z "$PR" ]]; then PR="$1"; shift
+      else echo "grip-pr-monitor: unknown arg '$1'" >&2; exit 2; fi ;;
+  esac
+done
+
+if [[ "$SWEEP" == 0 && "$SELFTEST" == 0 && -z "$CODEXHOLD" ]]; then
+  if [[ -z "$PR" ]]; then
+    echo "grip-pr-monitor: a PR number is required (or --sweep)" >&2; usage
+  fi
+  if [[ -z "$SUBJECT" ]]; then
+    echo "grip-pr-monitor: --subject is required (the squash-merge commit subject)" >&2; exit 2
+  fi
+fi
+
+mkdir -p "$(dirname "$LOG")"
+log() { echo "[$(date -u +%T)] $*" >> "$LOG"; }
+
+# Verdict-aware gate — echoes a hold reason to stdout, or nothing when the
+# verdict is green enough to attempt a merge. Absence of ANY verdict,
+# REQUEST_CHANGES, NO_QUORUM and JUDGE_UNAVAILABLE all hold: absence-of-signal
+# is not a PASS (rules/exogenous-anchor-law.md), and an unratified PR must not
+# merge silently. The last check is an allowlist, never a denylist: a token this
+# script has never seen holds rather than reads as green. Before it, the 17 real
+# AGORA comments carrying "**Verdict: JUDGE_UNAVAILABLE**" read as green.
+#
+# The caller passes ONLY the extracted "**Verdict: TOKEN**" string (from the
+# "## AGORA Council Review" comment's first verdict line), never the whole body.
+# Grepping the body is a false-hold, measured twice: a speaker discussing
+# "REQUEST_CHANGES" held #6909, and a speaker writing "**Verdict: REQUEST_CHANGES**"
+# as a falsifier example held #6913. This token is too small to harbour that.
+#
+# "STALE" is what VERDICT_JQ emits when the latest AGORA review was for another
+# commit; both hold reasons start "no AGORA verdict yet", which the single-PR
+# watch reads as "keep polling".
+hold_reason() {
+  local verdict="$1"
+  if [ -z "$verdict" ]; then echo "no AGORA verdict yet"; return 0; fi
+  if [ "$verdict" = "STALE" ]; then echo "no AGORA verdict yet for its latest commit"; return 0; fi
+  echo "$verdict" | grep -qiE 'REQUEST[_ ]CHANGES' && { echo "REQUEST_CHANGES"; return 0; }
+  echo "$verdict" | grep -qiE 'NO[_ ]QUORUM' && { echo "NO_QUORUM"; return 0; }
+  echo "$verdict" | grep -qiE 'JUDGE[_ ]UNAVAILABLE' && { echo "JUDGE_UNAVAILABLE"; return 0; }
+  echo "$verdict" | grep -qiE '^\*\*Verdict: *(MERGE|DEFER[_ ]CHANGES|PASS) *\*\*$' && return 0
+  echo "unrecognised AGORA verdict: $verdict"
+  return 0
+}
+
+# This poller never merges a PR that touches the merge machinery: a gate must never
+# ratify a change to itself. The paths are a proxy for merge authority, not a test
+# of it, so a footer line in lib/agora_pr_review.py holds exactly as a verdict
+# change does. Who merges a held PR by hand depends on its effect (V>> 2026-10-03):
+# a session merges it once AGORA is green if it leaves merge decisions unchanged;
+# V>> merges anything that changes how merges are decided -- the verdict, the
+# quorum, what the council may wave through, this poller's merge rule, or CI
+# permissions (the bootstrap carve-out in CLAUDE.md). These are the paths the
+# AGORA council will not wave through either (lib/agora_ladder_shadow.py,
+# _VERDICT_PATH_PREFIXES); tests/test_grip_pr_monitor.py keeps the two lists equal.
+# The code is half of the merge authority; the other half is the documents that
+# grant it (GRIP#7904): the RSI carve-out, its predicate and the bootstrap
+# exception; "merge without asking" and the stuck-loop admin merge; the loop's
+# merge gate; the in-session council that stands in for AGORA; both copies of
+# CLAUDE.md; and AGENTS.md. The one list of these paths is BOOTSTRAP_EXCEPTED_PATHS in
+# lib/agora_verdict_router.py, which the autonomous convergence loop also uses,
+# so a PR one merger holds is never merged by another; this regex must equal it,
+# entry for entry, and tests/test_grip_pr_monitor.py checks that (GRIP#7927).
+MERGE_MACHINERY_RE='^(lib/agora_|lib/agora_verdict_router\.py|lib/hal_council_dispatch\.py|lib/pr_diff\.py|\.github/|bin/grip-pr-monitor|bin/grip-merge-when-green|hooks/guardrail-removal-merge-gate\.py|lib/guardrail_removal_detector\.py|hooks/red-check-merge-gate\.py|lib/red_check\.py|lib/team_ratification\.py|config/team-ratification\.json|config/tick/grant-verifying\.pub|tests/test_verdict_polarity_contract\.py|agents/rsi-orchestrator\.md|agents/sprint-loop-agent\.md|skills/auto/SKILL\.md|skills/deploying-grip-to-projects/SKILL\.md|skills/finish/SKILL\.md|skills/pr-automation/reference\.md|skills/sprint-loop/RUNBOOK\.md|skills/triage/SKILL\.md|skills/ultrado/SKILL\.md|config/overnight-wave-prompt\.md|config/overnight-wave-prompt-opencode\.md|data/aide/workflows/rsi-autonomous\.yaml|rules/cross-harness-background-monitor\.md|bin/agora-convergence-tick|state/agora-convergence-repos\.json|tests/test_agora_verdict_router\.py|tests/test_agora_convergence_tick\.py|rules/exogenous-anchor-law\.md|rules/operational-principles\.md|rules/ci-review-driven-convergence\.md|rules/in-session-agora-convergence\.md|CLAUDE\.md|\.claude/CLAUDE\.md|AGENTS\.md)'
+GITHUB_FILE_LIST_CAP=3000
+
+# machinery_hold FILES: why a PR whose changed files are FILES (one per line) must
+# be merged by hand rather than by this poller; empty when it may merge here. A
+# list that is empty or at GitHub's cap holds too, because an unreadable or cut
+# list must never read as "nothing here".
+machinery_hold() {
+  local files="$1" count
+  if [ -z "$files" ]; then echo "its file list could not be read"; return 0; fi
+  count=$(printf '%s\n' "$files" | grep -c .)
+  if [ "$count" -ge "$GITHUB_FILE_LIST_CAP" ]; then echo "its file list may be cut"; return 0; fi
+  if printf '%s\n' "$files" | grep -qE "$MERGE_MACHINERY_RE"; then
+    echo "it touches the merge machinery; merge by hand: a session if merge decisions are unchanged, V>> if they change"
+  fi
+  return 0
+}
+
+# pr_files REPO PR: every file the PR changes, one per line; empty on any failure.
+pr_files() {
+  gh api --paginate "repos/$1/pulls/$2/files" --jq '.[].filename' 2>/dev/null || true
+}
+
+# crypt_hold FILES: why a PR whose changed files are FILES (one per line) must
+# be merged by hand rather than by this poller; empty when none of FILES carry
+# a git-crypt filter. AGORA and Codex only ever see ciphertext for a path
+# .gitattributes assigns a git-crypt filter -- CLAUDE.md's "AGORA could not
+# READ the diff" names that as NOT a review of that path, so the reader (a
+# human who can decrypt it) carries the duty. Decided from .gitattributes via
+# `git check-attr`, never from a release label or token: every session pushes
+# as the same GitHub identity, so any such mark could be set by an agent
+# itself. A list that is empty or at GitHub's cap holds too, same reasoning as
+# machinery_hold: an unreadable or cut list must never read as "nothing here".
+crypt_hold() {
+  local files="$1" count attrs encrypted
+  if [ -z "$files" ]; then echo "its file list could not be read"; return 0; fi
+  count=$(printf '%s\n' "$files" | grep -c .)
+  if [ "$count" -ge "$GITHUB_FILE_LIST_CAP" ]; then echo "its file list may be cut"; return 0; fi
+  attrs=$(printf '%s\n' "$files" | git -C "$CLAUDE_DIR" check-attr filter --stdin 2>/dev/null) || {
+    echo "its git-crypt status could not be read"
+    return 0
+  }
+  encrypted=$(printf '%s\n' "$attrs" | grep -E ': filter: git-crypt' \
+    | sed 's/: filter:.*$//' | tr '\n' ',' | sed 's/,$//' || true)
+  if [ -n "$encrypted" ]; then
+    echo "it touches git-crypt-encrypted path(s) ($encrypted); AGORA and Codex see only ciphertext there, so merge by hand once a human has read the decrypted diff"
+  fi
+  return 0
+}
+
+# try_merge PR SUBJECT HEAD: squash-merge, pinned to HEAD, the commit the AGORA
+# verdict was read for; gh's output goes to the log as before. With
+# --match-head-commit GitHub refuses the merge when the PR's head is no longer
+# HEAD, so a push between the verdict read and this call can never merge a
+# commit no reviewer saw (GRIP#9067). HEAD must be a full 40-character SHA:
+# anything else refuses without calling gh, because a merge with no pin is the
+# gap this closes. On a refusal, MERGE_REFUSAL holds the reason (gh's first line)
+# for the caller's state line: gh prints no timestamp, so a red required check
+# that refused every poll for two hours left a watcher of the state lines seeing
+# nothing (GRIP#8012).
+try_merge() {
+  local out rc=0
+  MERGE_REFUSAL=""
+  if ! [[ "${3:-}" =~ ^[0123456789abcdef]{40}$ ]]; then
+    MERGE_REFUSAL="no reviewed head commit to pin the merge to"
+    return 1
+  fi
+  out=$(gh pr merge "$1" --squash --repo "${GRIP_PR_MONITOR_REPO:-grip-platform/GRIP}" --subject "$2" \
+    --match-head-commit "$3" 2>&1) || rc=$?
+  if [ -n "$out" ]; then printf '%s\n' "$out" >> "$LOG"; fi
+  if [ "$rc" -ne 0 ]; then MERGE_REFUSAL=${out%%$'\n'*}; MERGE_REFUSAL=${MERGE_REFUSAL:-gh gave no reason}; fi
+  return "$rc"
+}
+
+# --- the Codex reviewer ---------------------------------------------------------
+# V>> 2026-10-06: "We should definitely also wait for Codex review." The Codex
+# reviewer (chatgpt-codex-connector) reviews a PR when it opens or leaves draft.
+# With findings it posts a review and one thread per finding; with none it reacts
+# with a thumbs-up (measured on GRIP#7570, #7600, #7601 and #7608). GRIP#7570
+# merged two minutes after Codex posted a real P1 finding, because this sweep
+# read only AGORA. So a PR now also holds:
+#   - while Codex has not reviewed, for up to CODEX_WAIT_S after the PR opened or
+#     left draft. Codex does not review every PR (GRIP#7108 got nothing), so past
+#     that the merge goes ahead on AGORA alone and the log says so: an absent
+#     reviewer must never stop good work for good;
+#   - while any thread Codex opened is unresolved. Resolving a thread once its
+#     point is tested, fixed or shown not to hold, is the release.
+# A review or thumbs-up counts only if it is newer than the PR's latest opening:
+# after a PR goes back to draft and is marked ready again, an old signal must not
+# clear the new wait. Only the connector's exact logins count, compared with ==,
+# so a lookalike account cannot fake a review. There are two: GitHub names it
+# "chatgpt-codex-connector" on reviews and comments but
+# "chatgpt-codex-connector[bot]" on reactions (measured on GRIP#7608). jq's
+# inside() would be wrong here: on strings it matches substrings, so a shorter
+# login such as "chatgpt-codex" would pass. When Codex says it is out of review quota
+# ("You have reached your Codex usage limits", first seen on GRIP#7621), the
+# merge goes ahead at once rather than after a wait that cannot end in a review.
+# So it does when Codex has touched none of the repository's 10 most recent
+# merges:
+# --codex-hold judges a merge a session types in any repository, and measured on
+# 2026-11-10, Codex had touched each of the last 6 merged PRs in GRIP and HAL and
+# none in the other ten repositories read, where about half the merges came
+# within 20 minutes of opening (GRIP#9087). A wait there could only end unreviewed.
+# Threads still hold in every repository. Merged PRs, never open ones, decide it:
+# Codex has had time to answer a merged PR, so a burst of new ones cannot end it.
+# GitHub offers no merge-time order for this connection, only CREATED_AT,
+# UPDATED_AT and COMMENTS, and the schema's default order is null. Ordered by
+# creation, a PR opened long ago and merged a minute ago fell outside the ten
+# (GRIP#9093). Ordered by update, a comment, edit or label on an old merged PR
+# moves it in, and ten such bumps could push the real recent merges out (Codex
+# on GRIP#9094). So the query takes the 30 merged PRs updated most recently, and
+# the jq keeps the 10 with the newest mergedAt. A merge updates its PR, so every
+# recent merge is among the 30 unless twenty later bumps push it out. A page of
+# signals cut at 20 counts as served: a cut list is no evidence that Codex was
+# absent (Codex on GRIP#9091).
+# A state that cannot be read holds, like a file list that cannot be read, and
+# so does one with more threads, reviews or reactions than one page returns.
+#
+# A review of an earlier commit counts as reviewed above, and a push starts a
+# new Codex review that nothing waited for: GRIP#9279 merged at 23:08:41Z while
+# Codex still reviewed its newest commit, and two real findings posted at
+# 23:10:11Z (GRIP#9283). Codex keeps one comment per PR and edits it in place.
+# Its marker, "<!-- codex-review-state:v1 {...} -->", names the commit and the
+# status of each review (code_review, security_review). The comment's edit
+# history on GRIP#9279 and GRIP#9289 shows every push setting the new commit's
+# reviews "running" within seconds, each reaching "completed" within about
+# seven minutes. On GRIP#9293 and GRIP#9294 a review that ran out of quota
+# ended "failed", four seconds after Codex's usage-limit reply; a failed review
+# never resumes ("Comment @codex review to try again"). So a PR also holds
+# while the marker shows any review in a status other than "completed" or
+# "failed", for up to CODEX_WAIT_S after the comment last changed, which
+# releases a review that never finishes. A
+# review still running on an earlier commit holds too: the head contains that
+# commit, so its findings usually apply. A marker that cannot be parsed holds
+# within the same bound, and so does a review that runs but names no commit,
+# or a code_review or security_review entry that is not an object at all; a
+# review not yet started is written as an object with every field null, and is
+# no hold.
+# Codex on GRIP#9293: in the seconds between a push and the marker's first edit,
+# the marker still shows the previous commit completed. So a PR whose marker
+# names no review of its head holds too, for up to CODEX_WAIT_S after the
+# marker last changed or after the head commit's date, whichever is later. A
+# usage-limit reply posted after the marker last changed releases the PR at
+# once, as it does without a marker; an older one does not, because Codex may
+# have quota again. Only the connector's exact logins count, as above. The
+# marker is read from the PR's first 50 comments, because Codex writes it at
+# its first review.
+CODEX_WAIT_S="${GRIP_PR_MONITOR_CODEX_WAIT_S:-1200}"
+[[ "$CODEX_WAIT_S" =~ ^[0-9]+$ ]] || CODEX_WAIT_S=1200
+CODEX_QUERY='query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+    createdAt
+    headRefOid
+    commits(last: 1) { nodes { commit { committedDate } } }
+    codexState: comments(first: 50) { nodes { author { login } updatedAt body } }
+    timelineItems(itemTypes: [READY_FOR_REVIEW_EVENT], last: 1) { nodes { ... on ReadyForReviewEvent { createdAt } } }
+    reviews(first: 100) { pageInfo { hasNextPage } nodes { author { login } submittedAt } }
+    reviewThreads(first: 100) { pageInfo { hasNextPage } nodes { isResolved comments(first: 1) { nodes { author { login } } } } }
+    reactions(first: 100) { pageInfo { hasNextPage } nodes { content createdAt user { login } } }
+    comments(last: 20) { nodes { author { login } createdAt body } }
+  }
+  pullRequests(first: 30, states: [MERGED], orderBy: {field: UPDATED_AT, direction: DESC}) { nodes {
+    mergedAt
+    reviews(first: 20) { pageInfo { hasNextPage } nodes { author { login } } }
+    reactions(first: 20) { pageInfo { hasNextPage } nodes { user { login } } }
+    comments(first: 20) { pageInfo { hasNextPage } nodes { author { login } } } } } } }'
+
+# The decision, one jq body over that query's JSON, with $now and $wait bound in
+# front of it by codex_jq so self_test runs the same expression at a fixed clock.
+# It prints "clear", "unavailable" (Codex is out of quota), "unreviewed" (no
+# Codex signal past the wait), "unserved" (no Codex signal on the repository's
+# last 10 merged PRs) or a hold reason, never nothing: gh prints nothing when the
+# call fails, and nothing must not read as clear. A reply without those recent
+# PRs, or with a cut page of their signals, counts as served, so it waits as
+# before. Timestamps compare as strings: GitHub writes every one as
+# YYYY-MM-DDTHH:MM:SSZ.
+CODEX_JQ_BODY='["chatgpt-codex-connector", "chatgpt-codex-connector[bot]"] as $codex
+  | .data.repository.pullRequest as $pr
+  | (.data.repository.pullRequests.nodes // null
+     | if . == null then null else sort_by(.mergedAt // "") | reverse | .[0:10] end) as $recent
+  | ($recent == null
+     or ([$recent[] | (.reviews.nodes // [])[].author.login,
+          (.reactions.nodes // [])[].user.login, (.comments.nodes // [])[].author.login]
+         | any(. as $l | $codex | any(. == $l)))
+     or ([$recent[] | .reviews, .reactions, .comments] | any(.pageInfo.hasNextPage // false))) as $served
+  | if $pr == null then "its Codex review state could not be read"
+    elif ([$pr.reviews, $pr.reviewThreads, $pr.reactions] | any(.pageInfo.hasNextPage)) then
+      "more Codex review threads, reviews or reactions than one page holds; check it by hand"
+    else
+    (([$pr.createdAt] + [$pr.timelineItems.nodes[].createdAt // empty]) | max) as $since
+    | ([$pr.reviewThreads.nodes[]
+        | select((.comments.nodes[0].author.login as $l | $codex | any(. == $l)) and (.isResolved | not))]
+       | length) as $open
+    | ([$pr.reviews.nodes[]
+        | select((.author.login as $l | $codex | any(. == $l)) and (.submittedAt // "") >= $since)]
+       + [$pr.reactions.nodes[]
+          | select(.content == "THUMBS_UP" and (.user.login as $l | $codex | any(. == $l))
+                   and (.createdAt // "") >= $since)]
+       | length) as $signals
+    | [$pr.comments.nodes[]
+       | select((.author.login as $l | $codex | any(. == $l)) and (.createdAt // "") >= $since
+                and (.body | test("reached your Codex usage limits"; "i")))
+       | .createdAt // ""] as $quota_at
+    | ($quota_at | length) as $quota
+    | [($pr.codexState.nodes // [])[]
+       | select(.author.login as $l | $codex | any(. == $l))
+       | {at: (.updatedAt // ""),
+          fresh: (($now - (try (.updatedAt | fromdateiso8601) catch 0)) < $wait),
+          marker: ((.body // "") | scan("codex-review-state:v1\\s+(.*?)\\s*-->") | .[0]
+                   | try fromjson catch null)}] as $markers
+    | ($pr.headRefOid // "") as $head
+    | [$markers[] | select(.fresh) | .marker | objects | .[] | objects
+       | select(.status != null and .status != "completed" and .status != "failed")] as $active
+    | [$active[] | .commit_sha | strings | select(. != "")] as $running
+    | (([$markers[] | select(.fresh) | .marker | select(type != "object")] | length)
+       + ([$active[] | select((.commit_sha | type) != "string" or .commit_sha == "")] | length)
+       + ([$markers[] | select(.fresh) | .marker | objects | to_entries[]
+           | select(.key == "code_review" or .key == "security_review") | select(.value | type != "object")]
+          | length)) as $unreadable
+    | any($markers[] | .marker | objects | .[] | objects; .commit_sha == $head) as $reached
+    | (try ($pr.commits.nodes[-1].commit.committedDate | fromdateiso8601) catch 0) as $committed
+    | ([$markers[].at] | max // "") as $marker_at
+    | "held up to \($wait)s after Codex last updated its status" as $bound
+    | (if $head != "" and any($running[]; . == $head) then
+         "Codex is still reviewing the newest commit (\($head[0:9])); \($bound)"
+       elif ($running | length) > 0 then
+         "Codex is still reviewing an earlier commit (\($running[0][0:9])), whose findings may apply to the newest; \($bound)"
+       elif $unreadable > 0 then "its Codex review-state marker could not be read; \($bound)"
+       elif $head != "" and ($markers | length) > 0 and ($reached | not)
+            and (any($markers[]; .fresh) or ($now - $committed) < $wait) then
+         "Codex has not reached the newest commit (\($head[0:9])) yet; held up to \($wait)s after Codex last updated its status or the commit was made"
+       else null end) as $marker_hold
+    | if $open > 0 then "\($open) unresolved Codex review thread(s); resolve each once its point is tested"
+      elif $marker_hold != null then
+        (if any($quota_at[]; . >= $marker_at) then "unavailable" else $marker_hold end)
+      elif $signals > 0 then "clear"
+      elif $quota > 0 then "unavailable"
+      elif ($now - ($since | fromdateiso8601)) >= $wait then "unreviewed"
+      elif $served then "waiting for the Codex review (up to \($wait)s after the PR opened or left draft)"
+      else "unserved" end
+    end'
+
+# codex_jq NOW: the whole program, with the clock and the wait bound in front.
+codex_jq() { printf '%s as $now | %s as $wait | %s' "$1" "$CODEX_WAIT_S" "$CODEX_JQ_BODY"; }
+
+# codex_hold REPO PR: why the PR must wait for the Codex reviewer; empty when it
+# may merge. It merges without a Codex review in three cases, and logs which:
+# Codex said it is out of quota, the wait passed with no Codex signal at all, or
+# Codex has touched none of the repository's last 10 merged PRs. A gh call that
+# fails reads as unreadable even when it printed something: on a GraphQL error
+# gh prints the raw reply, without the jq, and exits 1 (measured 2026-11-10 with
+# a number that names an issue), and that reply must not become a hold reason.
+codex_hold() {
+  local state
+  state=$(gh api graphql -F owner="${1%%/*}" -F name="${1##*/}" -F number="$2" \
+    -f query="$CODEX_QUERY" --jq "$(codex_jq "$(date +%s)")" 2>/dev/null) || state=""
+  case "$state" in
+    clear) ;;
+    unavailable) log "#$2: Codex is out of review quota; merging on AGORA alone" ;;
+    unreviewed) log "#$2: no Codex review within ${CODEX_WAIT_S}s of opening; merging on AGORA alone" ;;
+    unserved) log "#$2: Codex touched none of the last 10 merged PRs in $1; merging on AGORA alone" ;;
+    "") echo "its Codex review state could not be read" ;;
+    *) echo "$state" ;;
+  esac
+  return 0
+}
+
+# --- a red check that is not main's own (V>> 2026-10-15: "GO FOR OPTION 2!") ---
+# GitHub refuses a merge only while a REQUIRED check is red, and GRIP requires
+# leak-check and Forward Anchors alone. GRIP#8230 merged on AGORA's verdict with
+# its own "Unbound sweep (4)" red: four tests then failed on every main run for
+# six hours, every later PR's sweep showed the same red, and GRIP#8248 fixed them.
+# GRIP#7764 had merged the same way on 2026-10-08. So a PR now also holds while
+# a GitHub Actions job on its head commit is red, unless that job is red on main
+# too: then the red is main's own, the PR cannot fix it, and holding every PR
+# would hold the fix as well.
+#
+# Both sides are read from the Actions REST API by workflow id, never from the
+# PR's status rollup and never by workflow name (Codex on GRIP#8343). The
+# rollup mirrors the merge box and can leave out a run that GitHub does not
+# count toward the PR's status: on cli/cli#14253 the commit's check runs held a
+# failure the rollup did not. A name is not an identity: two workflows whose
+# names differ only by punctuation would share a cache key, and a disabled
+# workflow cannot be selected by name at all, though its red check cannot
+# re-run to clear itself. The head's runs come from actions/runs?head_sha=,
+# every run short of a whole success opened for its jobs. Main's reading of a
+# job is its conclusion in the newest of main's last MAIN_RUNS_LIMIT runs of
+# the same workflow id in which that job finished, whatever the run's own
+# state: a run still in progress may already hold the job's fresh result, and
+# a run GitHub cancelled later still counts for the jobs that finished in it,
+# because a fast-moving main leaves many cancelled runs and few whole ones (24
+# in a row on 2026-10-15, the newest finished reading 25 runs back, hence 50).
+# A job still running is not red here; pending_check_hold below waits for it
+# to finish, so a job that would turn red after the merge (the GRIP#7777
+# shape, seen again on GRIP#8678) is caught as well. A listing that cannot be
+# read holds, as a file list that cannot be read does. The reads need a token that can read Actions (the
+# classic repo scope can); without one every red check holds as unreadable,
+# and the log says so. Names travel as tab-separated lines, so a tab or a line
+# break inside a name becomes a space first.
+JQ_FLAT='def flat: gsub("[\\t\\n\\r]"; " ");'
+# The runs on a commit that may hold a red job or have not finished:
+# everything short of a whole success, as
+# "run<TAB>workflow_id<TAB>status<TAB>workflow" lines. A run that has not
+# finished has no conclusion yet, so it is always listed. A missing status
+# reads "unknown", never blank: a tab is whitespace to `read`, so an empty
+# middle field would shift the workflow's name into the status.
+HEAD_RUNS_JQ="$JQ_FLAT"'
+  .workflow_runs[] | select(.conclusion != "success" and .conclusion != "skipped")
+  | "\(.id)\t\(.workflow_id)\t\((.status // "") | if . == "" then "unknown" else flat end)\t\(.name // "" | flat)"'
+# A run's jobs as "job<TAB>conclusion" lines; a job still running has none.
+RUN_JOBS_JQ="$JQ_FLAT"'.jobs[] | "\(.name // "" | flat)\t\(.conclusion // "")"'
+MAIN_RUNS_LIMIT="${GRIP_PR_MONITOR_MAIN_RUNS:-50}"
+# The PR's head commit and base branch as "sha<TAB>base" (lib/red_check.py HEAD_JQ).
+HEAD_JQ='"\(.headRefOid)\t\(.baseRefName // "main")"'
+[[ "$MAIN_RUNS_LIMIT" =~ ^[1-9][0-9]*$ ]] || MAIN_RUNS_LIMIT=50
+RED_CHECK_TMP=$(mktemp -d "${TMPDIR:-/tmp}/grip-pr-monitor.XXXXXX")
+trap 'rm -rf "$RED_CHECK_TMP"' EXIT
+mkdir -p "$RED_CHECK_TMP/noted"
+
+# red_check_cache_reset: forget every read. The sweep calls it once per pass
+# and the single-PR watch once per poll, so a main that goes red or green
+# during a watch is seen at the next poll. The once-per-run notes survive it.
+red_check_cache_reset() {
+  rm -rf "$RED_CHECK_TMP/cache"
+  mkdir -p "$RED_CHECK_TMP/cache"
+}
+
+# cache_key TEXT: TEXT as hex, so two different names never share a cache
+# file ("release/a" and "release_a" did when every other byte became "_";
+# Codex on GRIP#8454).
+cache_key() {
+  printf '%s' "$1" | od -An -tx1 | tr -d ' \n'
+}
+
+# is_red CONCLUSION: a job conclusion that counts as red.
+is_red() {
+  case "$1" in failure|timed_out|startup_failure) return 0 ;; esac
+  return 1
+}
+
+# run_jobs REPO RUN: RUN's "job<TAB>conclusion" lines, read once per run of
+# this script into RED_CHECK_TMP/cache/run-RUN; returns 1 when the read fails.
+run_jobs() {
+  local repo="$1" run="$2" file="$RED_CHECK_TMP/cache/run-$2"
+  if [ ! -f "$file" ]; then
+    gh run view "$run" --repo "$repo" --json jobs --jq "$RUN_JOBS_JQ" > "$file" 2>/dev/null \
+      || { rm -f "$file"; return 1; }
+  fi
+  cat "$file"
+}
+
+# pr_head REPO PR: the PR's head commit and base branch as "sha<TAB>base"
+# (HEAD_JQ), read once per cache reset into RED_CHECK_TMP/cache, so the red
+# check and the unfinished check judge the same commit; prints nothing when the
+# read fails.
+pr_head() {
+  local repo="$1" pr="$2" file
+  file="$RED_CHECK_TMP/cache/pr-$(cache_key "$1")-$2"
+  if [ ! -f "$file" ]; then
+    gh pr view "$pr" --repo "$repo" --json headRefOid,baseRefName --jq "$HEAD_JQ" > "$file" 2>/dev/null \
+      || { rm -f "$file"; return 0; }
+  fi
+  cat "$file"
+}
+
+# head_runs REPO SHA: commit SHA's HEAD_RUNS_JQ lines, read once per cache
+# reset into RED_CHECK_TMP/cache/head-SHA, so the red check and the unfinished
+# check share one read; returns 1 when the read fails.
+head_runs() {
+  local repo="$1" sha="$2" file="$RED_CHECK_TMP/cache/head-$2"
+  if [ ! -f "$file" ]; then
+    gh api --paginate "repos/$repo/actions/runs?head_sha=$sha&per_page=100" --jq "$HEAD_RUNS_JQ" \
+      > "$file" 2>/dev/null || { rm -f "$file"; return 1; }
+  fi
+  cat "$file"
+}
+
+# red_head_jobs REPO SHA: every red Actions job on commit SHA, as
+# "workflow_id<TAB>workflow<TAB>job" lines; returns 1 when a read fails. Each
+# loop reads its list on its own fd, so a gh call inside it cannot eat a line.
+red_head_jobs() {
+  local repo="$1" sha="$2" run wf_id run_status wf_name job conclusion
+  head_runs "$repo" "$sha" > /dev/null || return 1
+  while IFS=$'\t' read -r -u 7 run wf_id run_status wf_name; do
+    [ -n "$run" ] || continue
+    run_jobs "$repo" "$run" > /dev/null || return 1
+    while IFS=$'\t' read -r -u 8 job conclusion; do
+      if [ -n "$job" ] && is_red "$conclusion"; then printf '%s\t%s\t%s\n' "$wf_id" "$wf_name" "$job"; fi
+    done 8< "$RED_CHECK_TMP/cache/run-$run"
+  done 7< "$RED_CHECK_TMP/cache/head-$sha"
+  return 0
+}
+
+# main_job_conclusion REPO WORKFLOW_ID JOB: JOB's lower-case conclusion
+# ("failure", "success", ...) in the newest of main's last MAIN_RUNS_LIMIT runs
+# of WORKFLOW_ID where it finished; "absent" when it finished in none of them;
+# nothing when a read failed. The walk stops at a run that succeeded as a
+# whole without the job: that version of the workflow does not run it, so an
+# older run cannot speak for it, and a job the PR adds costs a few reads, not
+# MAIN_RUNS_LIMIT. One run list per workflow and base branch, cached in
+# RED_CHECK_TMP/cache/main-wf-WORKFLOW_ID-<the branch as hex>.
+main_job_conclusion() {
+  local repo="$1" wf_id="$2" job="$3" base="${4:-main}" list run whole found
+  list="$RED_CHECK_TMP/cache/main-wf-$2-$(cache_key "${4:-main}")"
+  if [ ! -f "$list" ]; then
+    # The branch rides as a field gh encodes: git allows "#" and "&" in a
+    # branch name, which in a URL end the path or start another parameter.
+    gh api -X GET "repos/$repo/actions/workflows/$wf_id/runs" -f "branch=$base" -F "per_page=$MAIN_RUNS_LIMIT" \
+      --jq '.workflow_runs[] | "\(.id)\t\(.conclusion // "")"' > "$list" 2>/dev/null \
+      || { rm -f "$list"; return 0; }
+  fi
+  while IFS=$'\t' read -r -u 8 run whole; do
+    [ -n "$run" ] || continue
+    run_jobs "$repo" "$run" > /dev/null || return 0
+    # The job is matched by its whole name, exactly: "Unbound sweep (4)" is not "Unbound sweep (40)".
+    # The name rides in ENVIRON, which awk leaves as written; -v decodes "\t" (Codex on GRIP#8454).
+    found=$(JOB="$job" awk -F '\t' '$1 == ENVIRON["JOB"] { print $2; exit }' "$RED_CHECK_TMP/cache/run-$run")
+    case "$found" in
+      success|failure|timed_out|startup_failure|neutral|action_required) echo "$found"; return 0 ;;
+    esac
+    if [ "$whole" = success ]; then break; fi
+  done 8< "$list"
+  echo "absent"
+  return 0
+}
+
+# red_check_hold REPO PR: why the PR must wait for a red job on its head; empty
+# when it may merge. A red that is main's own is logged once per run of this
+# script and never held for.
+red_check_hold() {
+  local repo="$1" pr="$2" line sha base reds wf_id wf_name job on_main note held="" first_unread=""
+  # The head and the base branch as "sha<TAB>base"; a line with no tab is a
+  # head alone, compared with main.
+  line=$(pr_head "$repo" "$pr")
+  sha="${line%%$'\t'*}"
+  base="${line#*$'\t'}"
+  if [ "$base" = "$line" ] || [ -z "$base" ]; then base="main"; fi
+  if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then echo "its head commit could not be read"; return 0; fi
+  reds=$(red_head_jobs "$repo" "$sha") || { echo "its checks could not be read"; return 0; }
+  [ -n "$reds" ] || return 0
+  while IFS=$'\t' read -r -u 9 wf_id wf_name job; do
+    [ -n "$job" ] || continue
+    on_main=$(main_job_conclusion "$repo" "$wf_id" "$job" "$base")
+    case "$on_main" in
+      # A comparison that fails never discards a red already held for: the
+      # hold stands on the reds it could compare, and the failure is reported
+      # only when no red was the PR's own (lib/red_check.py judges the same).
+      "") [ -n "$first_unread" ] || first_unread="\"$wf_name / $job\"" ;;
+      failure|timed_out|startup_failure)
+        note="$RED_CHECK_TMP/noted/$pr-$wf_id-$(printf '%s' "$job" | tr -c 'A-Za-z0-9' '_')"
+        if [ ! -f "$note" ]; then
+          log "#$pr: \"$wf_name / $job\" is red on $base too (its newest finished run); not held for it"
+          : > "$note"
+        fi ;;
+      *) held="${held:+$held, }\"$wf_name / $job\"" ;;
+    esac
+  done 9<<<"$reds"
+  if [ -n "$held" ]; then echo "its red check(s) are not red on $base: $held"
+  elif [ -n "$first_unread" ]; then echo "its red check $first_unread could not be compared with $base"; fi
+  return 0
+}
+
+# --- a check that has not finished (V>> 2026-10-26: "I go with your
+# recommendation regarding 8682") ----------------------------------------------
+# GitHub waits only for the required checks, so this poller merged a PR the
+# moment they passed while slower jobs were still running. GRIP#8678 merged at
+# 03:24:00 UTC; its "Unbound sweep (4)" failed at 03:26:47, after the merge,
+# and the same red then showed on main. GRIP#8681 merged with that shard still
+# running too. So a PR now also holds while any GitHub Actions run on its head
+# commit has not finished. On those two PRs the slowest run, Validate, finished
+# 4m16s and 3m29s after the merge: that is the wait this adds. A finished run
+# counts whatever its conclusion: the red check above judges a red one, a
+# skipped one never ran, and a cancelled one has finished. So cancelling a run
+# that can never finish (no runner for its label, say) is the release, as
+# resolving a thread is for Codex; a run that is merely slow is waited for. A
+# run whose status cannot be read has not finished. The head (pr_head) and the
+# listing (head_runs) are the red check's own, read once per sweep pass or
+# watch poll, so both checks judge the same commit. lib/red_check.py makes the
+# same judgement for a merge a session types (GRIP#8454).
+
+# pending_check_hold REPO PR: why the PR must wait for a run on its head that
+# has not finished, or because its head or its runs cannot be read; empty when
+# every run on it has finished.
+pending_check_hold() {
+  local repo="$1" pr="$2" line sha run wf_id run_status wf_name waiting=""
+  line=$(pr_head "$repo" "$pr")
+  sha="${line%%$'\t'*}"
+  if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then echo "its head commit could not be read"; return 0; fi
+  head_runs "$repo" "$sha" > /dev/null || { echo "its checks could not be read"; return 0; }
+  while IFS=$'\t' read -r -u 7 run wf_id run_status wf_name; do
+    if [ -n "$run" ] && [ "$run_status" != completed ]; then waiting="${waiting:+$waiting, }\"$wf_name\""; fi
+  done 7< "$RED_CHECK_TMP/cache/head-$sha"
+  if [ -n "$waiting" ]; then echo "its checks have not finished: $waiting"; fi
+  return 0
+}
+
+# --- Jev verdict prediction (Jev plan, Phase 5.1 -- "calibration you can
+# watch") -----------------------------------------------------------------
+# Advisory delight only: Jev predicts whether AGORA will say MERGE and
+# whether CI will pass first time, sealed as a signed IDR leaf BEFORE the
+# verdict exists, and never read by anything that decides what merges. Fired
+# once per PR per sweep pass, fully detached -- a backgrounded subshell that
+# returns at once, so a hang or a raise inside lib/jev_verdict_predictor.py
+# can never delay, hold, or change a merge decision. Off by default since
+# 17 October 2026; GRIP_JEV_VERDICT_PREDICTOR=1 opts in. See docs/jev-shadows.md.
+# Every gh/HAL call lives in that module; the prediction never changes merges.
+#
+# The switch is ALSO read here, before anything is spawned (AGORA #8044):
+# checking it only inside the Python module meant a disabled or
+# test-fenced predictor still paid for mkdir, a subshell fork and a venv
+# Python start on every open PR, every sweep pass -- off did not mean
+# free. Kept in sync BY HAND with lib/jev_verdict_predictor.py's _OPT_IN
+# and _OFF; both are short-lived, stable env var names.
+#
+# Nothing in here may fail: this script runs under `set -e`, so one failing
+# `mkdir` or log append (a full disk, a file where the log directory should
+# be) would end the whole pass before any PR was looked at. A log that cannot
+# be written falls back to /dev/null and the prediction still runs.
+jev_tick_detached() {
+  local repo="$1" pr="$2" log="$CLAUDE_DIR/logs/jev-verdict-predictor.log"
+  if [[ "${GRIP_JEV_VERDICT_PREDICTOR:-}" != "1" || "${GRIP_CLASSIFY_NO_DECIDE:-}" == "1" ]]; then
+    return 0
+  fi
+  { mkdir -p "$CLAUDE_DIR/logs" && : >> "$log"; } 2>/dev/null || log=/dev/null
+  echo "[jev-verdict-predictor] #$pr: tick enqueued" >> "$log" 2>/dev/null || true
+  ( "$CLAUDE_DIR/bin/grip-py" -m lib.jev_verdict_predictor tick --repo "$repo" --pr "$pr" \
+      >>"$log" 2>&1 & ) 2>/dev/null || true
+  return 0
+}
+
+# The jq that extracts the verdict TOKEN from gh's `--json comments,headRefOid`
+# output. Defined once so the two call sites cannot drift, and so self_test()
+# runs the SAME expression against a fixture. "last" (latest review) and
+# "// empty" (no review -> empty, never the string "null") are the fixes for two
+# of the six bugs that shipped without a test.
+#
+# The latest review counts only if it carries the exact marker AGORA stamps for
+# the PR's current head, "<!-- agora-head-sha: <full sha> -->"; otherwise this
+# emits "STALE". The full-marker match is lib/agora_verdict_router.py's
+# _agora_comment_reviews_sha rule, never a short prefix. Without it, GRIP#7105
+# merged 8 seconds after leaving draft, on a MERGE for its previous commit,
+# while AGORA was still reviewing the new one (GRIP#7107). The head must be a
+# full 40-character SHA: a missing, null, empty or shortened headRefOid reads as
+# STALE, so a call site that forgets to request it holds rather than merges, and
+# an empty head can never match a comment carrying an empty marker. jq stops at
+# the first false "and", so test() never sees a null head.
+VERDICT_JQ='.headRefOid as $head
+  | [.comments[].body | select(test("AGORA Council Review"))] | last // empty
+  | (match("\\*\\*Verdict:[^*]+\\*\\*").string) as $verdict
+  | if ($head | type) == "string" and ($head | test("^[0-9a-f]{40}$"))
+       and contains("<!-- agora-head-sha: " + $head + " -->")
+    then $verdict else "STALE" end'
+
+# VIEW_JQ: the PR's head commit and VERDICT_JQ's token from ONE read of gh's
+# `--json comments,headRefOid`, printed as "HEAD<TAB>TOKEN" (GRIP#9067). The
+# merge is pinned to that HEAD, so it must be the very commit the token was
+# checked against: a second read of the head could already see a newer push. A
+# head gh did not return prints as nothing before the tab, and no verdict as
+# nothing after it.
+VIEW_JQ='(.headRefOid // "" | tostring) + "\t" + ([('"$VERDICT_JQ"')] | first // "")'
+
+# read_view LINE: split VIEW_JQ's line into VIEW_HEAD and VIEW_VERDICT. A line
+# with no tab (gh failed, or printed something else) leaves both empty, and an
+# empty verdict holds.
+read_view() {
+  VIEW_HEAD=""
+  VIEW_VERDICT=""
+  case "$1" in
+    *$'\t'*) VIEW_HEAD=${1%%$'\t'*}; VIEW_VERDICT=${1#*$'\t'} ;;
+  esac
+  return 0
+}
+
+# --self-test: the verdict gate's regression anchor. Six bugs shipped without a
+# test (whole-body grep, falsifier text, set -e, jq "null", CWD, stale-first
+# verdict); each is pinned here so a revert goes red, not silent.
+self_test() {
+  local failures=0 desc verdict expected got
+
+  hold_check() {
+    desc="$1"; verdict="$2"; expected="$3"
+    got=$(hold_reason "$verdict")
+    if [ "$got" != "$expected" ]; then
+      echo "FAIL: hold_reason($desc) -> '$got', want '$expected'" >&2
+      failures=$((failures + 1))
+    fi
+  }
+
+  hold_check "empty" "" "no AGORA verdict yet"
+  hold_check "REQUEST CHANGES" "**Verdict: REQUEST CHANGES**" "REQUEST_CHANGES"
+  hold_check "REQUEST_CHANGES underscore" "**Verdict: REQUEST_CHANGES**" "REQUEST_CHANGES"
+  hold_check "NO QUORUM" "**Verdict: NO QUORUM**" "NO_QUORUM"
+  hold_check "NO_QUORUM underscore" "**Verdict: NO_QUORUM**" "NO_QUORUM"
+  hold_check "DEFER CHANGES merges" "**Verdict: DEFER CHANGES**" ""
+  hold_check "MERGE merges" "**Verdict: MERGE**" ""
+  hold_check "PASS merges" "**Verdict: PASS**" ""
+  hold_check "a verdict for an older commit holds" "STALE" "no AGORA verdict yet for its latest commit"
+  hold_check "DEFER_CHANGES underscore merges" "**Verdict: DEFER_CHANGES**" ""
+  hold_check "JUDGE_UNAVAILABLE holds" "**Verdict: JUDGE_UNAVAILABLE**" "JUDGE_UNAVAILABLE"
+  hold_check "the legacy judge banner holds" "**Verdict: Judge unavailable — manual review required**" "JUDGE_UNAVAILABLE"
+  hold_check "an unknown token holds" "**Verdict: SHIP IT**" "unrecognised AGORA verdict: **Verdict: SHIP IT**"
+  hold_check "MERGE with trailing words holds" "**Verdict: MERGE, probably**" "unrecognised AGORA verdict: **Verdict: MERGE, probably**"
+
+  machinery_check() {
+    desc="$1"; files="$2"; expected="$3"
+    got=$(machinery_hold "$files")
+    if [ "$got" != "$expected" ]; then
+      echo "FAIL: machinery_hold($desc) -> '$got', want '$expected'" >&2
+      failures=$((failures + 1))
+    fi
+  }
+  local held="it touches the merge machinery; merge by hand: a session if merge decisions are unchanged, V>> if they change"
+  machinery_check "ordinary file merges" "lib/widget.py" ""
+  machinery_check "AGORA's code holds" "lib/agora_pr_review.py" "$held"
+  machinery_check "any workflow holds" ".github/workflows/forward-anchors.yml" "$held"
+  machinery_check "this poller holds" "bin/grip-pr-monitor" "$held"
+  machinery_check "the diff AGORA sees holds" "lib/pr_diff.py" "$held"
+  machinery_check "council transport holds" "lib/hal_council_dispatch.py" "$held"
+  machinery_check "one machinery file among many holds" $'docs/a.md\nlib/agora_x.py\nlib/b.py' "$held"
+  machinery_check "a similar name elsewhere merges" "docs/lib/agora_notes.md" ""
+  # GRIP#7904: the rules that grant the merge authority hold like the code does.
+  machinery_check "the anchor law holds" "rules/exogenous-anchor-law.md" "$held"
+  machinery_check "the operational principles hold" "rules/operational-principles.md" "$held"
+  machinery_check "the convergence merge gate holds" "rules/ci-review-driven-convergence.md" "$held"
+  machinery_check "the in-session council rule holds" "rules/in-session-agora-convergence.md" "$held"
+  machinery_check "an ordinary rule merges" "rules/bash-safety.md" ""
+  machinery_check "an authority rule's name elsewhere merges" "docs/rules/exogenous-anchor-law.md" ""
+  machinery_check "the root CLAUDE.md holds" "CLAUDE.md" "$held"
+  machinery_check "the project CLAUDE.md holds" ".claude/CLAUDE.md" "$held"
+  machinery_check "a skill's own CLAUDE.md merges" "skills/CLAUDE.md" ""
+  machinery_check "AGENTS.md holds" "AGENTS.md" "$held"
+  machinery_check "the other green-merger holds" "bin/grip-merge-when-green" "$held"
+  machinery_check "the guardrail-removal merge gate holds" "hooks/guardrail-removal-merge-gate.py" "$held"
+  machinery_check "this sweep's own rule holds" "rules/cross-harness-background-monitor.md" "$held"
+  machinery_check "the teammate merger holds" "lib/team_ratification.py" "$held"
+  machinery_check "the merge-gate contract test holds" "tests/test_verdict_polarity_contract.py" "$held"
+  machinery_check "a skill that tells an agent to merge holds" "skills/finish/SKILL.md" "$held"
+  machinery_check "a skill that never merges merges" "skills/eli5/SKILL.md" ""
+  machinery_check "the overnight-wave prompt holds" "config/overnight-wave-prompt.md" "$held"
+  machinery_check "the convergence tick holds" "bin/agora-convergence-tick" "$held"
+  machinery_check "an unreadable list holds" "" "its file list could not be read"
+  machinery_check "a list at GitHub's cap holds" "$(seq -f 'f%g.py' 1 3000)" "its file list may be cut"
+
+  # crypt_hold: a PR touching a git-crypt-encrypted path holds (GRIP#8376).
+  # AGORA and Codex only ever see ciphertext for such a path (CLAUDE.md
+  # "AGORA could not READ the diff"), so this poller must never merge one on
+  # its own. A throwaway repo carries the .gitattributes rule -- never the
+  # calling environment's own $CLAUDE_DIR, because a CI runner has no
+  # ~/.claude at all and this must pass there too.
+  local crypt_fixture crypt_badattr
+  crypt_fixture=$(mktemp -d "${TMPDIR:-/tmp}/grip-pr-monitor-selftest.XXXXXX")
+  git init -q "$crypt_fixture"
+  # keyed/** uses a NAMED git-crypt key, whose filter is git-crypt-<name>: two
+  # rules in GRIP's own .gitattributes do. An end-anchored match (git-crypt$)
+  # would skip those paths, so a case below pins the unanchored one.
+  printf 'rules/operational-context.md filter=git-crypt diff=git-crypt\nfacts/*.md filter=git-crypt diff=git-crypt\nkeyed/** filter=git-crypt-namedkey diff=git-crypt-namedkey\n' \
+    > "$crypt_fixture/.gitattributes"
+
+  crypt_check() {
+    desc="$1"; files="$2"; expected="$3"
+    got=$(CLAUDE_DIR="$crypt_fixture" crypt_hold "$files")
+    if [ "$got" != "$expected" ]; then
+      echo "FAIL: crypt_hold($desc) -> '$got', want '$expected'" >&2
+      failures=$((failures + 1))
+    fi
+  }
+  local held_rules="it touches git-crypt-encrypted path(s) (rules/operational-context.md); AGORA and Codex see only ciphertext there, so merge by hand once a human has read the decrypted diff"
+  local held_facts="it touches git-crypt-encrypted path(s) (facts/x.md); AGORA and Codex see only ciphertext there, so merge by hand once a human has read the decrypted diff"
+  crypt_check "an encrypted rules path holds" "rules/operational-context.md" "$held_rules"
+  crypt_check "an encrypted facts path holds" "facts/x.md" "$held_facts"
+  crypt_check "a mixed list with one encrypted path holds" \
+    $'lib/widget.py\nrules/operational-context.md\ndocs/readme.md' "$held_rules"
+  crypt_check "a list with only plaintext paths merges" $'lib/widget.py\ndocs/readme.md' ""
+  crypt_check "a path under a named git-crypt key holds" "keyed/x.md" \
+    "it touches git-crypt-encrypted path(s) (keyed/x.md); AGORA and Codex see only ciphertext there, so merge by hand once a human has read the decrypted diff"
+  crypt_check "a path merely named git-crypt merges" $'docs/git-crypt-guide.md\nlib/git-crypt.py' ""
+  crypt_check "an unreadable list holds" "" "its file list could not be read"
+  crypt_check "a list at GitHub's cap holds" "$(seq -f 'f%g.py' 1 3000)" "its file list may be cut"
+
+  crypt_badattr=$(mktemp -d "${TMPDIR:-/tmp}/grip-pr-monitor-selftest.XXXXXX")
+  got=$(CLAUDE_DIR="$crypt_badattr" crypt_hold "lib/widget.py")
+  if [ "$got" != "its git-crypt status could not be read" ]; then
+    echo "FAIL: crypt_hold(a failed attribute check) -> '$got', want 'its git-crypt status could not be read'" >&2
+    failures=$((failures + 1))
+  fi
+  rm -rf "$crypt_fixture" "$crypt_badattr" 2>/dev/null || true
+
+  # try_merge pins the merge to the commit the verdict was read for, and never
+  # calls gh without that pin (GRIP#9067). The stand-in gh is a function that
+  # records its arguments, so it shadows the real gh only inside this check.
+  local LOG pin_args sha pinned
+  LOG=$(mktemp "${TMPDIR:-/tmp}/grip-pr-monitor-selftest.XXXXXX")
+  pin_args=$(mktemp "${TMPDIR:-/tmp}/grip-pr-monitor-selftest.XXXXXX")
+  # Every hex digit appears in this head, so a head check that dropped the
+  # digits, and so refused nearly every real commit, fails here (the falsifier
+  # AGORA's council proposed on GRIP#9069).
+  sha=0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b
+  gh() { printf '%s\n' "$@" > "$pin_args"; }
+  try_merge 7 "s (#7)" "$sha" || true
+  pinned=$(tr '\n' ' ' < "$pin_args")
+  if [[ "$pinned" != *"--match-head-commit $sha "* ]]; then
+    echo "FAIL: try_merge(a reviewed head) ran '$pinned', want --match-head-commit $sha" >&2
+    failures=$((failures + 1))
+  fi
+  pin_check() {
+    desc="$1"
+    : > "$pin_args"
+    if try_merge 7 "s (#7)" "$2" || [ -s "$pin_args" ] \
+      || [ "$MERGE_REFUSAL" != "no reviewed head commit to pin the merge to" ]; then
+      echo "FAIL: try_merge($desc) ran gh, or refused without saying why" >&2
+      failures=$((failures + 1))
+    fi
+  }
+  pin_check "no head" ""
+  pin_check "a shortened head" "${sha:0:12}"
+  pin_check "an upper-case head" "$(printf 'A%.0s' {1..40})"
+  unset -f gh
+  rm -f "$LOG" "$pin_args" 2>/dev/null || true
+
+  if command -v jq >/dev/null 2>&1; then
+    local head old json
+    head=$(printf 'c%.0s' {1..40})
+    old=$(printf 'b%.0s' {1..40})
+    # fixture HEAD BODY...: gh's `--json comments,headRefOid` shape; an empty
+    # HEAD leaves headRefOid out, as a call site that forgot to request it would.
+    fixture() {
+      local fixture_head="$1"; shift
+      jq -n --arg head "$fixture_head" \
+        '{comments: ($ARGS.positional | map({body: .}))} + (if $head == "" then {} else {headRefOid: $head} end)' \
+        --args "$@"
+    }
+    # body VERDICT SHA: one AGORA review, stamped the way AGORA stamps it.
+    body() { printf '## AGORA Council Review\n> **Verdict: %s**\n<!-- agora-head-sha: %s -->' "$1" "$2"; }
+    jq_check() {
+      desc="$1"; json="$2"; expected="$3"
+      got=$(printf '%s' "$json" | jq -r "$VERDICT_JQ")
+      if [ "$got" != "$expected" ]; then
+        echo "FAIL: VERDICT_JQ($desc) -> '$got', want '$expected'" >&2
+        failures=$((failures + 1))
+      fi
+    }
+    # The extraction bugs: a body mentioning "DEFER CHANGES" in passing (no
+    # "Verdict:" prefix), a falsifier writing "**Verdict: REQUEST_CHANGES**" in
+    # the body of the review that is read, and two reviews where the LATEST wins.
+    jq_check "latest review, read past a falsifier" "$(fixture "$head" \
+      "## Codex Review Summary. not an AGORA review" \
+      "Follow-up tracked: #1234 (DEFER CHANGES from AGORA)" \
+      "$(body "DEFER CHANGES" "$old")" \
+      "$(body MERGE "$head") A falsifier: feed a **Verdict: REQUEST_CHANGES** in the body")" \
+      "**Verdict: MERGE**"
+    # No AGORA review at all -> empty output (must NOT be the string "null").
+    jq_check "absent" "$(fixture "$head" "no review here")" ""
+    # GRIP#7107: GRIP#7105 merged on a MERGE for its previous commit.
+    jq_check "the latest verdict is for an older commit" \
+      "$(fixture "$head" "$(body "REQUEST CHANGES" "$old")" "$(body MERGE "$old")")" "STALE"
+    jq_check "a verdict naming no commit" \
+      "$(fixture "$head" $'## AGORA Council Review\n> **Verdict: MERGE**')" "STALE"
+    jq_check "a marker carrying only a prefix of the head" \
+      "$(fixture "$head" "$(body MERGE "${head:0:12}")")" "STALE"
+    jq_check "headRefOid not requested" "$(fixture "" "$(body MERGE "$head")")" "STALE"
+    # The head must be a full 40-character SHA. A null, empty or shortened head
+    # must not match, even against a comment whose marker would fit it.
+    local blank=$'## AGORA Council Review\n> **Verdict: MERGE**\n<!-- agora-head-sha:  -->'
+    jq_check "headRefOid null, against an empty marker" \
+      "$(fixture "$head" "$blank" | jq '.headRefOid = null')" "STALE"
+    jq_check "headRefOid empty, against an empty marker" \
+      "$(fixture "$head" "$blank" | jq '.headRefOid = ""')" "STALE"
+    jq_check "headRefOid shortened, against a marker to match" \
+      "$(fixture "${head:0:12}" "$(body MERGE "${head:0:12}")")" "STALE"
+    jq_check "a newer review for the head with no verdict line yet" \
+      "$(fixture "$head" "$(body MERGE "$head")" $'## AGORA Council Review\nreviewing\n<!-- agora-head-sha: '"$head"' -->')" ""
+    # End to end: a MERGE for an older commit reaches hold_reason as a hold.
+    got=$(hold_reason "$(fixture "$head" "$(body MERGE "$old")" | jq -r "$VERDICT_JQ")")
+    if [ "$got" != "no AGORA verdict yet for its latest commit" ]; then
+      echo "FAIL: a MERGE for an older commit reached hold_reason as '$got'" >&2
+      failures=$((failures + 1))
+    fi
+
+    # VIEW_JQ reads the head and the verdict in ONE pass, so the merge is pinned
+    # to the commit the verdict was checked against (GRIP#9067); read_view splits
+    # its line, and a line with no tab leaves nothing to merge on.
+    local expected_head
+    view_check() {
+      desc="$1"; json="$2"; expected_head="$3"; expected="$4"
+      read_view "$(printf '%s' "$json" | jq -r "$VIEW_JQ")"
+      if [ "$VIEW_HEAD" != "$expected_head" ] || [ "$VIEW_VERDICT" != "$expected" ]; then
+        echo "FAIL: VIEW_JQ($desc) -> '$VIEW_HEAD' '$VIEW_VERDICT', want '$expected_head' '$expected'" >&2
+        failures=$((failures + 1))
+      fi
+    }
+    view_check "a verdict for the head" "$(fixture "$head" "$(body MERGE "$head")")" "$head" "**Verdict: MERGE**"
+    view_check "a verdict for an older commit" "$(fixture "$head" "$(body MERGE "$old")")" "$head" "STALE"
+    view_check "no review" "$(fixture "$head" "no review here")" "$head" ""
+    view_check "no head returned" "$(fixture "" "$(body MERGE "$head")")" "" "STALE"
+    read_view "**Verdict: MERGE**"
+    if [ -n "$VIEW_HEAD$VIEW_VERDICT" ]; then
+      echo "FAIL: read_view(a line with no tab) -> '$VIEW_HEAD' '$VIEW_VERDICT', want both empty" >&2
+      failures=$((failures + 1))
+    fi
+
+    # The Codex wait (V>> 2026-10-06). Fixtures take the GraphQL shape codex_hold
+    # asks for, built at a fixed clock so the wait is deterministic.
+    local cnow=1800000000 codex="chatgpt-codex-connector"
+    local thread_open='{"isResolved":false,"comments":{"nodes":[{"author":{"login":"chatgpt-codex-connector"}}]}}'
+    local thread_done='{"isResolved":true,"comments":{"nodes":[{"author":{"login":"chatgpt-codex-connector"}}]}}'
+    local thread_human='{"isResolved":false,"comments":{"nodes":[{"author":{"login":"a-person"}}]}}'
+    # codex_fixture OPENED_AGO READY_AGO REVIEWS THUMBS THREADS [SIGNAL_AGO]
+    # READY_AGO -1 means never a draft; reviews and thumbs-ups are dated
+    # SIGNAL_AGO seconds back (default 10, after any opening in these cases).
+    codex_fixture() {
+      jq -n --argjson now "$cnow" --argjson opened "$1" --argjson ready "$2" \
+        --argjson reviews "$3" --argjson thumbs "$4" --argjson threads "$5" \
+        --argjson signal "${6:-10}" --arg codex "$codex" \
+        '(($now - $signal) | todateiso8601) as $at
+         | {data: {repository: {pullRequest: {
+           createdAt: (($now - $opened) | todateiso8601),
+           timelineItems: {nodes: (if $ready < 0 then [] else [{createdAt: (($now - $ready) | todateiso8601)}] end)},
+           reviews: {nodes: [range($reviews) | {author: {login: $codex}, submittedAt: $at}]},
+           reactions: {nodes: [range($thumbs) | {content: "THUMBS_UP", createdAt: $at, user: {login: ($codex + "[bot]")}}]},
+           reviewThreads: {nodes: $threads},
+           comments: {nodes: []}}}}}'
+    }
+    codex_check() {
+      desc="$1"; json="$2"; expected="$3"
+      got=$(printf '%s' "$json" | jq -r "$(codex_jq "$cnow")")
+      if [ "$got" != "$expected" ]; then
+        echo "FAIL: codex($desc) -> '$got', want '$expected'" >&2
+        failures=$((failures + 1))
+      fi
+    }
+    local waiting="waiting for the Codex review (up to ${CODEX_WAIT_S}s after the PR opened or left draft)"
+    codex_check "no findings: a thumbs-up" "$(codex_fixture 300 -1 0 1 '[]')" "clear"
+    codex_check "findings, all resolved" "$(codex_fixture 300 -1 1 0 "[$thread_done,$thread_done]")" "clear"
+    codex_check "an unresolved finding holds" "$(codex_fixture 300 -1 1 0 "[$thread_open,$thread_done]")" \
+      "1 unresolved Codex review thread(s); resolve each once its point is tested"
+    codex_check "unresolved findings hold past the wait too" \
+      "$(codex_fixture 86400 -1 1 0 "[$thread_open,$thread_open]")" \
+      "2 unresolved Codex review thread(s); resolve each once its point is tested"
+    codex_check "a person's open thread is not Codex's" "$(codex_fixture 300 -1 0 1 "[$thread_human]")" "clear"
+    codex_check "no Codex signal yet waits" "$(codex_fixture 300 -1 0 0 '[]')" "$waiting"
+    codex_check "no Codex signal past the wait" "$(codex_fixture $((CODEX_WAIT_S + 60)) -1 0 0 '[]')" "unreviewed"
+    codex_check "the wait restarts when a draft goes ready" "$(codex_fixture 259200 300 0 0 '[]')" "$waiting"
+    codex_check "someone else's thumbs-up does not count" \
+      "$(codex_fixture 300 -1 0 0 '[]' \
+         | jq '.data.repository.pullRequest.reactions.nodes = [{content: "THUMBS_UP", user: {login: "a-person"}}]')" \
+      "$waiting"
+    codex_check "an unreadable state holds" '{"data":{"repository":{"pullRequest":null}}}' \
+      "its Codex review state could not be read"
+    # Codex on GRIP#7625: an old signal must not clear a restarted wait, a
+    # lookalike login must not count, and an unread page must not read as clear.
+    codex_check "a thumbs-up from before the PR left draft does not count" \
+      "$(codex_fixture 259200 300 0 1 '[]' 400)" "$waiting"
+    codex_check "a review from before the PR left draft does not count" \
+      "$(codex_fixture 259200 300 1 0 '[]' 400)" "$waiting"
+    codex_check "a lookalike login does not count" \
+      "$(codex_fixture 300 -1 0 1 '[]' | jq '.data.repository.pullRequest.reactions.nodes[0].user.login += "-fake"')" \
+      "$waiting"
+    codex_check "a shorter lookalike login does not count either" \
+      "$(codex_fixture 300 -1 0 1 '[]' | jq '.data.repository.pullRequest.reactions.nodes[0].user.login = "chatgpt-codex"')" \
+      "$waiting"
+    codex_check "a thumbs-up under the plain login counts too" \
+      "$(codex_fixture 300 -1 0 1 '[]' | jq '.data.repository.pullRequest.reactions.nodes[0].user.login = "chatgpt-codex-connector"')" \
+      "clear"
+    codex_check "more threads than one page holds" \
+      "$(codex_fixture 300 -1 1 0 '[]' | jq '.data.repository.pullRequest.reviewThreads.pageInfo = {hasNextPage: true}')" \
+      "more Codex review threads, reviews or reactions than one page holds; check it by hand"
+    # AGORA's falsifier on GRIP#7625: a thumbs-up that lands after the wait still clears.
+    codex_check "a thumbs-up after the wait still clears" \
+      "$(codex_fixture $((CODEX_WAIT_S + 600)) -1 0 1 '[]' 5)" "clear"
+    # Codex out of quota (its reply on GRIP#7621): go ahead at once, not after 20 minutes.
+    local quota='{"author":{"login":"chatgpt-codex-connector"},"body":"You have reached your Codex usage limits for code reviews."}'
+    codex_check "Codex out of quota goes ahead at once" \
+      "$(codex_fixture 300 -1 0 0 '[]' | jq --argjson c "$quota" --argjson t "$((cnow - 60))" \
+         '.data.repository.pullRequest.comments.nodes = [$c + {createdAt: ($t | todateiso8601)}]')" "unavailable"
+    codex_check "a quota reply from before the PR left draft does not count" \
+      "$(codex_fixture 259200 300 0 0 '[]' | jq --argjson c "$quota" --argjson t "$((cnow - 400))" \
+         '.data.repository.pullRequest.comments.nodes = [$c + {createdAt: ($t | todateiso8601)}]')" "$waiting"
+    # GRIP#9087: the wait applies only where Codex has touched a recent merged PR.
+    # recent LOGIN: the repository's merged PRs, one reaction from LOGIN on one of them.
+    recent() { jq --arg l "$1" '.data.repository.pullRequests.nodes =
+      [{reviews: {nodes: []}, comments: {nodes: []}}, {reviews: {nodes: [{author: null}]},
+       comments: {nodes: []}, reactions: {nodes: [{user: {login: $l}}]}}]'; }
+    codex_check "a repository Codex never touched does not wait" \
+      "$(codex_fixture 300 -1 0 0 '[]' | recent a-person)" "unserved"
+    codex_check "a repository Codex touched still waits" \
+      "$(codex_fixture 300 -1 0 0 '[]' | recent "$codex[bot]")" "$waiting"
+    codex_check "a lookalike login does not make a repository served" \
+      "$(codex_fixture 300 -1 0 0 '[]' | recent chatgpt-codex)" "unserved"
+    codex_check "an unresolved finding holds where Codex never reviewed before" \
+      "$(codex_fixture 300 -1 1 0 "[$thread_open]" | recent a-person)" \
+      "1 unresolved Codex review thread(s); resolve each once its point is tested"
+    codex_check "a repository with no merged PR does not wait" \
+      "$(codex_fixture 300 -1 0 0 '[]' | jq '.data.repository.pullRequests.nodes = []')" "unserved"
+    # AGORA's falsifier on GRIP#9091: a recent-PR object with no node list is
+    # read as served, so it waits as before rather than skipping the wait.
+    codex_check "a recent-PR object without its node list still waits" \
+      "$(codex_fixture 300 -1 0 0 '[]' | jq '.data.repository.pullRequests = {}')" "$waiting"
+    # Codex on GRIP#9091: a cut page is no evidence that Codex was absent.
+    codex_check "a cut page of a merged PR's signals still waits" \
+      "$(codex_fixture 300 -1 0 0 '[]' | recent a-person \
+         | jq '.data.repository.pullRequests.nodes[0].reactions = {pageInfo: {hasNextPage: true}, nodes: []}')" \
+      "$waiting"
+    # Codex on GRIP#9094: ten old merges, bumped since by a comment or a label,
+    # come first in the update order; the merge Codex touched, merged at AT,
+    # comes last. The ten newest by mergedAt decide.
+    merges() { jq --argjson at "$1" '.data.repository.pullRequests.nodes =
+      ([range(10) | {mergedAt: ((1700000000 - .) | todateiso8601)}]
+       + [{mergedAt: ($at | todateiso8601), reactions: {nodes: [{user: {login: "chatgpt-codex-connector[bot]"}}]}}])'; }
+    codex_check "a recent merge outranks old merges bumped after it" \
+      "$(codex_fixture 300 -1 0 0 '[]' | merges $((cnow - 1800)))" "$waiting"
+    codex_check "only the ten newest merges count" \
+      "$(codex_fixture 300 -1 0 0 '[]' | merges 1600000000)" "unserved"
+    # GRIP#9283: Codex's review-state marker. The base is GRIP#9279's shape at its
+    # merge: opened an hour ago, one review of an earlier commit, its thread resolved.
+    local chead="cccccccccccccccccccccccccccccccccccccccc" cold="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    local reviewed_before="$(codex_fixture 3600 -1 1 0 "[$thread_done]")"
+    # state CODE_SHA CODE_STATUS SEC_SHA SEC_STATUS: a marker's JSON, as Codex writes it.
+    state() {
+      jq -cn --arg cs "$1" --arg c "$2" --arg ss "$3" --arg s "$4" \
+        '{code_review: {commit_sha: $cs, has_any_findings: null, status: $c},
+          security_review: {commit_sha: $ss, has_any_findings: null, status: $s}}'
+    }
+    # marked MARKER UPDATED_AGO [LOGIN]: the head is $chead, and the PR's comments
+    # are an AGORA review and LOGIN's comment carrying MARKER (any text), last
+    # changed UPDATED_AGO seconds back. LOGIN is the connector by default.
+    marked() {
+      jq --arg m "$1" --argjson ago "$2" --arg login "${3:-$codex}" --arg head "$chead" --argjson now "$cnow" \
+        '.data.repository.pullRequest.headRefOid = $head
+         | .data.repository.pullRequest.codexState = {nodes: [
+             {author: {login: "github-actions"}, updatedAt: (($now - 5) | todateiso8601),
+              body: "## AGORA Council Review"},
+             {author: {login: $login}, updatedAt: (($now - $ago) | todateiso8601),
+              body: ("\n<!-- codex-review-state:v1 " + $m + " -->\n\n<details>Codex Review Summary</details>")}]}'
+    }
+    local bound="held up to ${CODEX_WAIT_S}s after Codex last updated its status"
+    local reviewing="Codex is still reviewing the newest commit (ccccccccc); $bound"
+    codex_check "GRIP#9279: a review still running on the head holds after older findings resolved" \
+      "$(printf '%s' "$reviewed_before" | marked "$(state "$chead" running "$chead" completed)" 60)" "$reviewing"
+    codex_check "GRIP#9289: a security review running on the head holds too" \
+      "$(printf '%s' "$reviewed_before" | marked "$(state "$cold" completed "$chead" running)" 60)" "$reviewing"
+    codex_check "a review still running on an earlier commit holds" \
+      "$(printf '%s' "$reviewed_before" | marked "$(state "$cold" running "$cold" running)" 60)" \
+      "Codex is still reviewing an earlier commit (bbbbbbbbb), whose findings may apply to the newest; $bound"
+    codex_check "a marker unchanged for the whole wait no longer holds" \
+      "$(printf '%s' "$reviewed_before" | marked "$(state "$chead" running "$chead" running)" "$((CODEX_WAIT_S + 60))")" \
+      "clear"
+    codex_check "both reviews completed on the head clear" \
+      "$(printf '%s' "$reviewed_before" | marked "$(state "$chead" completed "$chead" completed)" 60)" "clear"
+    # Codex writes a review not yet started with every field null (GRIP#9289, GRIP#9293).
+    # The marker texts are built here, outside the command substitutions below,
+    # because bash 3.2 (macOS's /bin/bash) misreads escaped quotes nested in "$(...)".
+    local idle='{"commit_sha":null,"has_any_findings":null,"has_unresolved_findings":null,"status":null}'
+    local head_done="{\"commit_sha\":\"$chead\",\"status\":\"completed\"}"
+    local m_idle="{\"code_review\":$idle,\"security_review\":$idle}"
+    local m_idle_done="{\"code_review\":$idle,\"security_review\":$head_done}"
+    local m_no_sha="{\"code_review\":{\"commit_sha\":null,\"status\":\"running\"},\"security_review\":$head_done}"
+    local not_reached="Codex has not reached the newest commit (ccccccccc) yet; held up to ${CODEX_WAIT_S}s after Codex last updated its status or the commit was made"
+    codex_check "a marker with no review started holds until Codex reaches the head" \
+      "$(printf '%s' "$reviewed_before" | marked "$m_idle" 60)" "$not_reached"
+    codex_check "a review not started beside one completed on the head does not hold" \
+      "$(printf '%s' "$reviewed_before" | marked "$m_idle_done" 60)" "clear"
+    codex_check "a marker that cannot be parsed holds" \
+      "$(printf '%s' "$reviewed_before" | marked '{"code_review":{"status":"running"}' 60)" \
+      "its Codex review-state marker could not be read; $bound"
+    codex_check "a marker from a lookalike login does not count" \
+      "$(printf '%s' "$reviewed_before" | marked "$(state "$chead" running "$chead" running)" 60 "$codex-fake")" \
+      "clear"
+    codex_check "an unresolved thread still names itself first" \
+      "$(codex_fixture 3600 -1 1 0 "[$thread_open]" | marked "$(state "$chead" running "$chead" running)" 60)" \
+      "1 unresolved Codex review thread(s); resolve each once its point is tested"
+    # Codex on GRIP#9293 (P1): between a push and the marker's first edit, the
+    # marker still shows the earlier commit completed.
+    # committed AGO: the head commit's date, AGO seconds back.
+    committed() {
+      jq --argjson now "$cnow" --argjson ago "$1" \
+        '.data.repository.pullRequest.commits = {nodes: [{commit: {committedDate: (($now - $ago) | todateiso8601)}}]}'
+    }
+    codex_check "a fresh marker that has not reached the head holds" \
+      "$(printf '%s' "$reviewed_before" | marked "$(state "$cold" completed "$cold" completed)" 60)" "$not_reached"
+    codex_check "a stale marker still holds a head committed a minute ago" \
+      "$(printf '%s' "$reviewed_before" \
+         | marked "$(state "$cold" completed "$cold" completed)" "$((CODEX_WAIT_S + 60))" | committed 60)" \
+      "$not_reached"
+    codex_check "a stale marker and an old head do not hold" \
+      "$(printf '%s' "$reviewed_before" \
+         | marked "$(state "$cold" completed "$cold" completed)" "$((CODEX_WAIT_S + 60))" | committed 3600)" \
+      "clear"
+    # Codex on GRIP#9293 (P2): a review that runs but names no commit cannot be read.
+    codex_check "a running review with no commit holds" \
+      "$(printf '%s' "$reviewed_before" | marked "$m_no_sha" 60)" \
+      "its Codex review-state marker could not be read; $bound"
+    # Codex on GRIP#9293, round two: an expected entry that is not an object at
+    # all cannot be read either, even beside one completed on the head.
+    local m_null_entry="{\"code_review\":null,\"security_review\":$head_done}"
+    local m_scalar_entry="{\"code_review\":\"pending\",\"security_review\":$head_done}"
+    codex_check "a null review entry beside one completed on the head holds" \
+      "$(printf '%s' "$reviewed_before" | marked "$m_null_entry" 60)" \
+      "its Codex review-state marker could not be read; $bound"
+    codex_check "a scalar review entry holds too" \
+      "$(printf '%s' "$reviewed_before" | marked "$m_scalar_entry" 60)" \
+      "its Codex review-state marker could not be read; $bound"
+    # Codex on GRIP#9293 (P2): a usage-limit reply posted after the marker last
+    # changed releases the PR at once; an older one does not.
+    # quota_reply AGO: Codex's usage-limit reply, AGO seconds back.
+    quota_reply() {
+      jq --argjson c "$quota" --argjson t "$((cnow - $1))" \
+        '.data.repository.pullRequest.comments.nodes += [$c + {createdAt: ($t | todateiso8601)}]'
+    }
+    codex_check "a usage-limit reply after the marker last changed releases a running review" \
+      "$(printf '%s' "$reviewed_before" | marked "$(state "$chead" running "$chead" running)" 60 | quota_reply 30)" \
+      "unavailable"
+    codex_check "a usage-limit reply before the marker last changed does not" \
+      "$(printf '%s' "$reviewed_before" | marked "$(state "$chead" running "$chead" running)" 60 | quota_reply 120)" \
+      "$reviewing"
+    # GRIP#9293 and GRIP#9294, measured: out of quota, Codex posted its usage-limit
+    # reply and set both reviews "failed" four seconds later. A failed review never
+    # resumes, so it holds nothing, and the reply releases the PR at once.
+    codex_check "a review that failed out of quota goes ahead at once" \
+      "$(codex_fixture 3600 -1 0 0 '[]' | marked "$(state "$chead" failed "$chead" failed)" 60 | quota_reply 64)" \
+      "unavailable"
+    codex_check "a failed review beside an earlier review clears" \
+      "$(printf '%s' "$reviewed_before" | marked "$(state "$chead" failed "$chead" failed)" 60)" "clear"
+
+    # The red-check reads (V>> 2026-10-15): which runs on a commit may hold a red
+    # job, how a run's jobs are listed, and which conclusions count as red. A
+    # whole success and a skipped run are never opened; a cancelled run and one
+    # still in progress are, because a job may have finished red inside them.
+    # A tab or a line break inside a name must not split the line it travels on.
+    local program conclusion
+    jq_line_check() {
+      desc="$1"; program="$2"; json="$3"; expected="$4"
+      got=$(printf '%s' "$json" | jq -r "$program")
+      if [ "$got" != "$expected" ]; then
+        echo "FAIL: $desc -> '$got', want '$expected'" >&2
+        failures=$((failures + 1))
+      fi
+    }
+    # run_item ID WORKFLOW_ID NAME CONCLUSION [STATUS]: one run; CONCLUSION is
+    # JSON (null = not finished), and STATUS defaults to the one CONCLUSION implies.
+    run_item() {
+      jq -n --argjson id "$1" --argjson wf "$2" --arg n "$3" --argjson c "$4" --arg s "${5:-}" \
+        '{id: $id, workflow_id: $wf, name: $n, conclusion: $c,
+          status: (if $s != "" then $s elif $c == null then "in_progress" else "completed" end)}'
+    }
+    runs_of() { jq -n '{workflow_runs: ($ARGS.positional | map(fromjson))}' --args "$@"; }
+    jq_line_check "head runs: a whole success and a skipped run are not opened" "$HEAD_RUNS_JQ" \
+      "$(runs_of "$(run_item 1 7 Validate '"success"')" "$(run_item 2 8 "Claude Code" '"skipped"')")" ""
+    jq_line_check "head runs: a failed, a cancelled and a running run are" "$HEAD_RUNS_JQ" \
+      "$(runs_of "$(run_item 1 7 Validate '"failure"')" "$(run_item 2 7 Validate '"cancelled"')" \
+         "$(run_item 3 9 CodeQL null)")" $'1\t7\tcompleted\tValidate\n2\t7\tcompleted\tValidate\n3\t9\tin_progress\tCodeQL'
+    jq_line_check "head runs: a tab in a workflow name" "$HEAD_RUNS_JQ" \
+      "$(runs_of "$(run_item 1 7 $'Val\tidate' '"failure"')")" $'1\t7\tcompleted\tVal idate'
+    jq_line_check "head runs: no runs at all" "$HEAD_RUNS_JQ" '{"workflow_runs": []}' ""
+    # GRIP#8682: a run that has not started yet, or waits, is listed with its
+    # status, and a run with no readable status says "unknown" rather than
+    # leaving an empty field that `read` would close up.
+    jq_line_check "head runs: a queued and a waiting run carry their status" "$HEAD_RUNS_JQ" \
+      "$(runs_of "$(run_item 4 9 CodeQL null queued)" "$(run_item 5 9 Deploy null waiting)")" \
+      $'4\t9\tqueued\tCodeQL\n5\t9\twaiting\tDeploy'
+    jq_line_check "head runs: a run with no status" "$HEAD_RUNS_JQ" \
+      '{"workflow_runs": [{"id": 6, "workflow_id": 9, "name": "Odd", "conclusion": null},
+                          {"id": 7, "workflow_id": 9, "name": "Blank", "conclusion": null, "status": ""}]}' \
+      $'6\t9\tunknown\tOdd\n7\t9\tunknown\tBlank'
+    # job_item NAME CONCLUSION: one job of a run; CONCLUSION is JSON (null = still going).
+    job_item() { jq -n --arg n "$1" --argjson c "$2" '{name: $n, conclusion: $c}'; }
+    jobs_of() { jq -n '{jobs: ($ARGS.positional | map(fromjson))}' --args "$@"; }
+    jq_line_check "run jobs: every job with its conclusion, a running one blank" "$RUN_JOBS_JQ" \
+      "$(jobs_of "$(job_item "Unbound sweep (4)" '"failure"')" "$(job_item leak-check '"success"')" \
+         "$(job_item "Unbound sweep (3)" null)")" $'Unbound sweep (4)\tfailure\nleak-check\tsuccess\nUnbound sweep (3)\t'
+    jq_line_check "run jobs: a line break in a job name" "$RUN_JOBS_JQ" \
+      "$(jobs_of "$(job_item $'odd\njob' '"timed_out"')")" $'odd job\ttimed_out'
+    red_check() {
+      desc="$1"; conclusion="$2"; expected="$3"
+      if is_red "$conclusion"; then got=red; else got=not; fi
+      if [ "$got" != "$expected" ]; then
+        echo "FAIL: is_red($desc) -> '$got', want '$expected'" >&2
+        failures=$((failures + 1))
+      fi
+    }
+    red_check "a failure" failure red
+    red_check "a timeout" timed_out red
+    red_check "a startup failure" startup_failure red
+    red_check "a success" success not
+    red_check "a cancelled job" cancelled not
+    red_check "a job still going" "" not
+    red_check "a skipped job" skipped not
+  fi
+
+  if [ "$failures" -eq 0 ]; then echo "self-test: OK"; return 0; fi
+  echo "self-test: $failures failure(s)" >&2
+  return 1
+}
+
+if [[ "$SELFTEST" == 1 ]]; then
+  self_test
+  exit $?
+fi
+
+# --- one PR's Codex hold (GRIP#9087) -------------------------------------------
+# GRIP#9084 merged 22 seconds after Codex posted a finding, by a merge a session
+# typed: hooks/red-check-merge-gate.py judged only red and unfinished runs. The
+# gate now asks this mode, so a typed merge and the sweep share codex_hold. It
+# prints the hold reason, or nothing when the PR may merge, and exits 0.
+if [[ -n "$CODEXHOLD" ]]; then
+  if [[ ! "$CODEXHOLD" =~ ^[0-9]+$ ]]; then
+    echo "grip-pr-monitor: --codex-hold takes a PR number, not '$CODEXHOLD'" >&2; exit 2
+  fi
+  codex_hold "${GRIP_PR_MONITOR_REPO:-grip-platform/GRIP}" "$CODEXHOLD"
+  exit 0
+fi
+
+# --- auto-merge path (verdict-unaware; robust to session/reboot) ------------
+if [[ "$AUTO" == 1 ]]; then
+  files=$(pr_files "${GRIP_PR_MONITOR_REPO:-grip-platform/GRIP}" "$PR")
+  reason=$(machinery_hold "$files")
+  if [ -n "$reason" ]; then
+    log "#$PR held ($reason) — auto-merge NOT enabled"
+    exit 0
+  fi
+  reason=$(crypt_hold "$files")
+  if [ -n "$reason" ]; then
+    log "#$PR held ($reason) — auto-merge NOT enabled"
+    exit 0
+  fi
+  gh pr merge "$PR" --squash --repo "${GRIP_PR_MONITOR_REPO:-grip-platform/GRIP}" --auto --subject "$SUBJECT" >> "$LOG" 2>&1
+  log "auto-merge enabled for #$PR (GitHub merges when required CI is green)"
+  exit 0
+fi
+
+# --- sweep path (durable, idempotent, scheduler-driven) ----------------------
+if [[ "$SWEEP" == 1 ]]; then
+  org_repo="${GRIP_PR_MONITOR_REPO:-grip-platform/GRIP}"
+  me=$(gh api user --jq .login 2>/dev/null || true)
+  if [ -z "$me" ]; then
+    log "sweep: cannot resolve gh login — no merge credential on this host"
+    exit 1
+  fi
+  # gh api, NOT gh pr list: the latter returns EMPTY on error, which reads as
+  # "nothing to do" (operational-context.md).
+  prs=$(gh api "repos/$org_repo/pulls?state=open&per_page=100" \
+    --jq "[.[] | select(.user.login == \"$me\") | .number] | .[]" 2>/dev/null || true)
+  red_check_cache_reset
+  for pr in $prs; do
+    # Always returns at once, in every path (off, on, or anything it spawns
+    # later failing): see jev_tick_detached's own definition above.
+    jev_tick_detached "$org_repo" "$pr"
+    read_view "$(gh pr view "$pr" --repo "$org_repo" --comments --json comments,headRefOid --jq "$VIEW_JQ" 2>/dev/null || true)"
+    verdict=$VIEW_VERDICT
+    reviewed_head=$VIEW_HEAD
+    subject=$(gh pr view "$pr" --repo "$org_repo" --json title --jq .title 2>/dev/null || true)
+    reason=$(hold_reason "$verdict")
+    if [ -z "$reason" ]; then
+      files=$(pr_files "$org_repo" "$pr")
+      reason=$(machinery_hold "$files")
+    fi
+    if [ -z "$reason" ]; then
+      reason=$(crypt_hold "$files")
+    fi
+    if [ -z "$reason" ]; then
+      reason=$(codex_hold "$org_repo" "$pr")
+    fi
+    if [ -z "$reason" ]; then
+      reason=$(red_check_hold "$org_repo" "$pr")
+    fi
+    if [ -z "$reason" ]; then
+      reason=$(pending_check_hold "$org_repo" "$pr")
+    fi
+    if [ -n "$reason" ]; then
+      log "sweep #$pr: holding ($reason)"
+      continue
+    fi
+    if try_merge "$pr" "${subject} (#$pr)" "$reviewed_head"; then
+      log "sweep #$pr: MERGED"
+    else
+      log "sweep #$pr: merge refused ($MERGE_REFUSAL) — re-check next fire"
+    fi
+  done
+  exit 0
+fi
+
+# --- verdict-aware poller (single PR, attended) ------------------------------
+DEADLINE=$(( $(date +%s) + TTL ))
+log "monitor start: PR #$PR (ttl=${TTL}s poll=${POLL}s)"
+last_codex=""
+last_checks=""
+last_refusal=""
+
+while [[ "$(date +%s)" -lt "$DEADLINE" ]]; do
+  read_view "$(gh pr view "$PR" --repo "${GRIP_PR_MONITOR_REPO:-grip-platform/GRIP}" --comments --json comments,headRefOid --jq "$VIEW_JQ" 2>/dev/null || true)"
+  verdict=$VIEW_VERDICT
+  reviewed_head=$VIEW_HEAD
+  reason=$(hold_reason "$verdict")
+  if [ -n "$reason" ]; then
+    if [[ "$reason" == "no AGORA verdict yet"* ]]; then
+      # Not rated yet, or rated only for an older commit — AGORA may still be
+      # reviewing the latest one; keep polling within the TTL.
+      sleep "$POLL"
+      continue
+    fi
+    log "AGORA not green ($reason) on #$PR — holding, NOT auto-merging"
+    exit 0
+  fi
+  files=$(pr_files "${GRIP_PR_MONITOR_REPO:-grip-platform/GRIP}" "$PR")
+  reason=$(machinery_hold "$files")
+  if [ -n "$reason" ]; then
+    log "#$PR held ($reason) — NOT auto-merging"
+    exit 0
+  fi
+  reason=$(crypt_hold "$files")
+  if [ -n "$reason" ]; then
+    log "#$PR held ($reason) — NOT auto-merging"
+    exit 0
+  fi
+  reason=$(codex_hold "${GRIP_PR_MONITOR_REPO:-grip-platform/GRIP}" "$PR")
+  if [ -n "$reason" ]; then
+    # Codex may still be reviewing, or a session may resolve its threads; keep
+    # polling within the TTL, and log only when the reason changes.
+    if [ "$reason" != "$last_codex" ]; then log "#$PR waiting ($reason)"; last_codex="$reason"; fi
+    sleep "$POLL"
+    continue
+  fi
+  red_check_cache_reset
+  reason=$(red_check_hold "${GRIP_PR_MONITOR_REPO:-grip-platform/GRIP}" "$PR")
+  if [ -z "$reason" ]; then
+    reason=$(pending_check_hold "${GRIP_PR_MONITOR_REPO:-grip-platform/GRIP}" "$PR")
+  fi
+  if [ -n "$reason" ]; then
+    # A push can replace the red job's run, main can turn the same job red, and
+    # a run still going will finish; keep polling within the TTL, and log only
+    # when the reason changes.
+    if [ "$reason" != "$last_checks" ]; then log "#$PR waiting ($reason)"; last_checks="$reason"; fi
+    sleep "$POLL"
+    continue
+  fi
+  if try_merge "$PR" "$SUBJECT" "$reviewed_head"; then
+    log "MERGED #$PR"
+    exit 0
+  fi
+  # Once per change, as the Codex wait does: pending CI, then a red check, each once.
+  if [ "$MERGE_REFUSAL" != "$last_refusal" ]; then log "#$PR merge refused ($MERGE_REFUSAL)"; last_refusal="$MERGE_REFUSAL"; fi
+  sleep "$POLL"
+done
+log "deadline reached — #$PR still not merged"
+exit 0

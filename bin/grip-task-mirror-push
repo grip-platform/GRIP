@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Push OPEN + SAFE harness tasks to a private GitHub repo as issues, once each.
+
+The side-effecting half of the exogenous task-mirror: the pure render/classify
+layer is ``lib.task_github_mirror`` (no side effects); this bin adds the actual
+``gh issue create`` + a local, append-only ``id -> {number,url}`` idempotency
+map so a re-run creates NO duplicates. Sensitive tasks are HELD by
+``should_mirror`` and never pushed. The PostToolUse mirror hook will call the
+same ``push()`` on a single new/updated task.
+
+Usage:
+  grip-task-mirror-push --repo OWNER/repo --tasks tasks.json [--dry-run]
+  echo '<tasks-json>' | grip-task-mirror-push --repo OWNER/repo
+
+Idempotency map default: $CLAUDE_DIR/state/task-mirror/id-issue-map.json
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+from typing import Callable
+
+_CLAUDE = Path(__file__).resolve().parent.parent
+if str(_CLAUDE) not in sys.path:
+    sys.path.insert(0, str(_CLAUDE))
+
+from lib.task_github_mirror import should_mirror, render_issue, _shield_redactor  # noqa: E402
+from lib.claude_dir import get_claude_dir  # noqa: E402
+
+# Canonical, run-location-INDEPENDENT map path: the worktree run and the future
+# ~/.grip PostToolUse hook must share ONE idempotency record, or a task pushed
+# from one location re-duplicates from the other.
+_DEFAULT_MAP = get_claude_dir() / "state" / "task-mirror" / "id-issue-map.json"
+_LABELS = ("harness-task", "status:pending", "status:in_progress")
+
+
+def _run(cmd: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def ensure_labels(repo: str) -> None:
+    """Create the mirror labels if absent (idempotent; ignores 'already exists')."""
+    for label in _LABELS:
+        _run(["gh", "label", "create", label, "-R", repo, "--force"])
+
+
+def _gh_create_issue(repo: str, issue: dict) -> str:
+    cmd = ["gh", "issue", "create", "-R", repo,
+           "--title", issue["title"], "--body", issue["body"]]
+    for label in issue["labels"]:
+        cmd += ["--label", label]
+    proc = _run(cmd)
+    if proc.returncode != 0:
+        raise RuntimeError(f"gh issue create failed for {issue['title']!r}: {proc.stderr.strip()}")
+    return proc.stdout.strip()
+
+
+def push(
+    tasks: list[dict],
+    repo: str,
+    map_path: Path,
+    *,
+    dry_run: bool = False,
+    create_fn: Callable[[str, dict], str] | None = None,
+    redactor: Callable[[str], str] | None = None,
+) -> dict:
+    """Create one GitHub issue per open+safe task not already in the map."""
+    create = create_fn if create_fn is not None else _gh_create_issue
+    redact = redactor if redactor is not None else _shield_redactor()
+    mp = json.loads(map_path.read_text()) if map_path.exists() else {}
+
+    created: list[dict] = []
+    skipped_already: list[str] = []
+    held: list[str] = []
+    for task in tasks:
+        tid = str(task.get("id"))
+        if not should_mirror(task):
+            held.append(tid)
+            continue
+        if tid in mp:
+            skipped_already.append(tid)
+            continue
+        issue = render_issue(task, redact)
+        url = f"(dry-run) {issue['title']}" if dry_run else create(repo, issue)
+        mp[tid] = {"url": url, "title": issue["title"]}
+        created.append({"id": tid, "url": url})
+
+    if not dry_run and created:
+        map_path.parent.mkdir(parents=True, exist_ok=True)
+        map_path.write_text(json.dumps(mp, indent=2, ensure_ascii=False))
+    return {"created": created, "skipped_already": skipped_already, "held": held}
+
+
+def _load_tasks(source: str | None) -> list[dict]:
+    raw = Path(source).read_text(encoding="utf-8") if source else sys.stdin.read()
+    data = json.loads(raw)
+    return data if isinstance(data, list) else data.get("tasks", [])
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Push open+safe harness tasks to a private repo as issues (idempotent).")
+    parser.add_argument("--repo", required=True, help="OWNER/repo (a PRIVATE repo only the operator controls)")
+    parser.add_argument("--tasks", help="Path to a JSON list of tasks; defaults to stdin.")
+    parser.add_argument("--map", default=str(_DEFAULT_MAP), help="Idempotency map path.")
+    parser.add_argument("--dry-run", action="store_true", help="Create nothing; report what would be pushed.")
+    args = parser.parse_args(argv)
+
+    tasks = _load_tasks(args.tasks)
+    if not args.dry_run:
+        ensure_labels(args.repo)
+    result = push(tasks, args.repo, Path(args.map), dry_run=args.dry_run)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

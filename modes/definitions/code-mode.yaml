@@ -1,0 +1,122 @@
+name: code
+description: Software development with design principles and testing
+version: 1.1.0
+effort: high
+triggers:
+- /mode code
+- build feature
+- implement
+- refactor
+- write code
+- fix bug
+skills:
+  always:
+  - feature-complete
+  - design-principles
+  - code-agentic
+  optional:
+  - e2e-test-generation
+  - ui-complete
+  - gitops
+  - pr-automation
+token_budget: ~6000
+foundation: true
+stacks_with:
+- ut++
+- asking-users
+- creating-wizards
+- hitl
+- context-gate
+prompt_injection: '[MODE: CODE]
+
+
+  Design principles active: SOLID, GRASP, DRY, KISS, YAGNI, YSH
+
+
+  Before implementing:
+
+  1. Verify requirements are clear (AskUserQuestion if < 99.9999999% confident)
+
+  2. Consider existing patterns in codebase
+
+  3. Plan approach before coding
+
+
+  During implementation:
+
+  - Feature-complete 7-phase workflow available
+
+  - Code-agentic verification gates for destructive operations
+
+  - Design principles enforced on all architecture decisions
+
+
+  After implementing:
+
+  - Run tests if available
+
+  - Consider e2e-test-generation for critical paths
+
+  - PR automation via /create-pr
+
+
+  ## Broly Auto-Activation
+
+
+  Broly is AUTO-ACTIVE in this mode at FORK level.
+
+  No /broly command needed -- UNLESS the operator has set the trigger to manual (check with `mode-loader.sh broly status`), in which case fan out ONLY on an explicit /broly. Assess task complexity and invoke automatically.
+
+
+  Default: FORK (Task tool subagents, up to 3 agents)
+
+  Team pattern: none | Reasoning: chain-of-thought (cot)
+
+
+  ### Escalation to CLUSTER
+
+  - Refactor spans more than 5 files
+
+  - Large feature requiring parallel implementation streams
+
+  - Codebase-wide pattern replacement
+
+
+  ### De-escalation to THREAD
+
+  - Single file/function task
+
+  - Quick question or clarification
+
+  - Minor fix or typo correction
+
+
+  ### Budget
+
+  FORK uses ~2x tokens. De-escalate to THREAD for simple tasks.
+
+  AskUserQuestion if scope is unclear.
+
+  '
+wave:
+  category: wave_aligned
+  w_level: 3
+  phase: ascent
+broly:
+  enabled: true
+  default_level: fork
+  team_pattern: null
+  reasoning_hint: cot
+  escalation:
+    to: cluster
+    signals:
+    - refactor spans more than 5 files
+    - large feature requiring parallel implementation streams
+    - codebase-wide pattern replacement
+context:
+- Building software features
+- Refactoring existing code
+- Bug fixing and debugging
+- Architecture decisions
+- Code review
+welcome_message: Code mode active. Design principles (SOLID, GRASP, DRY, KISS, YAGNI) enforced. Broly auto-escalation enabled.

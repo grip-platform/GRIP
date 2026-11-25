@@ -1,0 +1,455 @@
+{
+  "_doc": "Classifies ~/.claude/rules/*.md for the #464 subagent-preload split (docs/ultraprompt-464-subagent-preload-reduction.md). Claude Code natively loads EVERY ~/.claude/rules/*.md into BOTH the main session AND every custom Task-tool subagent (verified in code.claude.com/docs 'What loads at startup': a subagent loads 'every level of the CLAUDE.md hierarchy ... including project rules'). That is the ~208K subagent preload that dies 'Prompt is too long' on multi-file reads. FIX: keep only SAFETY-CORE rules natively loaded (reach subagents); EXCLUDE the EXTENDED rules from native load via settings.claudeMdExcludes and LIST them in the MAIN session ONLY, as an index the model Reads from on demand, via the SessionStart hook hooks/subagent-preload-main-inject.py (SessionStart never fires for subagents; SubagentStart is a separate event). The hook once injected their full text, about 405,000 characters, but hook output over 10,000 characters reaches the model as a 2KB preview (GRIP#6446), so the claimed 'main = full stack' was never true. Net: main = safety-core natively plus an index of the extended rules; subagent = safety-core only (< 150K). CC's own docs agree: 'most rules don't need to reach the subagent itself.'",
+  "_conservative_default": "None since 2026-10-01: every rule must be listed in `safety_core_explicit` or `extended`, and lib/rules_scope.validate (run by tests/test_rules_scope.py) reports any rule in neither, so a new rule cannot reach main unclassified. Where a computation meets an unlisted rule anyway, lib/rules_scope.classify treats it as extended (safety_core_default: false). That changes no rule's loading: Claude Code natively loads every rules/*.md that settings.claudeMdExcludes does not name, so an unclassified rule still reaches every session and subagent until it is classified and the settings re-synced. Before this, an unlisted rule defaulted to safety-core, which is how two rules nobody classified added 4,180 characters to the always-loaded set within two days (see _note_defaulted_moves_2026_10_01). NEVER move a mechanical-safety / code-integrity / claim-integrity rule to `extended` — that would drop a safety doctrine from subagent context (SECURITY REGRESSION, a #464 hard falsifier).",
+  "_classification_principle": "SAFETY-CORE iff the rule (a) mechanically prevents a dangerous action a subagent can take (guardrail evasion, secret/PII commit, cross-org leak, untrusted-content confused-deputy, force-push, shared-repo wipe, wrong-repo gh op, rendered-artifact leak), OR (b) governs the INTEGRITY of code a subagent WRITES (no-stubs, bash-safety, commit-standards, cc-enforcement, path-portability), OR (c) governs the INTEGRITY of CLAIMS a subagent MAKES (r0-critical-thinking, verify-canonical, prove-it). Everything else — memory/continuity, output-style (a subagent runs its own system prompt so output-style does not even shape it), dispatch/loop orchestration, operational reference (channel IDs/ports/VPS), and meta-doctrines — is EXTENDED (main-only).",
+  "safety_core_default": false,
+  "safety_core_explicit": [
+    "anchor-on-the-artefact-not-the-session.md",
+    "bash-safety.md",
+    "cc-enforcement.md",
+    "declared-input-must-reach-the-actor.md",
+    "gate-resolution-escape-hatch.md",
+    "mcp-org-isolation.md",
+    "never-system-python-for-grip.md",
+    "no-guardrail-evasion.md",
+    "no-sensitive-info-in-grip.md",
+    "no-stubs.md",
+    "path-portability.md",
+    "prove-it-claims-canonical.md",
+    "provenance-name-the-authors.md",
+    "python-async-safety.md",
+    "r0-critical-thinking.md",
+    "shared-tree-is-not-canonical.md",
+    "sync-mirror-safety.md",
+    "tests-must-be-able-to-fail.md",
+    "untrusted-content-capability-lock.md",
+    "verify-canonical-not-claimed.md",
+    "visual-artifact-leak-prevention.md",
+    "an-agora-downgrade-is-not-a-refutation.md",
+    "partial-record-never-outranks-the-witness.md",
+    "operator-anonymity.md",
+    "autonomous-blocker-resolution.md",
+    "surface-and-fix-regression.md",
+    "reasoning-lenses.md",
+    "personal-matters-stay-private.md",
+    "measured-claims-read-the-output-first.md",
+    "claude-cap-moves-to-the-next-subscription.md",
+    "whatsapp-bridge-never-uses-the-anthropic-api-key.md"
+  ],
+  "extended": [
+    "operational-context.md",
+    "efficiency-rules.md",
+    "session-context.md",
+    "HOLISTIC.md",
+    "learned-insights.md",
+    "canonical-output-style.md",
+    "agent-dispatch-protocol.md",
+    "CLAUDE.md",
+    "syscall-doctrine.md",
+    "ci-review-driven-convergence.md",
+    "dispatch-economics.md",
+    "rate-limit-never-blocks.md",
+    "loop-engineering.md",
+    "task-lease-claim-before-work.md",
+    "lifecycle-closed-or-expired.md",
+    "pool-a-offload-routing.md",
+    "llm-augmentation-pattern.md",
+    "cryptographic-causation.md",
+    "exogenous-anchor-law.md",
+    "session-protocol.md",
+    "port-registry.md",
+    "deferred-followups-complete-or-surface.md",
+    "output-tier-default.md",
+    "loop-priority-external-over-theatre.md",
+    "feature-complete-input-domain.md",
+    "rsi-loop-no-yield.md",
+    "knowledge-maturation-functor.md",
+    "efficient-always-active.md",
+    "parallel-default-over-either-or.md",
+    "concurrent-commit-plumbing.md",
+    "operational-principles.md",
+    "scientific-method.md",
+    "evo-dispatch-protocol.md",
+    "system-capabilities.md",
+    "caveman-default.md",
+    "verdict-opens-the-deliverable.md",
+    "ultraprompt-moat-council-rereview.md",
+    "worktree-must-track-main.md",
+    "paramount-backups.md",
+    "in-session-agora-convergence.md",
+    "dispatch-outward-when-context-fills.md",
+    "orchestrator-context-is-planning-capacity.md",
+    "binding-memory-records.md",
+    "critique-the-artefact-not-the-person.md",
+    "canonical-output-closer.md",
+    "congruent-continuity.md",
+    "cross-harness-background-monitor.md",
+    "em-dash-double-hyphen.md",
+    "an-agora-mergeable-pr-is-merged-not-handed-over.md",
+    "fan-out-spends-the-weekly-limit.md",
+    "workflows-never-stuck-never-burning.md",
+    "fetch-through-another-harness.md",
+    "high-bias-for-action.md",
+    "clear-naming.md"
+  ],
+  "_note_main_tier_2026_10_18": "Operator's ruling, 2026-10-18 (V>>, GRIP#6658, path B and decisions 3 to 6): the five operator-facing floor rules that no subagent needs, which every subagent still loaded (lib/rule_routing.py listed them), move to main_tier: full-power-stop-override.md (3,775 chars), good-faith-reciprocity-verification-points-outward.md (5,537), never-close-on-the-operators-behalf.md (10,336), productise-the-proof.md (3,065) and proportionate-critique.md (19,482). Each is tagged talks-to-operator only. Four of them were KEPT in safety-core on 2026-09-29 (_note_defaulted_moves_2026_09_29, HAL Council seal 5fdc01c667c42355) because an INDEX LINE cannot carry an operator-facing safeguard that must be in mind at the moment of acting; the main-session tier delivers their FULL TEXT to the main session on every kind of start (hooks/main-tier-inject.py, GRIP#8536), so that reason is met and the keep is satisfied rather than overruled. Subagents lose nothing they needed: no subagent reads these rules (lib/rules_scope.validate refuses a main-tier rule with a subagent reader). Loading: the five leave native loading through settings.claudeMdExcludes and arrive as SessionStart chunks; bin/grip-lexicon measure counts them in main_tier_chars and delivered_chars, never in always_loaded_chars. Figures are in the pull request that made the move.",
+  "_main_tier_doc": "KERN v2, the operator's ruling of 2026-10-18 (GRIP#6658): the main-session tier. A rule listed in main_tier leaves native loading (lib/rules_scope.exclude_globs puts it in settings.claudeMdExcludes, like an extended rule) and arrives in full in the main session through hooks/main-tier-inject.py, which settings bind on SessionStart once per chunk (--chunk 0 to --chunk 5) for every kind of start, so it is delivered again after /clear and after compaction. lib/main_tier.py packs the tier into chunks of at most 9,500 characters, under the 10,000 at which Claude Code cuts a hook's additionalContext to a 2KB preview, and cuts a rule too long for one chunk into labelled parts. No subagent receives a main-tier rule, so its readers must be only talks-to-operator and/or orchestrates, and no rule in lib/rules_scope.MUST_BE_SAFETY_CORE may be listed here: lib/rules_scope.validate refuses both, and a tier that needs more chunks than settings bind. Populated on 2026-10-18 with the five operator-facing rules no subagent needs (_note_main_tier_2026_10_18).",
+  "main_tier": [
+    "full-power-stop-override.md",
+    "good-faith-reciprocity-verification-points-outward.md",
+    "never-close-on-the-operators-behalf.md",
+    "productise-the-proof.md",
+    "proportionate-critique.md"
+  ],
+  "_command_moment_doc": "KERN v2, the operator's ruling 1(a) of 2026-10-18 (GRIP#6658): a rule listed in command_moment leaves native loading (lib/rules_scope.exclude_globs puts it in settings.claudeMdExcludes) and is TAUGHT instead by hooks/teach-once-gate.py (GRIP#8530), which refuses the first matching command in each recipient context, main session or subagent, with the rule's full text as the reason, then lets the same command pass; the record is renewed after compaction. Only a rule the gate names in lib/teach_once.RULES may be listed (lib/rules_scope.validate refuses any other, and any settings file that excludes these rules without binding the gate on PreToolUse for Bash). A pinned rule may be listed here because the gate keeps its reach: it arrives at the moment it matters rather than at every start.",
+  "_note_command_moment_2026_10_18": "Operator's ruling 1(a), 2026-10-18 (V>>, GRIP#6658): commit-standards.md (7,208 chars; pinned in MUST_BE_SAFETY_CORE), gh-repo-resolution.md (2,702) and gpt-on-the-subscription-never-credits.md (10,407) move to command_moment. The 2026-10-06 probe showed that context handed over at a command arrives too late to shape that first command, so the gate refuses it once with the rule as the reason (teach before, not context). never-system-python-for-grip.md stays native: its own rule forbids a deny path (gate-resolution-escape-hatch Invariant 1). Measured on Claude Code 2.1.301 (GRIP#8530): a deny reason reaches the model whole up to at least 60,000 characters, and the longest refusal these three rules produce together is about 20,600. Loading: the three leave settings.claudeMdExcludes-governed native loading; lib/rule_routing.py counts the command channel as reaching a subagent, like the file channel. bin/grip-lexicon measure counts them in neither always_loaded_chars nor delivered_chars: a taught rule enters a session's context only when its command fires. Figures are in the pull request that made the move.",
+  "command_moment": [
+    "commit-standards.md",
+    "gh-repo-resolution.md",
+    "gpt-on-the-subscription-never-credits.md"
+  ],
+  "runtime_generated": [
+    "session-context.md",
+    "HOLISTIC.md",
+    "learned-insights.md"
+  ],
+  "file_moment": [
+    "declared-input-must-reach-the-actor.md",
+    "no-stubs.md",
+    "path-portability.md",
+    "tests-must-be-able-to-fail.md"
+  ],
+  "readers": {
+    "_doc": "KERN v2 phase 1: who each rule is for. A subagent holds the capabilities its tools give it (Bash can run commands, write code, commit and send text out; Edit and Write write code; WebFetch and WebSearch send text out; Agent and Task dispatch) and every agent makes claims; handles-personal-data comes from the task. talks-to-operator and orchestrates (GRIP's loops, merges, memory and session state) belong to the main session alone. The tags say who needs a rule, not where it is delivered today: lib/rule_routing.py compares the two, and lib/rules_scope.MUST_REACH pins the readers of the floor rules. A first pass, 2026-10-06, for review.",
+    "agent-dispatch-protocol.md": [
+      "dispatches"
+    ],
+    "an-agora-downgrade-is-not-a-refutation.md": [
+      "writes-repo"
+    ],
+    "an-agora-mergeable-pr-is-merged-not-handed-over.md": [
+      "orchestrates",
+      "talks-to-operator"
+    ],
+    "anchor-on-the-artefact-not-the-session.md": [
+      "makes-claims"
+    ],
+    "autonomous-blocker-resolution.md": [
+      "orchestrates",
+      "runs-shell"
+    ],
+    "bash-safety.md": [
+      "runs-shell"
+    ],
+    "binding-memory-records.md": [
+      "orchestrates"
+    ],
+    "canonical-output-closer.md": [
+      "talks-to-operator"
+    ],
+    "canonical-output-style.md": [
+      "talks-to-operator"
+    ],
+    "caveman-default.md": [
+      "talks-to-operator"
+    ],
+    "cc-enforcement.md": [
+      "writes-code"
+    ],
+    "ci-review-driven-convergence.md": [
+      "orchestrates",
+      "writes-repo"
+    ],
+    "claude-cap-moves-to-the-next-subscription.md": [
+      "dispatches",
+      "runs-shell",
+      "sends-outside"
+    ],
+    "CLAUDE.md": [
+      "orchestrates"
+    ],
+    "clear-naming.md": [
+      "handles-personal-data",
+      "talks-to-operator",
+      "writes-code",
+      "writes-repo"
+    ],
+    "commit-standards.md": [
+      "writes-repo"
+    ],
+    "concurrent-commit-plumbing.md": [
+      "writes-repo"
+    ],
+    "congruent-continuity.md": [
+      "orchestrates"
+    ],
+    "critique-the-artefact-not-the-person.md": [
+      "talks-to-operator"
+    ],
+    "cross-harness-background-monitor.md": [
+      "orchestrates"
+    ],
+    "cryptographic-causation.md": [
+      "orchestrates"
+    ],
+    "declared-input-must-reach-the-actor.md": [
+      "writes-code"
+    ],
+    "deferred-followups-complete-or-surface.md": [
+      "orchestrates",
+      "writes-repo"
+    ],
+    "dispatch-economics.md": [
+      "dispatches"
+    ],
+    "dispatch-outward-when-context-fills.md": [
+      "orchestrates"
+    ],
+    "efficiency-rules.md": [
+      "orchestrates",
+      "talks-to-operator"
+    ],
+    "efficient-always-active.md": [
+      "orchestrates"
+    ],
+    "em-dash-double-hyphen.md": [
+      "talks-to-operator"
+    ],
+    "evo-dispatch-protocol.md": [
+      "dispatches",
+      "orchestrates"
+    ],
+    "exogenous-anchor-law.md": [
+      "orchestrates",
+      "writes-repo"
+    ],
+    "fan-out-spends-the-weekly-limit.md": [
+      "dispatches"
+    ],
+    "feature-complete-input-domain.md": [
+      "writes-code"
+    ],
+    "fetch-through-another-harness.md": [
+      "makes-claims",
+      "orchestrates"
+    ],
+    "full-power-stop-override.md": [
+      "talks-to-operator"
+    ],
+    "gate-resolution-escape-hatch.md": [
+      "writes-code"
+    ],
+    "gh-repo-resolution.md": [
+      "runs-shell"
+    ],
+    "good-faith-reciprocity-verification-points-outward.md": [
+      "talks-to-operator"
+    ],
+    "gpt-on-the-subscription-never-credits.md": [
+      "runs-shell",
+      "sends-outside"
+    ],
+    "high-bias-for-action.md": [
+      "orchestrates",
+      "talks-to-operator"
+    ],
+    "HOLISTIC.md": [
+      "orchestrates"
+    ],
+    "in-session-agora-convergence.md": [
+      "orchestrates",
+      "writes-repo"
+    ],
+    "knowledge-maturation-functor.md": [
+      "orchestrates"
+    ],
+    "learned-insights.md": [
+      "orchestrates"
+    ],
+    "lifecycle-closed-or-expired.md": [
+      "writes-code"
+    ],
+    "llm-augmentation-pattern.md": [
+      "writes-code"
+    ],
+    "loop-engineering.md": [
+      "orchestrates"
+    ],
+    "loop-priority-external-over-theatre.md": [
+      "orchestrates"
+    ],
+    "mcp-org-isolation.md": [
+      "sends-outside",
+      "writes-code"
+    ],
+    "measured-claims-read-the-output-first.md": [
+      "makes-claims",
+      "writes-repo"
+    ],
+    "never-close-on-the-operators-behalf.md": [
+      "talks-to-operator"
+    ],
+    "never-system-python-for-grip.md": [
+      "runs-shell"
+    ],
+    "no-guardrail-evasion.md": [
+      "writes-code"
+    ],
+    "no-sensitive-info-in-grip.md": [
+      "writes-code",
+      "writes-repo"
+    ],
+    "no-stubs.md": [
+      "writes-code"
+    ],
+    "operational-context.md": [
+      "orchestrates"
+    ],
+    "operational-principles.md": [
+      "orchestrates"
+    ],
+    "operator-anonymity.md": [
+      "handles-personal-data",
+      "writes-repo"
+    ],
+    "orchestrator-context-is-planning-capacity.md": [
+      "orchestrates"
+    ],
+    "output-tier-default.md": [
+      "talks-to-operator"
+    ],
+    "parallel-default-over-either-or.md": [
+      "orchestrates"
+    ],
+    "paramount-backups.md": [
+      "orchestrates"
+    ],
+    "partial-record-never-outranks-the-witness.md": [
+      "handles-personal-data",
+      "talks-to-operator"
+    ],
+    "path-portability.md": [
+      "writes-code"
+    ],
+    "personal-matters-stay-private.md": [
+      "handles-personal-data",
+      "writes-repo"
+    ],
+    "pool-a-offload-routing.md": [
+      "dispatches",
+      "orchestrates"
+    ],
+    "port-registry.md": [
+      "runs-shell"
+    ],
+    "productise-the-proof.md": [
+      "talks-to-operator"
+    ],
+    "proportionate-critique.md": [
+      "talks-to-operator"
+    ],
+    "prove-it-claims-canonical.md": [
+      "makes-claims"
+    ],
+    "provenance-name-the-authors.md": [
+      "writes-repo"
+    ],
+    "python-async-safety.md": [
+      "writes-code"
+    ],
+    "r0-critical-thinking.md": [
+      "makes-claims"
+    ],
+    "rate-limit-never-blocks.md": [
+      "orchestrates"
+    ],
+    "reasoning-lenses.md": [
+      "makes-claims"
+    ],
+    "rsi-loop-no-yield.md": [
+      "orchestrates"
+    ],
+    "scientific-method.md": [
+      "orchestrates",
+      "writes-repo"
+    ],
+    "session-context.md": [
+      "orchestrates"
+    ],
+    "session-protocol.md": [
+      "orchestrates"
+    ],
+    "shared-tree-is-not-canonical.md": [
+      "makes-claims"
+    ],
+    "surface-and-fix-regression.md": [
+      "makes-claims",
+      "writes-code"
+    ],
+    "sync-mirror-safety.md": [
+      "writes-repo"
+    ],
+    "syscall-doctrine.md": [
+      "writes-code"
+    ],
+    "system-capabilities.md": [
+      "orchestrates"
+    ],
+    "task-lease-claim-before-work.md": [
+      "orchestrates",
+      "writes-repo"
+    ],
+    "tests-must-be-able-to-fail.md": [
+      "writes-code"
+    ],
+    "ultraprompt-moat-council-rereview.md": [
+      "orchestrates"
+    ],
+    "untrusted-content-capability-lock.md": [
+      "dispatches",
+      "writes-code"
+    ],
+    "verdict-opens-the-deliverable.md": [
+      "talks-to-operator"
+    ],
+    "verify-canonical-not-claimed.md": [
+      "makes-claims"
+    ],
+    "visual-artifact-leak-prevention.md": [
+      "sends-outside",
+      "writes-code"
+    ],
+    "whatsapp-bridge-never-uses-the-anthropic-api-key.md": [
+      "runs-shell",
+      "writes-code",
+      "writes-repo"
+    ],
+    "workflows-never-stuck-never-burning.md": [
+      "dispatches",
+      "orchestrates"
+    ],
+    "worktree-must-track-main.md": [
+      "writes-repo"
+    ]
+  },
+  "_note_rules_index": "rules/CLAUDE.md is the rules-index table (navigation), NOT a top-level CLAUDE.md. It is extended. The exclude globs are scoped '**/rules/<name>.md' so they can NEVER match the top-level ~/.grip/CLAUDE.md or a project ./CLAUDE.md (those carry no /rules/ path segment and MUST always load).",
+  "_note_defaulted_moves_2026_08_25": "Six rules that had DEFAULTED into safety-core (safety_core_default:true) were reclassified as extended to bring safety_core_tokens_approx back under the 40000 budget, which had been red on main at 45259. Each was checked against _classification_principle, and none REQUIRES its content to sit in safety-core: five carry no (a) dangerous-action, (b) code-integrity or (c) claim-integrity content at all, and paramount-backups.md carries a dangerous-action half that is DUPLICATED by no-sensitive-info-in-grip.md, which stays explicit safety-core - the defence there is duplication, not absence, and an earlier wording of this note asserted absence and contradicted itself two sentences later (AGORA #5080 concern 2). None appears in lib/rules_scope.MUST_BE_SAFETY_CORE either. Per-rule reasons: verdict-opens-the-deliverable.md -> deliverable FORMAT (a verdict must end by opening an artifact) - output-style class, which the principle names as extended; a subagent renders no verdicts | ultraprompt-moat-council-rereview.md -> meta-doctrine on re-reviewing continuation briefs via council; a subagent writes no ultraprompts | worktree-must-track-main.md -> session/launch orchestration - the launcher bases and re-levels the tree; a subagent inherits one and creates none | paramount-backups.md -> operator artefact preservation. Its DANGEROUS-ACTION half (never commit contracts/PII) is already carried by no-sensitive-info-in-grip.md, which stays explicit safety-core | in-session-agora-convergence.md -> merge-gate orchestration; a subagent opens and merges no PRs | dispatch-outward-when-context-fills.md -> dispatch/loop orchestration - named verbatim in _classification_principle as extended. DELIBERATELY KEPT in safety-core despite also defaulting in: tests-must-be-able-to-fail.md and declared-input-must-reach-the-actor.md (both (b) - integrity of code a subagent writes); shared-tree-is-not-canonical.md and anchor-on-the-artefact-not-the-session.md (both (c) - integrity of claims a subagent makes); provenance-name-the-authors.md (governs commit trailers, and commit-standards.md is explicit safety-core). HARDENED after AGORA #5080 round 2: the five DELIBERATELY KEPT rules are now listed in safety_core_explicit rather than left to default in. The decision was previously prose only - verified by moving shared-tree-is-not-canonical.md to extended, which failed NOTHING. They are ALSO pinned in lib/rules_scope.MUST_BE_SAFETY_CORE, which is the floor validate() enforces. An earlier version of this note claimed the extended-vs-explicit disjointness check was the enforcement; that was FALSE and is corrected here - that check fires only on an overlap, so removing a rule from safety_core_explicit AND adding it to extended passed every test (AGORA #5080 round 3). Listing them explicitly also empties the growth-term candidate list, because every rule is now classified on purpose rather than by default.",
+  "_note_never_system_python_2026_09_20": "never-system-python-for-grip.md promoted from defaulted-in to EXPLICIT safety-core, and pinned in lib/rules_scope.MUST_BE_SAFETY_CORE. It was appearing in the budget test's growth term (~2976 tok) beside four rules that ARE legitimately extended by _classification_principle, and the test's remedy text said to move the non-safety ones out -- so the list read as uniformly sheddable and nothing refused this one. It is (a) dangerous-action: a subagent has Bash, and running a GRIP module under the system python does not fail, it writes a FORGEABLE demo seal and exits 0. Shedding it to save tokens is the security regression _conservative_default forbids. The other four (proportionate-critique, binding-memory-records, never-close-on-the-operators-behalf, congruent-continuity) are NOT reclassified here: the 40000 budget is a growth tripwire rather than a measured ceiling -- a 64254-token safety core was observed delivered to a subagent in full on 2026-09-17 (GRIP#6093) -- so there is no measured benefit to trade coverage for, and that trade is the operator's call, not a side effect of a red test.",
+  "non_rule_excludes": [
+    "**/.grip-worktrees/*/CLAUDE.md"
+  ],
+  "_note_non_rule_excludes_2026_09_20": "claudeMdExcludes legitimately carries globs that are not rules/*.md, and check_settings demanded EXACT equality with the generated rules globs, so it reported the one live example as an UNEXPECTED glob and test_settings_claude_md_excludes_in_sync had been red. The glob is real: ~/.grip-worktrees is GRIP_WORKTREE_HOME's default (skills/worktree-isolation/SKILL.md), and excluding a session worktree's own CLAUDE.md stops it loading as a second copy of the operator's memory. Deleting it to satisfy the checker would have changed memory-loading behaviour to fix a checker bug. Declared here so the drift guard still fires on anything NOT in this list -- the allowance is a named set, not a wildcard.",
+  "_note_defaulted_moves_2026_10_01": "Operator's ruling, 2026-10-01 (KERN option B planning): move both rules that had defaulted into safety-core to extended, and stop unclassified rules defaulting to core. bin/grip-lexicon measure on main 2b9e37a51: 33 always-loaded files, 265,961 characters, against Claude Code's 150,000 warning; after this change 31 files and 261,781 characters, the two rules' 4,180, with the main-session index 100 characters longer for their two lines. Both are extended under _classification_principle, and each keeps its one-paragraph summary in the global CLAUDE.md, which every session and subagent loads: em-dash-double-hyphen.md is operator voice and output style, the class the principle names as extended (CLAUDE.md block 'Em dash as double hyphen (--)'); cross-harness-background-monitor.md is dispatch/loop orchestration for harnesses without a native monitor, also named extended (CLAUDE.md block 'Cross-Harness Background Monitor'). Neither carries (a) dangerous-action, (b) code-integrity or (c) claim-integrity content, and neither is in lib/rules_scope.MUST_BE_SAFETY_CORE.",
+  "_note_defaulted_moves_2026_09_29": "KERN option C step 1 (operator's HITL lock-2 ruling, 2026-09-29: structural savings with no content risk, no rule text rewritten). Twelve rules had DEFAULTED into safety-core. Each was decided by a converging review - gpt-6-astra (lead), Claude Fable 5.1 and DeepSeek v4-pro, five rounds until two changed nothing - and ratified by the HAL Council seal 5fdc01c667c42355 (IDR precog-1790680846-c03ac7a1; speakers DeepSeek v4-pro, Grok, gpt-6-astra via Codex; judge Gemini 3.1 Pro). Beyond _classification_principle, the review weighed that since GRIP#6732 an extended rule reaches the MAIN session only as an index line, so moving one demotes it there too. MOVED to extended: binding-memory-records.md (memory/continuity mechanics; the pinned MEMORY.md lines it governs travel on their own); critique-the-artefact-not-the-person.md (superseded on the self-assignment axis by proportionate-critique.md, which stays core); canonical-output-closer.md (output style, which the principle names as extended; a subagent renders no closer); congruent-continuity.md (continuity machinery whose recorder runs without the prose and whose watcher is unbound; its one claim limit, that records are signed and chain-ordered but not established against the writer without a time anchor, is carried verbatim by the always-loaded global CLAUDE.md). KEPT in safety-core, now listed explicitly: proportionate-critique.md, never-close-on-the-operators-behalf.md, partial-record-never-outranks-the-witness.md, good-faith-reciprocity-verification-points-outward.md and operator-anonymity.md (operator-facing safeguards that must be in mind at the moment of acting, which an index line cannot carry); an-agora-downgrade-is-not-a-refutation.md (claim integrity when reading a review); autonomous-blocker-resolution.md (reserves irreversible actions and client commitments for the operator); productise-the-proof.md (KEPT AGAINST the council judge, who ruled extended: its limit that a seal proves integrity, never correctness, appears in no always-loaded file, and the judge's own reasoning traded that unduplicated limit for savings, which the operator's no-content-risk ruling forbids; 3,065 chars; the operator may overrule). tests/test_rules_scope.py pins the eight keeps.",
+  "_note_surface_and_fix_regression_2026_10_03": "Operator's ruling, 2026-10-03: surface-and-fix-regression.md is safety-core, listed in safety_core_explicit and pinned in lib/rules_scope.MUST_BE_SAFETY_CORE. It merged unclassified on 2026-10-01 23:48 UTC (GRIP#6957, which touched only CLAUDE.md and the rule itself), and tests/test_rules_scope.py::test_partition_is_sound, the guard GRIP#6864 built for exactly that case, was red on main from then on, naming it. Nothing on the PR showed it: no CI workflow ran that test file, so Forward Anchors passed on GRIP#6957, and main has no required checks (GRIP#6936), so even a red check would not have blocked the merge. .github/workflows/forward-anchors.yml now runs the file, which makes the failure visible on a PR but does not yet block a merge. Under _classification_principle the rule is (c), the integrity of claims a subagent makes: it forbids calling a failure 'pre-existing' without evidence, and requires a regression to be named as one rather than buried in a summary. Loading does not change: an unclassified rule was never in settings.claudeMdExcludes, so it already loaded natively into every session and subagent (1,377 characters), and safety-core keeps it there.",
+  "_note_reasoning_lenses_2026_10_03": "reasoning-lenses.md merged unclassified on 2026-10-03 04:59 UTC (GRIP#7191, which touched only the rule, r0-critical-thinking.md and the two CLAUDE.md indexes). It merged one minute after GRIP#7188 began running tests/test_rules_scope.py on every PR, and its own CI had run before that, so test_partition_is_sound went red on main from the next commit on and stayed red for every PR. Classified safety-core by the precedent of the operator's ruling the same morning on surface-and-fix-regression.md (the note above): it is (c), the integrity of claims a subagent makes. It calls itself subordinate to R0, and its spine is that a cheap signal (simplicity, a five-year-old's view, common sense, intuition) may direct attention and break ties but never override evidence. Loading does not change: as an unclassified rule it already loaded natively into every session and subagent (5,334 bytes, about 1,400 tokens of the safety-core projection), and safety-core keeps it there; extended would have demoted it to an index line and required a settings.json re-sync. It is NOT pinned in lib/rules_scope.MUST_BE_SAFETY_CORE, so moving it later is one line and the operator's call.",
+  "_note_budget_tripwire_2026_10_03": "Operator's ruling, 2026-10-03 (V>>): raise the safety-core budget tripwire in tests/test_rules_scope.py from 40000 to 72000 tokens, and demote NOTHING. The 40000 figure was a growth tripwire, never a measured ceiling -- GRIP#6093 measured a 64254-token safety-core DELIVERED to a dispatched subagent in full, and the hard 'Prompt is too long' limit is ~150K (see _doc). The ratified core projects to ~60196 tokens: the MUST_BE_SAFETY_CORE floor (35268, immovable) plus the operator-facing safeguards a HAL Council kept (seal 5fdc01c667c42355, 2026-09-29; mirrored in tests/test_rules_scope.py RATIFIED_KEEPS_2026_09_29) plus the genuine a/b/c rules. So 40000 was red by construction, and every honest path was 'raise the number', not 'demote a ratified safeguard to chase it' (_note_never_system_python_2026_09_20: that trade is the operator's call, not a side effect of a red test). 72000 leaves ~11800 tokens of headroom (warning shelf 70000) for deliberate growth while still tripping on a large accidental inclusion. The two budget tests had been --deselected in .github/workflows/forward-anchors.yml (red but non-blocking, so main looked green); those deselects are REMOVED in the same change, so the file now runs in full on every PR and a future overrun is visible. The extended/shed set projects to ~119,000 tokens; its own floor in test_projection_under_budget (shed_tokens_approx > 40,000) is a SEPARATE axis -- 'the #464 split sheds meaningful weight' -- not a stale copy of the 72,000 core ceiling (AGORA #7289 Speaker C read the two 40,000 figures as one; the test docstring now spells the distinction out).",
+  "_note_personal_matters_stay_private_2026_10_05": "personal-matters-stay-private.md listed in safety_core_explicit when it was added (V>>, 2026-10-05). Under _classification_principle it is (a), a dangerous action a subagent can take: committing personal material, fixtures or identifiers into GRIP, the same class as the PII commit no-sensitive-info-in-grip.md guards, and a dispatched agent writing tests or docs is the likeliest author of exactly that. Loading does not change: an unclassified rule is not in settings.claudeMdExcludes, so it already loaded natively everywhere (3633 characters). It is not pinned in lib/rules_scope.MUST_BE_SAFETY_CORE; pinning is one line and the operator's call.",
+  "_note_gpt_on_the_subscription_2026_10_05": "gpt-on-the-subscription-never-credits.md listed in safety_core_explicit when it was added (V>>, 2026-10-05). Under _classification_principle it is (a), a dangerous action a subagent can take: a subagent with Bash can call Codex, and without forced_login_method=chatgpt Codex falls through to workspace credits, which is paid spend the operator has barred until about 2026-10-11. Loading does not change: an unclassified rule already loaded natively everywhere. It is not pinned in lib/rules_scope.MUST_BE_SAFETY_CORE; pinning is one line and the operator's call.",
+  "_note_measured_claims_2026_10_12": "measured-claims-read-the-output-first.md listed in safety_core_explicit when it was added (V>>, 2026-10-12: \"11 times? Learn!!\"). Under _classification_principle it is (c), the integrity of claims a subagent makes: a dispatched agent that commits or opens a PR writes test counts into the commit message and body, and this rule, with hooks/measured-claim-gate.py behind it, says the count is copied from the run's summary line, never typed from expectation. Readers: makes-claims, writes-repo. Loading does not change: an unclassified rule already loaded natively everywhere. It is not pinned in lib/rules_scope.MUST_BE_SAFETY_CORE; pinning is one line and the operator's call.",
+  "_note_file_moment_2026_10_18": "Operator's ruling 2(a), 2026-10-18 (V>>, GRIP#6658, KERN v2 phase 2): four code rules leave the always-loaded set and load at the file moment. Each now carries paths: frontmatter, so Claude Code loads it only when a file matching one of its globs is read, written or edited. lib/rules_scope.validate accepts a pinned rule (MUST_REACH) with paths: only when `file_moment` lists it, and refuses a listed rule that carries no paths:, whose paths: names no glob (paths: [] still reads as path-scoped), or that `extended` excludes (claudeMdExcludes keeps an extended rule out even on a matching file; the last two from Codex on GRIP#8526), so the list, the classification and the files cannot drift. MUST_REACH readers are unchanged, and nothing changes in settings.json: a path-scoped rule is not excluded, Claude Code loads it on a match. The globs, each from the rule's own scope: no-stubs.md takes **/*.py and bin/**, because its detector reads Python and 111 of GRIP's Python tools sit in bin/ with no .py suffix. tests-must-be-able-to-fail.md takes tests/**, **/tests/**, **/test/**, **/__tests__/**, **/conftest.py, **/test.*, **/test_*, **/test-*, **/*_test.*, **/*-test.*, **/*.test.*, **/*.spec.*, **/*_spec.*, **/*Test.* and **/*Tests.*, because its scope is every test in every repo: this checkout holds 77 TypeScript and JavaScript tests outside tests/ and prefix-named test scripts (test.mjs, test-wa.mjs, a *-smoke-test.sh), and Go, Java, Kotlin, Swift and RSpec name tests foo_test.go, FooTest.java, FooTests.swift, src/test/ and foo_spec.rb (Codex on GRIP#8526). declared-input-must-reach-the-actor.md takes lib/**/*.py, bin/**, scripts/**/*.py and hooks/**/*.py, the four directories its scope names, with bin/ whole because its Python tools carry no suffix. path-portability.md takes every code and config type, not prose: .py, .sh, .bash, .zsh, .ps1, .js, .mjs, .cjs, .jsx, .ts, .tsx, .swift, .kt, .kts, .gradle, .java, .go, .rs, .rb and .tf sources and .json, .yaml, .yml, .toml, .plist, .template, .service and .timer config, each as **/*.<suffix>, plus bin/** and scripts/** whole because their executables carry no suffix. Its ban on hardcoded user paths does not depend on the language (Codex on GRIP#8526), config is where such a path turns up in practice (17 tracked config files hold a /Users/ or /home/ literal today), and .ps1 is there because the rule names C:/Users/ and the Windows installers are PowerShell. A new code or config type has to be added to the list. path-portability.md is not pinned, so validate() would accept its frontmatter unlisted; it is listed so its frontmatter cannot be dropped, nor the rule moved to `extended`, unseen. The cost the ruling accepts: the vendor probes of 2026-10-06 (docs/measurements/2026-10-06-kern-v2-vendor-probes.md, file-write and file-edit; one run each, Claude Haiku 4.5, Claude Code 2.1.289) found that the FIRST write of a new matching file, and the first edit of a matching file, ignore a path-scoped rule: it loads at that write, and the model then corrected the file. The ruling accepts that for these four code rules. visual-artifact-leak-prevention.md stays native, because for it one leaking write is the harm. bin/grip-lexicon measure on main at 8796aa9f7: 37 always-loaded files and 300,262 characters; with this change 33 files and 274,517, the four rules' 25,745. lib/rule_routing.py: 7 file-channel rules, up from 3.",
+  "ratchet": {
+    "_doc": "Ceilings that only come down (KERN v2, P0; the operator's ruling 2026-10-06, HITL lock 3, decision 3: growth is a report plus a ratchet, never a block). bin/grip-lexicon measure reports each figure against its ratchet on every pull request (the Forward Anchors job summary), with a GitHub warning when a figure is over it and never a failure. After a change that saves characters, run bin/grip-lexicon ratchet: it lowers each ratchet to today's figure and never raises one. Raising one is a deliberate hand edit, with its reason in the pull request. always_loaded_chars is what Claude Code adds up at startup: both CLAUDE.md files and every natively loaded rule, in UTF-16 code units. It warns above 150,000 on a 1M-context session. 289,970 is main at 54b72c7c9, the day this ratchet was set. The value below is always the current ratchet: bin/grip-lexicon ratchet lowers it with each saving (first to 274,517 on 2026-10-18 when four code rules moved to the file moment, _note_file_moment_2026_10_18, then by each annex and tier pull request), and the pull request that lowered it says why; this sentence never names the figure, so it cannot go stale again (AGORA on GRIP#8553).",
+    "always_loaded_chars": 183078
+  }
+}

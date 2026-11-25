@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+"""showcase-server — entry point for the generalised video showcase tracker.
+
+Reads:
+  $SHOWCASE_HOST (default 127.0.0.1)
+  $SHOWCASE_PORT (default 9000)
+  $CLAUDE_DIR    (default ~/.claude) — state lives under state/showcases/
+
+See ~/.claude/plans/enchanted-spinning-emerson.md.
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+# Make lib/ importable without installing the package.
+_CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR", Path.home() / ".claude"))
+if str(_CLAUDE_DIR) not in sys.path:
+    sys.path.insert(0, str(_CLAUDE_DIR))
+
+from lib.showcase.server import main  # noqa: E402
+
+if __name__ == "__main__":
+    main()

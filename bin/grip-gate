@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""grip-gate -- run GRIP's mechanical gates from any harness.
+
+GRIP's gates are wired to the eight hook events Claude Code defines, and nothing
+else invokes them. Run GRIP under Codex or OpenCode today and not one gate fires,
+with no signal that anything changed -- the system looks healthy and is unguarded.
+
+This is the neutral entry point. The detectors are already pure functions; only the
+Claude Code payload shape and its decision JSON were ever harness-specific. Point any
+harness's pre-write hook at this and it enforces the same DENY set.
+
+Exit codes are the integration contract, and they match Codex's documented deny
+path for a PreToolUse hook -- "exit with code 2 and write the reason to stderr"
+(developers.openai.com/codex/hooks):
+    0  allow
+    2  deny (at least one gate that RAN objected); reason on stderr
+    1  usage error
+
+Usage:
+    bin/grip-gate check PATH                    # read content from PATH
+    bin/grip-gate check PATH --content-file F   # judge F's bytes as PATH's new content
+    cat new | bin/grip-gate check PATH -        # read candidate content from stdin
+    bin/grip-gate check PATH --json             # machine-readable verdict
+    bin/grip-gate check PATH --only no-stubs    # one gate
+    bin/grip-gate list                          # what is wired, and its rule
+
+Codex wiring lives in ``~/.codex/hooks.json`` (NOT in config.toml, which only
+carries the ``hooks = true`` flag), in the same JSON shape Claude Code uses::
+
+    {"hooks": {"PreToolUse": [{"matcher": "",
+      "hooks": [{"type": "command",
+                 "command": "~/.grip/bin/grip-gate check \\"$FILE\\""}]}]}}
+
+Register PermissionRequest alongside PreToolUse: sources disagree on whether
+PreToolUse fires for every local tool or only the shell, and PermissionRequest can
+fire standalone. Codex skips a hook whose hash has not been reviewed -- run
+``/hooks`` in Codex to trust it. That human step is the design, not an obstacle.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+_LIB = _ROOT / "lib"
+# BOTH are needed. Detector modules are imported bare (``from no_stubs_detector
+# import ...``), which wants lib/ on the path, but some of them import their own
+# siblings as ``lib.x``, which wants the repo root. With only lib/ present,
+# guardrail-evasion reported COULD-NOT-RUN -- caught on the first smoke test by
+# the very reporting this tool exists to provide.
+for _entry in (str(_ROOT), str(_LIB)):
+    if _entry not in sys.path:
+        sys.path.insert(0, _entry)
+
+from gate_runner import (  # noqa: E402
+    DENY,
+    deny_summary,
+    GATES,
+    as_dict,
+    gate_names,
+    render_text,
+    run_gates,
+    verdict,
+)
+
+
+def _read_content(path: Path, content_file: str | None) -> str | None:
+    """Content to judge: stdin, an explicit candidate file, or the path itself."""
+    if content_file == "-":
+        return sys.stdin.read()
+    if content_file:
+        try:
+            return Path(content_file).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            print(f"grip-gate: cannot read {content_file}: {exc}", file=sys.stderr)
+            return None
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        print(f"grip-gate: cannot read {path}: {exc}", file=sys.stderr)
+        return None
+
+
+def _cmd_list() -> int:
+    print("Gates wired into grip-gate:\n")
+    for name, rule, _ in GATES:
+        print(f"  {name:<20} {rule}")
+    print("\nExit codes: 0 allow, 2 deny, 1 usage error.")
+    return 0
+
+
+def _cmd_check(args: argparse.Namespace) -> int:
+    path = Path(args.path)
+    content = _read_content(path, args.content_file)
+    if content is None:
+        return 1
+
+    only = tuple(args.only) if args.only else None
+    unknown = [n for n in (only or ()) if n not in gate_names()]
+    if unknown:
+        print(f"grip-gate: unknown gate(s): {', '.join(unknown)}", file=sys.stderr)
+        print(f"available: {', '.join(gate_names())}", file=sys.stderr)
+        return 1
+
+    results = run_gates(content, str(path), only=only)
+    if args.json:
+        print(json.dumps(as_dict(results, str(path)), indent=2))
+    else:
+        print(render_text(results, str(path)))
+
+    code = verdict(results)
+    if code == DENY:
+        # Codex's documented deny contract for a PreToolUse hook is "exit with code
+        # 2 and write the reason to stderr" (developers.openai.com/codex/hooks). The
+        # full report goes to stdout for a human; stderr carries the reason the
+        # harness actually surfaces, so a DENY is never silent to the caller.
+        print(deny_summary(results), file=sys.stderr)
+    return code
+
+
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="grip-gate", description="Run GRIP's mechanical gates from any harness."
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    check = sub.add_parser("check", help="Judge one candidate edit.")
+    check.add_argument("path", help="Path the content would be written to.")
+    check.add_argument(
+        "content_file", nargs="?", default=None,
+        help="Candidate content: a file, or '-' for stdin. Defaults to reading PATH.",
+    )
+    check.add_argument("--content-file", dest="content_file_opt", default=None,
+                       help="Same as the positional form.")
+    check.add_argument("--only", action="append", default=None,
+                       help="Run only this gate (repeatable).")
+    check.add_argument("--json", action="store_true", help="Machine-readable verdict.")
+
+    sub.add_parser("list", help="Show which gates are wired, and the rule each applies.")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    if args.command == "list":
+        return _cmd_list()
+    # Accept the flag spelling as well as the positional one; the flag is what a
+    # hook config reads more clearly, the positional is what a human types.
+    args.content_file = args.content_file or args.content_file_opt
+    return _cmd_check(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

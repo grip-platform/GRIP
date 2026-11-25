@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# happiverse-export — thin shim over lib/happiverse_proof.py (syscall-doctrine).
+#
+# Exports the PUBLIC, stranger-verifiable bundle for your-gateway.example.com:
+# node-001 witness METADATA rows (never message content) + the Ed25519-signed
+# chain root + node-001's PUBLIC key. The PRIVATE signing key is a parameter and
+# is NEVER embedded or printed; on the blackbook this runs with node 001's real
+# key, in CI/locally `gen-sample` uses a throwaway TEST keypair.
+#
+# Usage:
+#   happiverse-export export --witness-chain <in.jsonl> \
+#       --private-key <signing.key> --out <bundle.json>      # blackbook (P1-install)
+#   happiverse-export gen-sample --out-dir apps/happiverse-proof  # TEST keypair sample
+#   happiverse-export verify --bundle <bundle.json>          # offline self-check
+#
+# Routes through the canonical GRIP venv (cryptography lives there); falls back
+# to walking up for a venv/ like bin/grip-test does.
+set -euo pipefail
+
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+
+# Resolve the repo root from this script's location (bin/ -> repo).
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname -- "$SCRIPT_DIR")"
+
+source "$REPO_ROOT/scripts/lib/venv-utils.sh"
+
+# resolve_venv_python knows both layouts (Windows Scripts/python.exe, POSIX
+# bin/python3) but falls back to the SYSTEM python when a directory has no venv
+# — which would match the very first ancestor and end the walk. So a candidate
+# counts only when it actually lives inside that ancestor's venv/.
+find_venv_python() {
+    local d="$1" cand
+    while [[ "$d" != "/" && -n "$d" ]]; do
+        cand="$(resolve_venv_python "$d/venv" 2>/dev/null || true)"
+        [[ "$cand" == "$d/venv/"* ]] && { echo "$cand"; return 0; }
+        d="$(dirname -- "$d")"
+    done
+    return 1
+}
+
+VENV_PY=""
+if ! VENV_PY="$(find_venv_python "$REPO_ROOT" 2>/dev/null)"; then
+    VENV_PY="$(resolve_venv_python "$CLAUDE_DIR/venv" 2>/dev/null || true)"
+    [[ "$VENV_PY" == "$CLAUDE_DIR/venv/"* ]] || VENV_PY=""
+fi
+
+if [[ ! -x "$VENV_PY" ]]; then
+    echo "happiverse-export: no venv python found (needs the 'cryptography' package)." >&2
+    # pip runs through the sibling grip-py, pinned to the same venv, because it
+    # finds the new interpreter in either platform's layout.
+    echo "  fix: python3 -m venv $CLAUDE_DIR/venv && CLAUDE_DIR=$CLAUDE_DIR $SCRIPT_DIR/grip-py -m pip install cryptography" >&2
+    exit 2
+fi
+
+exec env PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    "$VENV_PY" -m lib.happiverse_proof "$@"

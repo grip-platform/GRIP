@@ -1,0 +1,66 @@
+{
+  "title": "/legal-provenance — the 5 legal-citation hallucination modes (teaching sample)",
+  "response": "# Limitation review — *Ashworth v Pennine Logistics Ltd* (teaching sample)\n\n**Matter:** simple-contract debt claim. **Question:** is the claim statute-barred? This is a junior associate's AI-assisted draft, run through `/legal-provenance`. Three citations are sound (green); five are textbook AI-citation fabrications (red) — one per failure mode. Click any chip to see the exact source span, or its absence.\n\n## The limitation period\n\nThe claim is founded on simple contract, so the six-year period applies: an action \"shall not be brought after the expiration of six years from the date on which the cause of action accrued\" [[cite:c1]]. Time runs from the **breach**, not from when loss is felt: the court confirmed that \"time runs from the date of the breach, not from the date on which loss is suffered\" [[cite:c2]]. The breach occurred on 3 March 2017, so the primary period expired on 3 March 2023.\n\n## The acknowledgment argument\n\nThe claimant relies on the defendant's letter of 12 June 2022. The court rejected it, finding the letter \"neither admitted liability nor identified any sum as due\" [[cite:c3]]. The judgment went further, holding that the letter \"cannot amount to an acknowledgment under section 29\" [[cite:c4]], and that \"the burden lies on the claimant to prove deliberate concealment of the breach\" [[cite:c5]] before time could be extended.\n\n## The statutory hook\n\nThe six-year bar is recorded in the judgment itself, which states that an action \"shall not be brought after the expiration of six years from the date on which the cause of action accrued\" [[cite:c6]]. The Court of Appeal in *Meridian Freight v Calder* put it more plainly still: a debtor's silence \"is not capable in law of stopping the limitation clock\" [[cite:c7]].\n\n## Conclusion\n\nThe claim, issued on 5 May 2023, is \"clearly statute-barred\" [[cite:c8]].\n\n---\n\n*What `/legal-provenance` caught:* **c4** invents a statutory cross-reference the judgment never makes; **c5** attributes a holding the court never gave; **c6** quotes the statute but pins it to the *case*; **c7** cites an authority that is not in the record at all; **c8** silently embellishes \"is therefore statute-barred\" into \"is clearly statute-barred\". Each renders RED — verbatim-absent — and none could survive to a court.",
+  "sources": [
+    {
+      "id": "s_statute",
+      "label": "Limitation Act 1980, s.5 (genuine public statute)",
+      "text": "Limitation Act 1980\n\nSection 5 — Time limit for actions founded on simple contract.\n\nAn action founded on simple contract shall not be brought after the expiration of six years from the date on which the cause of action accrued."
+    },
+    {
+      "id": "s_case",
+      "label": "Ashworth v Pennine Logistics Ltd [2023] EWHC 1180 (KB) — FICTIONAL teaching sample",
+      "text": "Ashworth v Pennine Logistics Ltd [2023] EWHC 1180 (KB)\n\n[Fictional judgment — illustrative teaching sample for /legal-provenance. Not a real case; any resemblance to a real matter or person is coincidental. The Limitation Act 1980 extract used alongside it is the genuine public statute.]\n\n12. The principle is settled. For a claim founded on simple contract, time runs from the date of the breach, not from the date on which loss is suffered. The cause of action is complete the moment the contractual obligation is broken.\n\n13. I reject the submission that the defendant's letter of 12 June 2022 operated as an acknowledgment. On its proper construction the letter did no more than propose a without-prejudice meeting; it neither admitted liability nor identified any sum as due.\n\n14. The primary limitation period is therefore not displaced. The claim, issued on 5 May 2023, is therefore statute-barred."
+    }
+  ],
+  "citations": [
+    {
+      "id": "c1",
+      "claim": "A simple-contract claim carries a six-year limitation period.",
+      "source_id": "s_statute",
+      "quote": "shall not be brought after the expiration of six years from the date on which the cause of action accrued"
+    },
+    {
+      "id": "c2",
+      "claim": "Time runs from the date of breach, not from when loss is suffered.",
+      "source_id": "s_case",
+      "quote": "time runs from the date of the breach, not from the date on which loss is suffered"
+    },
+    {
+      "id": "c3",
+      "claim": "The 12 June 2022 letter was not an acknowledgment.",
+      "source_id": "s_case",
+      "quote": "it neither admitted liability nor identified any sum as due"
+    },
+    {
+      "id": "c4",
+      "claim": "MODE 2 — Fabricated statutory cross-reference: the judgment supposedly tied its ruling to section 29.",
+      "source_id": "s_case",
+      "quote": "cannot amount to an acknowledgment under section 29"
+    },
+    {
+      "id": "c5",
+      "claim": "MODE 1 — Phantom holding: a ratio on burden of proof the court never stated.",
+      "source_id": "s_case",
+      "quote": "the burden lies on the claimant to prove deliberate concealment of the breach"
+    },
+    {
+      "id": "c6",
+      "claim": "MODE 3 — Wrong-source attribution: a real statute quote pinned to the case rather than the Act.",
+      "source_id": "s_case",
+      "quote": "shall not be brought after the expiration of six years from the date on which the cause of action accrued"
+    },
+    {
+      "id": "c7",
+      "claim": "MODE 5 — Phantom authority: a Court of Appeal case that is not in the record at all.",
+      "source_id": "s_meridian",
+      "quote": "is not capable in law of stopping the limitation clock"
+    },
+    {
+      "id": "c8",
+      "claim": "MODE 4 — Embellished quote: 'therefore statute-barred' silently upgraded to 'clearly statute-barred'.",
+      "source_id": "s_case",
+      "quote": "The claim, issued on 5 May 2023, is clearly statute-barred"
+    }
+  ]
+}

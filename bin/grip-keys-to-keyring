@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+# grip-keys-to-keyring — move plaintext provider API keys out of a shell
+# profile and into the operating system's secret store, via bin/grip-keyring.
+#
+# WHY THIS EXISTS
+#   A>> (Andre Theart)'s ~/.bashrc exports unencrypted API keys for fourteen
+#   LLM providers. Every process the shell starts inherits them, any script
+#   can print them, and a backup of the home directory carries them in clear
+#   text. GRIP already ships bin/grip-keyring, which stores secrets in the
+#   platform keystore (macOS Keychain, Linux libsecret, Windows Credential
+#   Vault). This moves the keys there and comments the exports out.
+#
+# THE ORDER OF OPERATIONS IS THE WHOLE SAFETY ARGUMENT
+#   A half-migrated profile that has LOST keys is far worse than an
+#   unmigrated one, so nothing is removed until everything is proven present:
+#
+#     1. Prove the keystore works at all      (grip-keyring selftest)
+#     2. Back the profile up, and verify the backup byte-for-byte
+#     3. Store every key                       (grip-keyring install)
+#     4. Read every key back and compare SHA-256 against the original
+#     5. ONLY THEN comment the export lines out, never delete them
+#
+#   Steps 1-4 change nothing in the profile. If any key fails to store or
+#   fails to round-trip, the run aborts at step 4 and the profile is
+#   untouched — the keys still work exactly as before. Storing a key into the
+#   keystore is additive and harmless on its own, which is why an abort
+#   part-way through step 3 is safe.
+#
+# SECRETS DISCIPLINE
+#   No key value is ever printed, logged, or echoed. Reports name only the
+#   variable, the provider, and the character length. Values pass through one
+#   temporary file (mode 600, in a private directory outside any git repo,
+#   removed by an EXIT trap) because `grip-keyring install` takes a file —
+#   that is its real interface and this script does not invent another.
+#
+# IDEMPOTENT
+#   A second run finds the exports already commented out, reports "nothing to
+#   do", and changes nothing.
+#
+# USAGE
+#   grip-keys-to-keyring                    # dry run — shows what it would move
+#   grip-keys-to-keyring --apply            # do it
+#   grip-keys-to-keyring --profile ~/.zshrc # a different shell profile
+#
+# OPTIONS
+#   --apply             Make changes (default is dry-run).
+#   --profile FILE      Shell profile to read/edit (default $HOME/.bashrc).
+#   --keyring CMD       Path to grip-keyring (default: alongside this script).
+#   --skip-selftest     Skip the keystore selftest. Only for testing this
+#                       script itself; never use it on a real migration.
+#
+# PLATFORM NOTE (read this before running on Windows)
+#   bin/grip-keyring DOES ship a Windows backend (PowerShell +
+#   Windows.Security.Credentials.PasswordVault), but its own source comment
+#   marks it "Implemented but untested on this host". That is why step 1
+#   above is a hard precondition: if the Windows backend does not work on
+#   your machine, the selftest fails, this script aborts, and your profile is
+#   never touched.
+
+set -euo pipefail
+
+APPLY=0
+PROFILE=""
+KEYRING=""
+SKIP_SELFTEST=0
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+MARKER="grip-keys-to-keyring"
+WORKDIR=""
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf 'WARN: %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+cleanup() { [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ] && rm -rf "$WORKDIR"; }
+trap cleanup EXIT INT TERM
+
+usage() { sed -n '2,60p' "$0" >&2; exit 0; }
+
+# --- provider map -------------------------------------------------------------
+#
+# env var -> grip-keyring service name. Sourced from the code that actually
+# reads these keys, not invented here:
+#   bin/grip-hal                 provider_envvar() / provider_keychain()
+#   lib/hal_council_dispatch.py  ANTHROPIC_API_KEY, XAI_API_KEY pairs
+#   lib/grip_hear_lyrics.py      grip-vulavula service name
+#
+# CAVEAT: the Vulavula *environment variable* name is the one entry not
+# evidenced anywhere in the tree (only its keychain service is). VULAVULA_API_KEY
+# is the conventional form. Any key-shaped export this map does not know is
+# REPORTED as unmapped rather than silently ignored, so a wrong guess here
+# surfaces instead of losing a key.
+keyring_service_for() {
+    case "$1" in
+        ANTHROPIC_API_KEY)  printf 'grip-anthropic-external' ;;
+        OPENAI_API_KEY)     printf 'grip-openai' ;;
+        XAI_API_KEY)        printf 'grip-xai' ;;
+        GROQ_API_KEY)       printf 'grip-groq' ;;
+        GEMINI_API_KEY)     printf 'grip-gemini' ;;
+        DEEPSEEK_API_KEY)   printf 'grip-deepseek' ;;
+        MOONSHOT_API_KEY)   printf 'grip-moonshot' ;;
+        ZHIPU_API_KEY)      printf 'grip-zhipu' ;;
+        MISTRAL_API_KEY)    printf 'grip-mistral' ;;
+        OPENROUTER_API_KEY) printf 'grip-openrouter' ;;
+        DASHSCOPE_API_KEY)  printf 'grip-dashscope' ;;
+        SORUXGPT_API_KEY)   printf 'grip-soruxgpt' ;;
+        VULAVULA_API_KEY)   printf 'grip-vulavula' ;;
+        *)                  printf '' ;;
+    esac
+}
+
+# Anything key-shaped that the map does not cover, so nothing is lost silently.
+looks_like_a_key_var() {
+    case "$1" in *_API_KEY|*_API_TOKEN|*_SECRET_KEY|*_ACCESS_TOKEN) return 0 ;; *) return 1 ;; esac
+}
+
+# --- parsing ------------------------------------------------------------------
+#
+# Emits "NAME<TAB>VALUE" for each uncommented `export NAME=VALUE` in the
+# profile, stripping one layer of single or double quotes. Later definitions
+# win, matching how the shell itself would evaluate the file.
+parse_exports() {
+    awk '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*export[[:space:]]+[A-Za-z_][A-Za-z0-9_]*=/ {
+            line = $0
+            sub(/^[[:space:]]*export[[:space:]]+/, "", line)
+            eq = index(line, "=")
+            name = substr(line, 1, eq - 1)
+            val  = substr(line, eq + 1)
+            sub(/[[:space:]]+$/, "", val)
+            if (val ~ /^".*"$/ || val ~ /^'"'"'.*'"'"'$/) { val = substr(val, 2, length(val) - 2) }
+            if (val != "") { print name "\t" val }
+        }
+    ' "$1"
+}
+
+sha_of_stdin() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then shasum -a 256 | awk '{print $1}'
+    else die "no sha256sum or shasum on PATH — cannot verify the round-trip, refusing to continue"; fi
+}
+
+# --- preconditions ------------------------------------------------------------
+
+resolve_keyring() {
+    KEYRING="${KEYRING:-}"
+    [ -n "$KEYRING" ] || KEYRING="$SELF_DIR/grip-keyring"
+    [ -x "$KEYRING" ] || command -v "$KEYRING" >/dev/null 2>&1 \
+        || die "grip-keyring not found or not executable at: $KEYRING"
+}
+
+check_keystore_works() {
+    [ "$SKIP_SELFTEST" -eq 1 ] && { warn "keystore selftest SKIPPED (--skip-selftest) — do not do this on a real migration"; return 0; }
+    say "Checking the keystore actually works on this machine ($(uname -s))..."
+    if ! "$KEYRING" selftest >/dev/null 2>&1; then
+        say ""
+        say "  The keystore selftest FAILED. Nothing has been changed."
+        say "  grip-keyring cannot store and retrieve a throwaway value here, so"
+        say "  migrating real keys into it would lose them."
+        say ""
+        say "  Run this to see the actual error:"
+        say "      $KEYRING selftest"
+        say ""
+        say "  On Windows this usually means the PowerShell Credential Vault path"
+        say "  is unavailable. grip-keyring prefers pwsh (PowerShell 7); the WinRT"
+        say "  PasswordVault API it uses is a Windows PowerShell 5.1 feature. Try:"
+        say "      powershell -NoProfile -Command '[Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime]::new()'"
+        say "  If that works but pwsh does not, a Windows credential store is"
+        say "  present and grip-keyring's shell preference is the problem."
+        die "keystore unusable — aborting before any change"
+    fi
+    say "  keystore selftest PASSED"
+}
+
+make_private_workdir() {
+    umask 077
+    WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/grip-keys-XXXXXX")" || die "cannot create a private temp directory"
+    if git -C "$WORKDIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        die "temp directory $WORKDIR is inside a git repository — refusing to write secrets there"
+    fi
+    chmod 700 "$WORKDIR"
+}
+
+# --- the three phases ---------------------------------------------------------
+
+# Phase A: store. Additive and harmless on its own; the profile is untouched.
+store_keys() {
+    local payload="$WORKDIR/payload.env"
+    umask 077
+    : >"$payload"
+    local name val svc
+    while IFS="$(printf '\t')" read -r name val; do
+        svc="$(keyring_service_for "$name")"
+        printf '%s=%s\n' "$svc" "$val" >>"$payload"
+    done <"$WORKDIR/found.tsv"
+    chmod 600 "$payload"
+
+    say "Storing $(wc -l <"$payload" | tr -d ' ') keys into the keystore..."
+    "$KEYRING" install "$payload" >/dev/null 2>&1 \
+        || die "grip-keyring install failed — the profile has NOT been touched, your keys still work"
+    rm -f "$payload"
+}
+
+# Phase B: verify. Reads every value back out and compares hashes. No value is
+# ever printed. A single mismatch aborts before the profile is edited.
+verify_keys() {
+    local dump="$WORKDIR/verify.env"
+    umask 077
+    "$KEYRING" export "$dump" >/dev/null 2>&1 \
+        || die "grip-keyring export failed — cannot verify the round-trip. Profile NOT touched."
+
+    local name val svc want got stored failures=0
+    while IFS="$(printf '\t')" read -r name val; do
+        svc="$(keyring_service_for "$name")"
+        want="$(printf '%s' "$val" | sha_of_stdin)"
+        # $(...) strips the trailing newline awk's print adds, so the hash is
+        # taken over exactly the same bytes as the profile value. Getting this
+        # wrong makes every key look like a mismatch (caught in testing).
+        stored="$(awk -F= -v s="$svc" '$1 == s { sub("^" s "=", ""); print; exit }' "$dump")"
+        got="$(printf '%s' "$stored" | sha_of_stdin)"
+        stored=""
+        if [ "$want" = "$got" ]; then
+            say "  verified  $name -> $svc  (${#val} chars)"
+        else
+            warn "  MISMATCH  $name -> $svc  (stored value does not match the profile)"
+            failures=$((failures + 1))
+        fi
+    done <"$WORKDIR/found.tsv"
+
+    rm -f "$dump"
+    [ "$failures" -eq 0 ] \
+        || die "$failures key(s) failed to round-trip. The profile has NOT been touched — nothing is lost."
+}
+
+# Phase C: comment out. The only step that edits the profile, and it runs only
+# after every key is proven readable from the keystore. Lines are commented,
+# never deleted.
+comment_out_exports() {
+    local backup="$PROFILE.$MARKER-backup-$TS"
+    cp -p "$PROFILE" "$backup" || die "profile backup FAILED — refusing to edit the profile"
+    cmp -s "$PROFILE" "$backup" || die "profile backup is not byte-identical — refusing to edit the profile"
+    say "Profile backed up to: $backup"
+
+    local names="" name val
+    while IFS="$(printf '\t')" read -r name val; do names="$names $name"; done <"$WORKDIR/found.tsv"
+
+    local edited="$WORKDIR/profile.new"
+    awk -v names="$names" -v marker="$MARKER" -v ts="$TS" '
+        BEGIN { n = split(names, a, " "); for (i = 1; i <= n; i++) if (a[i] != "") want[a[i]] = 1 }
+        {
+            line = $0
+            if (line ~ /^[[:space:]]*export[[:space:]]+[A-Za-z_][A-Za-z0-9_]*=/) {
+                t = line
+                sub(/^[[:space:]]*export[[:space:]]+/, "", t)
+                nm = substr(t, 1, index(t, "=") - 1)
+                if (nm in want) {
+                    print "# " marker " " ts ": moved to the OS keystore. Retrieve with: grip-keyring status"
+                    print "# " line
+                    next
+                }
+            }
+            print line
+        }
+    ' "$PROFILE" >"$edited" || die "could not rewrite the profile — original untouched, backup at $backup"
+
+    cat "$edited" >"$PROFILE" || die "could not write the profile — restore with: cp \"$backup\" \"$PROFILE\""
+    say "Commented out $(wc -l <"$WORKDIR/found.tsv" | tr -d ' ') export line(s) in $PROFILE"
+    say ""
+    say "ROLLBACK (copy-paste to undo the profile edit):"
+    say "  cp \"$backup\" \"$PROFILE\""
+}
+
+# --- discovery ----------------------------------------------------------------
+
+discover() {
+    mkdir -p "$WORKDIR"
+    : >"$WORKDIR/found.tsv"
+    local unmapped=0 name val svc
+    while IFS="$(printf '\t')" read -r name val; do
+        [ -n "$name" ] || continue
+        svc="$(keyring_service_for "$name")"
+        if [ -n "$svc" ]; then
+            printf '%s\t%s\n' "$name" "$val" >>"$WORKDIR/found.tsv"
+            say "  found     $name -> $svc  (${#val} chars)"
+        elif looks_like_a_key_var "$name"; then
+            warn "  UNMAPPED  $name looks like a credential but has no keystore mapping — left alone"
+            unmapped=$((unmapped + 1))
+        fi
+    done < <(parse_exports "$PROFILE")
+    [ "$unmapped" -gt 0 ] && warn "$unmapped key-shaped export(s) were not migrated; add them to keyring_service_for() if they should be"
+    return 0
+}
+
+# --- main ---------------------------------------------------------------------
+
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --apply)          APPLY=1; shift ;;
+            --profile)        PROFILE="${2:-}"; shift 2 ;;
+            --keyring)        KEYRING="${2:-}"; shift 2 ;;
+            --skip-selftest)  SKIP_SELFTEST=1; shift ;;
+            -h|--help)        usage ;;
+            *)                die "unknown argument: $1 (try --help)" ;;
+        esac
+    done
+}
+
+main() {
+    parse_args "$@"
+    PROFILE="${PROFILE:-$HOME/.bashrc}"
+    [ -f "$PROFILE" ] || die "shell profile not found: $PROFILE"
+    resolve_keyring
+    make_private_workdir
+
+    say "grip-keys-to-keyring — profile=$PROFILE apply=$APPLY"
+    say "Scanning for provider keys (values are never printed)..."
+    discover
+
+    local n
+    n="$(wc -l <"$WORKDIR/found.tsv" | tr -d ' ')"
+    if [ "$n" -eq 0 ]; then
+        say ""
+        say "No uncommented provider key exports found in $PROFILE."
+        say "Nothing to do. (Idempotent: a profile already migrated looks exactly like this.)"
+        exit 0
+    fi
+
+    if [ "$APPLY" -eq 0 ]; then
+        say ""
+        say "DRY RUN — nothing changed. With --apply this would:"
+        say "  1. run '$KEYRING selftest' and abort if the keystore does not work"
+        say "  2. store the $n key(s) above into the keystore"
+        say "  3. read each one back and compare SHA-256 against the profile value"
+        say "  4. back up $PROFILE, then comment out (never delete) those $n export line(s)"
+        say ""
+        say "Re-run with --apply to perform it."
+        exit 0
+    fi
+
+    check_keystore_works
+    store_keys
+    say "Verifying every key reads back correctly BEFORE touching the profile..."
+    verify_keys
+    comment_out_exports
+    say ""
+    say "SUCCESS: $n key(s) now live in the OS keystore. Check with: $KEYRING status"
+    say "Open a new shell for the change to take effect."
+}
+
+main "$@"

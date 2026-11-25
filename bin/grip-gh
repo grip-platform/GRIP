@@ -1,0 +1,73 @@
+#!/bin/sh
+# grip-gh — gh shim that resolves the correct repo deterministically.
+# Resolution ladder (first match wins):
+#   1. Caller already passed -R/--repo → exec unchanged (explicit wins)
+#   2. $GH_REPO set → exec unchanged (gh honours it natively)
+#   3. git remote get-url origin from $PWD (repo root or any subdir) → OWNER/REPO
+#   4. Known map: $HOME/.claude → grip-platform/GRIP, $HOME/.hal → grip-platform/HAL
+#   5. Ambiguous → exit 1 + loud stderr (NEVER silent guess)
+# On steps 3-5 (when repo resolved here), always echo one stderr diagnostic line.
+
+set -e
+
+# ── Step 1: explicit -R/--repo in args ──────────────────────────────────────
+# Any of -R, --repo, -R=X, --repo=X anywhere in args → gh handles it natively.
+# The two-token form `-R OWNER/REPO` is covered too: `-R` itself is an arg the
+# loop sees, so it exec's unchanged (no separate prev-tracking pass needed).
+for arg in "$@"; do
+  case "$arg" in
+    -R|--repo|-R=*|--repo=*) exec gh "$@" ;;
+  esac
+done
+
+# ── Step 2: $GH_REPO already set ─────────────────────────────────────────────
+if [ -n "$GH_REPO" ]; then
+  exec gh "$@"
+fi
+
+# ── Step 3: resolve from cwd git remote ──────────────────────────────────────
+_resolve_from_git() {
+  # `git remote get-url origin` works from the repo root OR any subdir
+  # (git walks up to find .git) — no rev-parse + -C indirection needed.
+  remote=$(git remote get-url origin 2>/dev/null) || return 1
+  # Strip SSH or HTTPS prefix and .git suffix → OWNER/REPO
+  repo=$(printf '%s' "$remote" \
+    | sed 's|git@github\.com:||; s|https://github\.com/||; s|\.git$||')
+  # Strict OWNER/REPO: GitHub charset only, exactly two non-empty segments.
+  # Anything else (ssh://…:port, token@host, non-GitHub, "OWNER/") → return 1
+  # so the caller falls through to the loud Step-5 error — NEVER inject a
+  # malformed --repo (the shim's whole point is no silent wrong-repo).
+  case "$repo" in
+    *[!A-Za-z0-9._/-]*) return 1 ;;   # scheme/colon/@/space residue
+  esac
+  owner="${repo%%/*}"
+  name="${repo#*/}"
+  if [ -z "$owner" ] || [ -z "$name" ] || [ "$owner" = "$repo" ]; then
+    return 1
+  fi
+  case "$name" in */*) return 1 ;; esac   # more than two segments
+  printf '%s' "$repo"
+  return 0
+}
+
+if resolved=$(_resolve_from_git 2>/dev/null); then
+  printf '[grip-gh] repo → %s (via cwd git remote)\n' "$resolved" >&2
+  exec gh "$@" --repo "$resolved"
+fi
+
+# ── Step 4: known home-dir map ────────────────────────────────────────────────
+case "$PWD" in
+  "$HOME/.claude"|"$HOME/.claude/"*) resolved="grip-platform/GRIP" ;;
+  "$HOME/.hal"|"$HOME/.hal/"*)       resolved="grip-platform/HAL"  ;;
+  *)                                  resolved="" ;;
+esac
+
+if [ -n "$resolved" ]; then
+  printf '[grip-gh] repo → %s (via known-dir map)\n' "$resolved" >&2
+  exec gh "$@" --repo "$resolved"
+fi
+
+# ── Step 5: ambiguous — loud error, never silent guess ───────────────────────
+printf '[grip-gh] ERROR: cannot determine target repo from cwd=%s.\n' "$PWD" >&2
+printf '  Fix: pass -R OWNER/REPO, set $GH_REPO, or run from inside the target repo tree.\n' >&2
+exit 1

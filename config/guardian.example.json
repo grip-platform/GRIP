@@ -1,0 +1,15 @@
+{
+  "_comment": "Example of guardian.json, which lives ENCRYPTED inside the operator's own guardian repository (see skills/guardian/SKILL.md), never in GRIP. GRIP itself keeps only a gitignored pointer, config/guardian.local.json: {\"guardian_repo\": \"<path>\"}.",
+  "owner_github": "<the operator's own GitHub account>",
+  "mail_accounts": ["<Apple Mail account name, as Mail shows it>"],
+  "workspace_accounts": ["<gog-authorised Workspace address>"],
+  "window_days": 90,
+  "matters": [
+    {
+      "code": "M1",
+      "name": "<matter name: encrypted, so it may be descriptive>",
+      "record": "<path to the matter record>",
+      "terms": ["<sender or subject terms that identify this matter>"]
+    }
+  ]
+}

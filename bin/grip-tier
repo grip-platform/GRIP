@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Thin wrapper — all logic in lib/grip_tier.py.
+# Mirrors the grip-output-tier / grip-channels-wizard convention, with a
+# script-relative fallback so it works on non-standard layouts (symlinked
+# bin, CLAUDE_DIR unset) — AGORA #3276 robustness concern.
+_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for _gt in \
+    "${CLAUDE_DIR:-$HOME/.claude}/lib/grip_tier.py" \
+    "${_script_dir%/bin}/lib/grip_tier.py"; do
+    if [[ -f "$_gt" ]]; then
+        exec python3 "$_gt" "$@"
+    fi
+done
+echo "grip-tier: resolver not found (looked in \$CLAUDE_DIR/lib and the bin-relative lib). Set CLAUDE_DIR or reinstall GRIP." >&2
+exit 1

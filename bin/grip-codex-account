@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+# grip-codex-account — register and sign in the ChatGPT accounts the billing
+# ladder rotates over (rung 1).
+#
+# Each account gets its OWN CODEX_HOME, because that is what actually isolates
+# credentials: codex stores auth in "$CODEX_HOME/auth.json", so one home per
+# account is the only way to hold several logins side by side. `--profile` is a
+# CONFIG layer, not an auth layer, and cannot separate logins on its own.
+#
+# Verified on codex 0.147.0, 2026-08-18.
+
+set -uo pipefail
+
+GRIP_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+# GRIP_CODEX_BIN wins; else the codex on PATH; else Homebrew's usual place. A
+# recipient who installed codex with npm has it on PATH and nowhere else
+# (the gift-kit review, 2026-10-16).
+CODEX_BIN="${GRIP_CODEX_BIN:-$(command -v codex 2>/dev/null || echo /opt/homebrew/bin/codex)}"
+ACCOUNTS_FILE="${GRIP_CODEX_ACCOUNTS:-$GRIP_DIR/config/codex-accounts.json}"
+
+usage() {
+    cat >&2 <<'EOF'
+Usage:
+  grip-codex-account list
+  grip-codex-account add <slug> [label] [--workspace <id>]  Register; log in if needed
+  grip-codex-account login <slug> [--workspace <id>]        Re-run the browser login
+  grip-codex-account check [slug]          Check pinned billing workspaces
+  grip-codex-account remove <slug>          Deregister (the home is left on disk)
+  grip-codex-account whoami [slug]          Show the plan and workspaces of each account
+
+The login step opens a browser and is the operator's own action — this tool
+never handles a password. Sign in as the account that owns the workspace you
+want that rung to bill.
+EOF
+}
+
+home_for() { echo "$HOME/.codex-$1"; }
+
+valid_workspace() {
+    [[ "$1" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]
+}
+
+workspace_for() {
+    python3 - "$ACCOUNTS_FILE" "$1" <<'PY'
+import json, pathlib, sys
+path, slug = pathlib.Path(sys.argv[1]), sys.argv[2]
+if path.exists():
+    for row in json.loads(path.read_text()).get("accounts", []):
+        if row.get("slug") == slug:
+            # A null pin is no pin: printing it would hand `login` the text "None".
+            print(row.get("workspace_id") or "")
+            break
+PY
+}
+
+set_workspace() {
+    python3 - "$ACCOUNTS_FILE" "$1" "$2" "$3" "$4" <<'PY'
+import json, pathlib, sys
+path, slug, home, label, workspace = pathlib.Path(sys.argv[1]), *sys.argv[2:]
+data = json.loads(path.read_text())
+rows = data.get("accounts", [])
+row = next((item for item in rows if item.get("slug") == slug), None)
+if row is None:
+    row = {"slug": slug, "codex_home": home, "label": label}
+    rows.append(row)
+if workspace:
+    row["workspace_id"] = workspace
+data["accounts"] = rows
+path.write_text(json.dumps(data, indent=1) + "\n")
+PY
+}
+
+ensure_file() {
+    mkdir -p "$(dirname "$ACCOUNTS_FILE")" 2>/dev/null || true
+    [[ -f "$ACCOUNTS_FILE" ]] || echo '{"accounts": []}' > "$ACCOUNTS_FILE"
+}
+
+cmd_list() {
+    ensure_file
+    python3 - "$ACCOUNTS_FILE" <<'PY'
+import json, os, sys, pathlib
+p = pathlib.Path(sys.argv[1])
+data = json.loads(p.read_text())
+rows = data.get("accounts", [])
+if not rows:
+    print("No accounts registered. Add one with: grip-codex-account add <slug> [label]")
+    raise SystemExit
+print(f"{'SLUG':<16} {'LABEL':<20} {'AUTH':<8} CODEX_HOME")
+for a in rows:
+    home = os.path.expanduser(a.get("codex_home", ""))
+    auth = "yes" if pathlib.Path(home, "auth.json").exists() else "NO"
+    print(f"{a.get('slug',''):<16} {a.get('label',''):<20} {auth:<8} {home}")
+PY
+}
+
+cmd_add() {
+    local slug="${1:-}" label="" workspace="" workspace_supplied=0
+    [[ -z "$slug" ]] && { usage; return 2; }
+    shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --workspace)
+                [[ $# -ge 2 ]] || { echo "[grip] --workspace needs a UUID" >&2; return 2; }
+                workspace="$2"; workspace_supplied=1; shift 2 ;;
+            *)
+                [[ -z "$label" ]] || { usage; return 2; }
+                label="$1"; shift ;;
+        esac
+    done
+    [[ "$workspace_supplied" -eq 0 ]] || valid_workspace "$workspace" || {
+        echo "[grip] --workspace needs a UUID" >&2; return 2;
+    }
+    ensure_file
+    local home; home="$(home_for "$slug")"
+    mkdir -p "$home"
+
+    # Seed the new home from the base config so provider definitions carry over,
+    # while auth.json stays per-home (the whole point of the separate home).
+    if [[ -f "$HOME/.codex/config.toml" && ! -f "$home/config.toml" ]]; then
+        cp "$HOME/.codex/config.toml" "$home/config.toml"
+        echo "[grip] seeded $home/config.toml from ~/.codex/config.toml"
+    fi
+    local signed_in=0
+    if [[ -f "$home/auth.json" ]] && CODEX_HOME="$home" "$CODEX_BIN" login status >/dev/null 2>&1; then
+        signed_in=1
+    fi
+
+    # The registry's order IS the ladder's billing order, so an existing row is
+    # updated where it stands; appending it would move the seat behind a later
+    # one, such as the credit-holding seat that is deliberately last.
+    python3 - "$ACCOUNTS_FILE" "$slug" "$home" "$label" "$workspace" <<'PY'
+import json, sys, pathlib
+p, slug, home, label, workspace = pathlib.Path(sys.argv[1]), *sys.argv[2:]
+data = json.loads(p.read_text())
+rows = data.get("accounts", [])
+row = next((a for a in rows if a.get("slug") == slug), None)
+if row is None:
+    row = {}
+    rows.append(row)
+row.update({"slug": slug, "codex_home": home})
+# With no label given, a registered seat keeps its own and a new seat takes its slug.
+row["label"] = label or row.get("label") or slug
+if workspace:
+    row["workspace_id"] = workspace
+data["accounts"] = rows
+p.write_text(json.dumps(data, indent=1) + "\n")
+PY
+    if [[ "$signed_in" -eq 1 ]]; then
+        echo "[grip] '$slug' is already signed in -- sign in again with: grip-codex-account login $slug"
+        [[ -n "$(workspace_for "$slug")" ]] || return 0
+        # A pinned row whose home is signed in elsewhere is skipped by the
+        # ladder, so say so now rather than at the first failed rung.
+        cmd_check "$slug"
+        return $?
+    fi
+    echo "[grip] registered '$slug'${label:+ ($label)} -> $home"
+    cmd_login "$slug"
+}
+
+cmd_login() {
+    local slug="${1:-}" workspace=""
+    [[ -z "$slug" ]] && { usage; return 2; }
+    shift
+    if [[ $# -gt 0 ]]; then
+        [[ "$1" == "--workspace" && $# -eq 2 ]] || { usage; return 2; }
+        workspace="$2"
+        valid_workspace "$workspace" || { echo "[grip] --workspace needs a UUID" >&2; return 2; }
+    fi
+    local home; home="$(home_for "$slug")"
+    mkdir -p "$home"
+    ensure_file
+    if [[ -n "$workspace" ]]; then
+        set_workspace "$slug" "$home" "$slug" "$workspace"
+    else
+        workspace="$(workspace_for "$slug")"
+    fi
+    echo "[grip] opening the Codex login for '$slug' (CODEX_HOME=$home)."
+    echo "[grip] sign in as the account that owns the workspace this rung should bill."
+    if [[ -n "$workspace" ]]; then
+        CODEX_HOME="$home" "$CODEX_BIN" login -c "forced_chatgpt_workspace_id=\"$workspace\""
+    else
+        CODEX_HOME="$home" "$CODEX_BIN" login
+    fi
+}
+
+cmd_check() {
+    local only="${1:-}"
+    [[ $# -le 1 ]] || { usage; return 2; }
+    ensure_file
+    python3 - "$ACCOUNTS_FILE" "$only" <<'PY'
+import json, os, pathlib, sys
+path, only = pathlib.Path(sys.argv[1]), sys.argv[2]
+rows = json.loads(path.read_text()).get("accounts", [])
+if only and not any(row.get("slug") == only for row in rows):
+    print(f"[grip] no such account: {only}", file=sys.stderr)
+    raise SystemExit(2)
+mismatch = False
+for row in rows:
+    if only and row.get("slug") != only:
+        continue
+    expected = row.get("workspace_id")
+    if not expected:
+        continue
+    auth = pathlib.Path(os.path.expanduser(row.get("codex_home", ""))) / "auth.json"
+    try:
+        actual = json.loads(auth.read_text()).get("tokens", {}).get("account_id")
+    except (OSError, ValueError, AttributeError):
+        actual = None
+    if actual == expected:
+        print(f"{row['slug']}: ok (...{expected[-6:]})")
+    else:
+        print(f"{row['slug']}: MISMATCH (home is signed in to a different workspace) "
+              f"expected ...{expected[-6:]}, home ...{str(actual)[-6:] if actual else 'unknown'}")
+        mismatch = True
+raise SystemExit(1 if mismatch else 0)
+PY
+}
+
+cmd_remove() {
+    local slug="${1:-}"
+    [[ -z "$slug" ]] && { usage; return 2; }
+    ensure_file
+    python3 - "$ACCOUNTS_FILE" "$slug" <<'PY'
+import json, sys, pathlib
+p, slug = pathlib.Path(sys.argv[1]), sys.argv[2]
+data = json.loads(p.read_text())
+before = len(data.get("accounts", []))
+data["accounts"] = [a for a in data.get("accounts", []) if a.get("slug") != slug]
+p.write_text(json.dumps(data, indent=1) + "\n")
+print(f"[grip] {'removed' if len(data['accounts']) < before else 'no such account:'} {slug}")
+print("[grip] the CODEX_HOME directory was left on disk — delete it yourself if you want the login gone.")
+PY
+}
+
+# Read the plan and workspaces straight out of each home's stored id_token.
+# Local file read only; no network, no inference.
+cmd_whoami() {
+    local only="${1:-}"
+    ensure_file
+    python3 - "$ACCOUNTS_FILE" "$only" <<'PY'
+import base64, json, os, sys, pathlib, time
+p, only = pathlib.Path(sys.argv[1]), (sys.argv[2] if len(sys.argv) > 2 else "")
+data = json.loads(p.read_text())
+rows = data.get("accounts", [])
+if not rows:
+    rows = [{"slug": "default", "codex_home": "~/.codex", "label": "default"}]
+for a in rows:
+    slug = a.get("slug", "")
+    if only and slug != only:
+        continue
+    home = pathlib.Path(os.path.expanduser(a.get("codex_home", "")))
+    auth = home / "auth.json"
+    print(f"=== {slug} ({a.get('label','')}) ===")
+    if not auth.exists():
+        print("  not signed in\n"); continue
+    try:
+        d = json.loads(auth.read_text())
+        tok = d.get("tokens", {}).get("id_token", "")
+        seg = tok.split(".")[1] if tok.count(".") >= 2 else ""
+        seg += "=" * (-len(seg) % 4)
+        c = json.loads(base64.urlsafe_b64decode(seg))
+        auth_claim = c.get("https://api.openai.com/auth", {})
+        print(f"  email      : {c.get('email','?')}")
+        print(f"  auth mode  : {d.get('auth_mode','?')}")
+        # THE decisive field. chatgpt_account_id identifies the SUBSCRIPTION this
+        # login bills — it is what differs between two logins under one email, and
+        # what makes rotating over several homes worth anything. Printed first,
+        # because omitting it made three separate subscriptions look identical: the
+        # organizations list below is account-level and is byte-identical in every
+        # token, so it cannot tell two logins apart and must never be read as
+        # "which workspace is this session using".
+        acct = auth_claim.get("chatgpt_account_id") or d.get("tokens", {}).get("account_id")
+        print(f"  billing id : {acct or '?'}   <- the subscription this login charges")
+        print(f"  plan       : {auth_claim.get('chatgpt_plan_type','?')}")
+        start = auth_claim.get("chatgpt_subscription_active_start")
+        until = auth_claim.get("chatgpt_subscription_active_until")
+        if start or until:
+            print(f"  plan window: {start or '?'} -> {until or '?'}")
+            if until:
+                try:
+                    end = time.mktime(time.strptime(until[:19], "%Y-%m-%dT%H:%M:%S"))
+                    days = (end - time.time()) / 86400
+                    if days < 30:
+                        print(f"               ** renews or lapses in {days:.0f} day(s) **")
+                except Exception:
+                    pass
+        # The id_token's exp says how fresh the CLAIMS PRINTED ABOVE are. It does NOT
+        # say whether the login still works: codex authenticates with a separate
+        # access_token and holds a refresh_token. Measured 2026-08-18 — a home whose
+        # id_token had expired ran fine and returned the right answer, and auth.json's
+        # last_refresh was never rewritten. Labelling that "EXPIRED" invited exactly
+        # the wrong conclusion: a fleet scheduler reading it would park three healthy
+        # subscriptions.
+        exp = c.get("exp")
+        if exp:
+            stale = exp < time.time()
+            when = time.strftime('%Y-%m-%d %H:%M', time.localtime(exp))
+            if stale:
+                print(f"  claims     : STALE as of {when} — the plan/window above may be "
+                      f"out of date")
+                print( "               (the login itself is unaffected; codex uses a "
+                       "separate access token)")
+                print( "               refresh the display with: grip-codex-account login "
+                      f"{slug}")
+            else:
+                print(f"  claims     : fresh (id_token exp {when})")
+        print("  workspaces this USER belongs to (same in every login, not the active one):")
+        for o in auth_claim.get("organizations", []):
+            star = "*" if o.get("is_default") else " "
+            print(f"  workspace {star}: {o.get('title','?')}  [{o.get('role','?')}]  id={o.get('id','?')}")
+    except Exception as e:
+        print(f"  could not read: {e}")
+    print()
+PY
+}
+
+case "${1:-}" in
+    list)    shift; cmd_list "$@" ;;
+    add)     shift; cmd_add "$@" ;;
+    login)   shift; cmd_login "$@" ;;
+    check)   shift; cmd_check "$@" ;;
+    remove)  shift; cmd_remove "$@" ;;
+    whoami)  shift; cmd_whoami "$@" ;;
+    ""|-h|--help) usage ;;
+    *)       echo "[grip] unknown command: $1" >&2; usage; exit 2 ;;
+esac

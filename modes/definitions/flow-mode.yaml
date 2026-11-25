@@ -1,0 +1,44 @@
+name: flow
+description: Trust-based permission bypass (SECURITY RISK - hidden by default)
+version: 1.0.0
+effort: high
+hidden: true
+triggers:
+- /mode flow
+- grip flow --enable
+- enable flow mode
+security:
+  risk_level: HIGH
+  requires_explicit_enable: true
+  enable_command: grip flow --enable --i-understand-the-risks
+  warnings:
+  - File edits happen without confirmation
+  - Bash commands execute without review
+  - Git operations (including destructive) proceed automatically
+  - Recovery may require manual intervention
+skills:
+  always: []
+  optional: []
+token_budget: ~500
+foundation: false
+stacks_with: []
+prompt_injection: '[MODE: FLOW - SECURITY BYPASS ACTIVE]
+
+
+  WARNING: Permission gates are BYPASSED. All file, bash, and git operations
+
+  execute without confirmation.
+
+
+  To disable: grip flow --disable
+
+  '
+wave:
+  category: orthogonal
+broly:
+  enabled: false
+context:
+- High-trust rapid development
+- Experienced users with version control discipline
+- Time-critical operations with acceptable risk tolerance
+welcome_message: Flow mode active. Trust-based bypass permissions enabled.

@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Rebuild Desktop MCP servers from source. Prompts for Desktop restart afterwards.
+# Use after editing any TypeScript under:
+#   mcp-servers/grip-mcp-desktop/src/   (legacy path: grip-mcp/src/)
+#   mcp-servers/grip-mcp-web/src/       (legacy path: grip-mcp-server/src/)
+#   mcp-servers/hal-mcp/src/
+#
+# Skills don't need this — both servers live-read $HOME/.claude/skills/ at
+# every grip_list_skills / grip_load_skill call (see src/server.ts:111-113
+# and src/index.ts:175-188). This script only matters for MCP tool changes
+# (new tool registration, schema edits, description changes), which the
+# protocol negotiates once at MCP connection time.
+
+set -euo pipefail
+
+build_one() {
+  local dir="$1"
+  local label="$2"
+  if [[ ! -d "$dir" ]]; then
+    echo "==> Skipping $label — $dir not present" >&2
+    return 0
+  fi
+  echo "==> Building $label ..."
+  ( cd "$dir" && npm run build )
+}
+
+build_one "$HOME/.claude/mcp-servers/grip-mcp-desktop" "grip-mcp-desktop"
+build_one "$HOME/.claude/mcp-servers/grip-mcp-web"     "grip-mcp-web"
+build_one "$HOME/.claude/mcp-servers/hal-mcp"          "hal-mcp"
+
+cat <<'EOF'
+
+Both Desktop MCP servers rebuilt.
+
+Next: quit Claude Desktop (Cmd+Q) and relaunch. The desktop config spawns
+both servers as subprocesses on launch, so a restart picks up the new dist.
+EOF

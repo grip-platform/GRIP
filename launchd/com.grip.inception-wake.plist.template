@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.grip.inception-wake</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.claude/bin/grip-inception-wake</string>
+        <string>--levels</string>
+        <string>2</string>
+    </array>
+
+    <!-- 03:00 every day -- the divergent counterpart to the convergent
+         overnight loop (com.grip.overnight-loop). Overnight wall-clock buys
+         many Pool-B iterations at $0. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PYTHONPATH</key>
+        <string>__HOME__/.claude</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.claude/logs/inception-wake.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.claude/logs/inception-wake.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
