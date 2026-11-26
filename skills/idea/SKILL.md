@@ -40,7 +40,7 @@ The records go to `state/precog/ideas.jsonl`, and git ignores that folder.
 | C | KISS | One module, one skill and one test file, with no new cryptography |
 | D | The idea is the origin of a chain of idempotent, deterministic, transparent, tamper-evident, replayable records | Every node is a signed IDR record, a repeated step writes nothing, and `verify` checks the signatures and every rule |
 
-Rule B uses the confidence bar of 99.9999999%.
+Rule B uses the confidence bar of 99.9999999%, which is the operator's policy (CLAUDE.md rule 3), not a derived number.
 Two plausible readings mean that confidence is below that bar.
 So the gate counts readings: one reading settles the meaning, and two or more readings halt and ask.
 
@@ -114,10 +114,13 @@ bin/grip-py -m lib.idea_chain verdict --idea <id> --claim <claim fingerprint pre
 
 The verdict is CONGRUENT when the claim held, and INCONGRUENT when the falsifier fired.
 It is UNVERIFIABLE when no measurement could settle the claim.
-To quote a source, add `--quote "<exact words>" --source <file>`.
-The tool refuses a quote that is not in its source, through `verify_quote` in `lib/prove_it.py`.
 A claim gets one verdict.
 To test a claim again, write a new claim.
+
+To quote a source, add `--quote "<exact words>" --source <file>`.
+The tool stores a source inside the GRIP folder relative to that folder, so the verdict has the same fingerprint on every machine.
+It stores a source outside the GRIP folder as given.
+The tool refuses a quote that is not in its source, through `verify_quote` in `lib/prove_it.py`.
 
 ## 6. ACT: act on what survived
 
@@ -161,7 +164,7 @@ Then explain the chain to the operator through `/simple`: the idea, its meaning,
 
 Each record is an ordinary signed IDR record from `lib/precog/idr.py`.
 A record's fingerprint is the sha256 of the RFC 8785 form (`lib/jcs.py`) of its idea, kind, parent fingerprint and body.
-No clock and no random value go into that fingerprint, so a repeated step finds it and writes nothing.
+No clock and no random value go into that fingerprint, so a step repeated with the same arguments finds it and writes nothing.
 The ledger is a separate file, so the main decision chain's HEAD never moves and nothing reaches the public chain.
 
 ## How it follows HAPPI and GRASP
@@ -187,6 +190,7 @@ A client's matter goes to that client's own private repository.
 
 - The chain is tamper-evident, not tamper-proof. A changed record fails its signature, but anyone who can write the file can delete a whole line. The signing key is on this machine.
 - The tool cannot prove that an answer came from the operator. The session transcript holds that exchange.
+- Rule B counts the readings you give it, so it is a speed bump, not a lock. If you list one reading, the gate passes, and `list` cannot see that.
 - A verdict is only as good as the evidence recorded with it.
 - `verify` reports a line it cannot read and a record moved to another idea. It cannot see a line that was cleanly removed.
 
@@ -196,3 +200,5 @@ This skill is wrong if, over its first 10 runs, the operator never picks a readi
 Then the gate adds nothing, and it should become advice.
 The skill is also wrong if no chain ever ends in a merged change.
 `list` prints both counts: how often the gate fired with another reading chosen, and how many ideas ended in a merged change.
+In `tests/test_idea_chain.py`, `test_two_readings_need_the_question_and_the_operators_answer` pins the gate: it turns red if anyone weakens the gate.
+Hypothesis H1082 tracks the first count over the first 10 ideas.

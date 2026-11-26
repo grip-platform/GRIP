@@ -30,10 +30,14 @@ The tool refuses rather than advises (``IdeaRefused``):
 
 Deterministic and idempotent: a node's fingerprint is sha256 over the RFC 8785
 form of ``{idea, kind, parent, body}`` (the root's is ``compute_fingerprint`` of
-the text). A repeated step finds its fingerprint and writes nothing, and the
-idea digest (sha256 over the sorted fingerprints) is the same for any two
-recordings of the same steps. The Merkle root commits to ONE signed recording,
-because it covers each record's random id.
+the text). A step repeated with the same arguments finds its fingerprint and
+writes nothing, and the idea digest (sha256 over the sorted fingerprints) is
+the same for any two recordings of the same steps. A verdict's quote binds its
+source's path and content. A source inside this checkout is stored relative to
+it, so the same verdict has the same fingerprint on every machine; a source
+outside it keeps the path as given. A repeat after the source changed or moved
+is refused, not a no-op. The Merkle root commits to ONE signed
+recording, because it covers each record's random id.
 
 An explicit ledger path means ``append_idr`` never moves the main decision
 chain's HEAD (``lib.precog.idr._advance_head``), so an idea draws no false
@@ -42,12 +46,15 @@ causal edge and nothing here reaches the public chain.
 Honest limits: tamper-EVIDENT, not tamper-proof. A changed record fails its
 signature, but a whole line can be deleted and the signing key is local. The
 tool cannot prove that an answer came from the operator; the transcript holds
-that exchange. A verdict is only as good as the evidence recorded with it.
+that exchange. Rule B counts the readings it is given, so it is a speed bump,
+not a lock: an agent that lists one reading passes it, and ``list`` cannot see
+that. A verdict is only as good as the evidence recorded with it.
 
 CLI: ``bin/grip-py -m lib.idea_chain {open,meaning,claim,verdict,outcome,show,
-verify,list} --help``. Exit 0 on success and 3 when a rule refuses a step.
-``verify`` exits 1 when anything is BROKEN or a rule is broken, and 2 when the
-worst it found is DEGRADED.
+verify,list} --help``. Exit 0 on success, 3 when a rule refuses a step, and 1
+when a file cannot be read (printed as UNREADABLE). ``verify`` also exits 1
+when anything is BROKEN or a rule is broken, and 2 when the worst it found is
+DEGRADED.
 """
 from __future__ import annotations
 
@@ -118,6 +125,15 @@ class IdeaRefused(ValueError):
     """A step the /idea rules forbid. The message names the rule and the fix."""
 
 
+class IdeaUnreadable(Exception):
+    """A file a step needs cannot be read: missing, forbidden, or not UTF-8 text.
+
+    Kept apart from ``OSError`` because a decode failure is not an OS failure.
+    The command line prints it, like a ledger ``OSError``, as UNREADABLE with
+    exit 1.
+    """
+
+
 # --- identity ---------------------------------------------------------------
 
 def _sha256(text: str) -> str:
@@ -154,8 +170,10 @@ def anchor_of(idea_id: str) -> str:
 def node_fingerprint(idea_id: str, kind: str, parent_fp: str, body: dict[str, Any]) -> str:
     """sha256 over the RFC 8785 form of ``{idea, kind, parent, body}``.
 
-    No clock, random id or signature goes in, so the same step has the same
-    fingerprint on any machine and in any recording.
+    No clock, random id or signature goes in, so a step given the same
+    arguments has the same fingerprint in any recording. A verdict's source
+    inside this checkout is stored relative to it (``_portable``), so that step
+    is also the same on every machine.
     """
     payload = {"idea": idea_id, "kind": kind, "parent": parent_fp, "body": body}
     return hashlib.sha256(jcs.dumps(payload)).hexdigest()
@@ -309,10 +327,22 @@ def _required(value: str | None, label: str) -> str:
 
 
 def _read_text(path: Path | str) -> str:
+    """A file's text, or ``IdeaUnreadable``, which the command line prints as
+    UNREADABLE with exit 1, the same as for a ledger it cannot read."""
     try:
         return Path(path).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
-        raise IdeaRefused(f"cannot read {path}: {exc}") from exc
+        raise IdeaUnreadable(f"cannot read {path}: {exc}") from exc
+
+
+def _portable(source: Path | str) -> str:
+    """The source path to record: relative to this checkout when the file lies
+    inside it, so one verdict has one fingerprint on every machine; any other
+    path is kept as given."""
+    try:
+        return Path(source).resolve().relative_to(_REPO.resolve()).as_posix()
+    except ValueError:
+        return str(source)
 
 
 # --- the five steps ---------------------------------------------------------
@@ -512,7 +542,7 @@ def _quote_part(quote: str | None, source: Path | str | None) -> dict[str, Any]:
         raise IdeaRefused(f"the quote is not in {source}; a verdict may only quote what its source says")
     return {
         "quote": quote,
-        "source": str(source),
+        "source": _portable(source),
         "source_sha256": _sha256(text),
         "quote_status": status,
         "quote_span": [start, end],
@@ -571,18 +601,35 @@ def verify_idea(idea_id: str, path: Path | str | None = None) -> Report:
     The forests are built and checked by the unmodified ``lib.idr_forest``
     functions: the idea ledger is checked exactly as the main chain is.
     """
+    return verify_ideas([idea_id], path)[0]
+
+
+def verify_ideas(ids: Sequence[str], path: Path | str | None = None) -> list[Report]:
+    """One report per idea, from ONE read of the ledger and ONE check of its signatures.
+
+    The ledger-wide facts are the same for every idea, so they are computed
+    once. Checking them once per idea made ``verify`` with no ``--idea``
+    quadratic in the size of the ledger (AGORA on GRIP#9973).
+    """
     ledger = ledger_path(path)
-    records = read_ledger(ledger)
-    nodes = [n for n in records if _idea_of(n) == idea_id]
+    every = read_idr_chain(path=ledger)
+    records = [n for n in every if n.kind in KINDS]
+    shared = _ledger_problems(ledger, records, len(every))
+    ledger_verdict = _ledger_integrity(records)
+    by_idea: dict[str, list[PrecogIDR]] = {}
+    for node in records:
+        by_idea.setdefault(_idea_of(node), []).append(node)
+    return [_report(idea_id, by_idea.get(idea_id, []), shared, ledger_verdict) for idea_id in ids]
+
+
+def _report(idea_id: str, nodes: list[PrecogIDR], shared: list[str], ledger_verdict: str) -> Report:
     forest, not_a_tree = _forest((anchor_of(idea_id),), nodes)
-    problems = _ledger_problems(ledger, records) + rule_problems(idea_id, nodes)
-    if not_a_tree:
-        problems.append(not_a_tree)
+    problems = shared + rule_problems(idea_id, nodes) + ([not_a_tree] if not_a_tree else [])
     return Report(
         idea=idea_id,
         nodes=len(nodes),
         integrity=_integrity(forest),
-        ledger=_ledger_integrity(records),
+        ledger=ledger_verdict,
         problems=tuple(problems),
         digest=idea_digest(nodes),
         merkle_root=forest_merkle_root(forest) if forest is not None else "",
@@ -620,9 +667,9 @@ def _ledger_integrity(records: list[PrecogIDR]) -> str:
     return _integrity(forest)
 
 
-def _ledger_problems(ledger: Path, records: list[PrecogIDR]) -> list[str]:
+def _ledger_problems(ledger: Path, records: list[PrecogIDR], parsed: int) -> list[str]:
     problems = []
-    unread = _unreadable_lines(ledger)
+    unread = _raw_lines(ledger) - parsed
     if unread:
         problems.append(f"{unread} ledger line(s) could not be read as records")
     opened = {_idea_of(n) for n in records if n.kind == ROOT}
@@ -632,13 +679,13 @@ def _ledger_problems(ledger: Path, records: list[PrecogIDR]) -> list[str]:
     return problems
 
 
-def _unreadable_lines(ledger: Path) -> int:
-    """Lines ``read_idr_chain`` skipped. It drops a line it cannot parse, silently."""
+def _raw_lines(ledger: Path) -> int:
+    """Non-empty lines in the ledger. ``read_idr_chain`` drops a line it cannot
+    parse, silently, so the shortfall against this count is reported."""
     if not ledger.exists():
         return 0
     with open(ledger, encoding="utf-8", errors="replace") as fh:
-        lines = sum(1 for line in fh if line.strip())
-    return lines - len(read_idr_chain(path=ledger))
+        return sum(1 for line in fh if line.strip())
 
 
 def rule_problems(idea_id: str, nodes: Sequence[PrecogIDR]) -> list[str]:
@@ -958,7 +1005,7 @@ def _exit_code(reports: Sequence[Report]) -> int:
 
 def _cli_verify(ns: argparse.Namespace) -> int:
     ids = [_idea(ns)] if ns.idea else idea_ids(ns.ledger)
-    reports = [verify_idea(idea_id, ns.ledger) for idea_id in ids]
+    reports = verify_ideas(ids, ns.ledger)
     for report in reports:
         _print_report(report)
     if not reports:
@@ -1061,10 +1108,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except IdeaRefused as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return EXIT_REFUSED
-    except OSError as exc:
-        # A ledger the process cannot read or write is a named status, never a
-        # traceback: the /mental-model contract (GRIP#9967) composes this tool and
-        # reads UNREADABLE from a closed set. Found by /idea's own dogfood run.
+    except (IdeaUnreadable, OSError) as exc:
+        # A file the process cannot read or write, an argument file or the ledger,
+        # is a named status, never a traceback: the /mental-model contract
+        # (GRIP#9967) composes this tool and reads UNREADABLE from a closed set.
+        # Found by /idea's own dogfood run.
         print(f"UNREADABLE: {exc}", file=sys.stderr)
         return 1
 

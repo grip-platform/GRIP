@@ -402,16 +402,27 @@ def bash_for(platform: str, which=None) -> str:
     with no Linux distribution it runs no README line at all (GRIP#9965). So use the
     ``bash.exe`` Git for Windows ships beside the ``git`` on PATH, or say plainly
     that there is none.
+
+    A ``bash`` on PATH outside System32 is taken first. Otherwise the search covers
+    up to three folders above ``git.exe``, because which ``git.exe`` PATH finds
+    depends on the shell: inside Git Bash, as on a GitHub runner, it is
+    ``Git\\mingw64\\bin\\git.exe``, whose grandparent ``mingw64`` holds no bash
+    (GRIP#9971).
     """
     if platform != "windows":
         return "bash"
     import shutil
-    git = (which or shutil.which)("git")
-    if git:
-        root = Path(git).resolve().parent.parent
-        for candidate in (root / "bin" / "bash.exe", root / "usr" / "bin" / "bash.exe"):
-            if candidate.is_file():
-                return str(candidate)
+    from itertools import product
+    find = which or shutil.which
+    on_path = find("bash")
+    if on_path and "system32" not in on_path.lower():
+        return on_path
+    git = find("git")
+    roots = list(Path(git).resolve().parents)[:3] if git else []
+    candidates = (root / sub / "bash.exe" for root, sub in product(roots, ("bin", "usr/bin")))
+    found = next((str(c) for c in candidates if c.is_file()), None)
+    if found:
+        return found
     raise StrangerError("no Git Bash found: install Git for Windows, whose bash.exe sits beside "
                         "git.exe; the WSL bash.exe in System32 runs no README line")
 
