@@ -1,0 +1,60 @@
+body {
+  font-family: system-ui, sans-serif;
+  max-width: 40rem;
+  margin: 2rem auto;
+  padding: 0 1rem;
+  color: #1a1a1a;
+  background: #fff;
+}
+
+h1 {
+  font-size: 1.4rem;
+}
+
+ul#steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+ul#steps li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.6rem 0;
+  border-bottom: 1px solid #ddd;
+}
+
+.step-name {
+  font-weight: 600;
+  min-width: 10rem;
+}
+
+.step-detail {
+  color: #555;
+  font-size: 0.9rem;
+  flex: 1;
+}
+
+li[data-status="done"],
+li[data-status="already done"],
+li[data-status="still true"] {
+  color: #1a7f37;
+}
+
+li[data-status="failed"],
+li[data-status="broken by a later step"] {
+  color: #b42318;
+}
+
+button {
+  font: inherit;
+  padding: 0.4rem 0.9rem;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}

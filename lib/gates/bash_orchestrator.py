@@ -116,10 +116,10 @@ def _run_quality_gates(stripped, command, *, check_env_var_exposure_fn,
 
     Lint gets the RAW command, as the secrets gate does, and strips per pattern:
     zsh expands parameters inside double quotes, which `stripped` has removed.
-    The env-var guard gets `stripped` too, except that presence checks are
-    found and removed in the raw command first (GRIP#9911).
+    The env-var guard gets its own view of the raw command instead: presence
+    checks removed (GRIP#9911), and what the shell expands kept (GRIP#9916).
     """
-    env_text = bash_text_for_env_guard(command, stripped)
+    env_text = bash_text_for_env_guard(command)
     for fn, text, label in ((check_env_var_exposure_fn, env_text, "Env var exposure"),
                             (check_database_exposure_fn, stripped, "Database exposure"),
                             (check_bash_tools_fn, stripped, "Tool substitution"),

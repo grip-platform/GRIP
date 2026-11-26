@@ -1,0 +1,10 @@
+{
+  "_comment": "Pseudonyms from the operator's private redaction list that are public on purpose, each with the path globs where it may appear. Pseudonyms and paths only, never a name. scripts/build_oss_candidate.py verify() blocks a release that carries a private-list person, matter, phone or host entry anywhere else. [PERSON-16] and [PERSON-8] are the operator's own names (copyright and provenance lines); [PERSON-13] is the README dedication. A>> is a collaborator credited for his work (V>> 2026-11-25: \"Keep A>> obviously.\"). [PERSON-11] stays public in the three files that already carried it in public GRIP, and nowhere else (V>> 2026-11-26: \"Keep [PERSON-11]\"). Widening this file is a reviewed decision.",
+  "sites": {
+    "[PERSON-16]": ["*"],
+    "[PERSON-8]": ["*"],
+    "[PERSON-13]": ["README.md"],
+    "A>>": ["*"],
+    "[PERSON-11]": ["lib/aide/_archive/test_standup_bot.py", "lib/build_catalogue.py", "skills/git-solve/SKILL.md"]
+  }
+}

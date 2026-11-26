@@ -38,11 +38,16 @@ class Proof:
 
 @dataclass(frozen=True)
 class Step:
-    """One thing the suite needs, how to prove it, and how to make it true."""
+    """One thing the suite needs, how to prove it, and how to make it true.
+
+    ``command`` is the step's own command text for a record of what ran. The setup
+    page's ledger (``lib.suite_install.page``) falls back to ``name`` when a step
+    carries none, which is every step except the signing-key step today."""
 
     name: str
     prove: Callable[[], Proof]
     install: Optional[Callable[[], None]] = None
+    command: Optional[str] = None
 
 
 @dataclass(frozen=True)

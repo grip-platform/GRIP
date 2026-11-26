@@ -1,6 +1,6 @@
 # System Capabilities
 
-Skills: 339 | Agents: 45 | Commands: 473 | Rules: 91 | Hooks: 142 | Modes: 31 <!-- grip-stats -->
+Skills: 340 | Agents: 45 | Commands: 473 | Rules: 91 | Hooks: 142 | Modes: 31 <!-- grip-stats -->
 
 ## Key Commands
 `/refresh-context`, `/create-pr`, `/remind-yourself`, `/audit-efficiency`, `/markdown-lint`, `/preplan`, `/extend-context`, `/learn`, `/broly`, `/converge`, `/rsi`

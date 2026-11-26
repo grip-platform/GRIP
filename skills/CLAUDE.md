@@ -1,6 +1,6 @@
 # Skills Directory
 
-339 skills organised by domain.
+340 skills organised by domain.
 
 ## Structure
 

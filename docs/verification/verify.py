@@ -15,8 +15,8 @@ def entry_hash(record):
     return "sha256:" + hashlib.sha256(
         json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
-record = json.loads(open(sys.argv[1]).read().strip().splitlines()[0])
-keys   = json.loads(open(sys.argv[2]).read())
+record = json.loads(open(sys.argv[1], encoding="utf-8").read().strip().splitlines()[0])
+keys   = json.loads(open(sys.argv[2], encoding="utf-8").read())
 audit  = record["audit"]
 msg    = entry_hash(record).encode()
 ok     = True

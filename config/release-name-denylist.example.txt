@@ -1,0 +1,5 @@
+# Copy to config/release-name-denylist.txt (gitignored) and list one real name per line.
+# scripts/release_contamination_gate.py blocks a release whose tree carries any of them.
+# The operator's private redaction list is checked as well, by scripts/build_oss_candidate.py verify().
+Jane Example
+Ottoline Vexmoor

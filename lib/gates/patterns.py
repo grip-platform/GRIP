@@ -184,7 +184,11 @@ SENSITIVE_ENV_PATTERNS = [
     rf"\$[A-Z_]+(?:{_AK}|{_SC}|{_TK}|{_PW}|{_CR}|{_PK})",
     rf"\$\{{[A-Z_]+(?:{_AK}|{_SC}|{_TK}|{_PW}|{_CR}|{_PK})",
     r"printenv\s*\|?\s*(?:grep|rg)?\s*(?:" + _SC + "|KEY|" + _TK + "|PASS|CRED)",
-    r"env\s*\|?\s*(?:grep|rg)?\s*(?:" + _SC + "|KEY|" + _TK + "|PASS|CRED)",
+    # `env` also matches the end of `printenv`. The second alternative lets
+    # options, a quote or a word prefix sit between the search command and the
+    # secret word, which the first does not allow (GRIP#9958).
+    rf"env\s*\|?\s*(?:grep|rg)?\s*(?:{_SC}|KEY|{_TK}|PASS|CRED)"
+    rf"|env\s*\|\s*(?:e?grep|fgrep|rg)\b[^;&\n]*?(?:{_SC}|KEY|{_TK}|PASS|CRED)",
     r"echo\s+\$[A-Z_]*(?:" + _AK + "|" + _SC + "|" + _TK + "|" + _PW + "|AWS_|ANTHRO" + "PIC_|OPEN" + "AI_)",
     # Narrowed 2026-07-08 (V>>--<<V ratified): a source-code env-secret READ is
     # only flagged when its value is ALSO passed to an output/exposure sink

@@ -3,7 +3,7 @@
 # profile and into the operating system's secret store, via bin/grip-keyring.
 #
 # WHY THIS EXISTS
-#   A>> (Andre Theart)'s ~/.bashrc exports unencrypted API keys for fourteen
+#   An operator's ~/.bashrc exports unencrypted API keys for fourteen
 #   LLM providers. Every process the shell starts inherits them, any script
 #   can print them, and a backup of the home directory carries them in clear
 #   text. GRIP already ships bin/grip-keyring, which stores secrets in the

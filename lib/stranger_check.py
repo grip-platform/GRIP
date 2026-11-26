@@ -394,12 +394,35 @@ def stranger_env(home: str) -> dict:
     return env
 
 
+def bash_for(platform: str, which=None) -> str:
+    """The bash that runs a README script on this machine.
+
+    Anywhere but Windows that is plain ``bash``. On Windows, CreateProcess searches
+    System32 before PATH, and ``System32\\bash.exe`` is the WSL launcher: on a runner
+    with no Linux distribution it runs no README line at all (GRIP#9965). So use the
+    ``bash.exe`` Git for Windows ships beside the ``git`` on PATH, or say plainly
+    that there is none.
+    """
+    if platform != "windows":
+        return "bash"
+    import shutil
+    git = (which or shutil.which)("git")
+    if git:
+        root = Path(git).resolve().parent.parent
+        for candidate in (root / "bin" / "bash.exe", root / "usr" / "bin" / "bash.exe"):
+            if candidate.is_file():
+                return str(candidate)
+    raise StrangerError("no Git Bash found: install Git for Windows, whose bash.exe sits beside "
+                        "git.exe; the WSL bash.exe in System32 runs no README line")
+
+
 def run_here(script: str, timeout: int) -> tuple:
     """Run in a throwaway HOME, with no secrets and no git credentials."""
     with tempfile.TemporaryDirectory(prefix="stranger-") as home:
         path = Path(home) / ".stranger.sh"
         path.write_text(script, encoding="utf-8")
-        return _run(["bash", str(path).replace("\\", "/")], None, stranger_env(home), timeout, home)
+        return _run([bash_for(_platform()), str(path).replace("\\", "/")], None,
+                    stranger_env(home), timeout, home)
 
 
 def run_vps(script: str, timeout: int) -> tuple:

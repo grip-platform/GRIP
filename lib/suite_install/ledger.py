@@ -55,10 +55,6 @@ if TYPE_CHECKING:
     from lib.precog.idr import PrecogIDR
 
 GENESIS_HASH = "0" * 64
-# The only seal check() accepts: a tenant's own dual key, the seal seal() writes. The
-# demo seal (hmac-sha256 under one shared key, lib/precog/idr.py's _demo_audit) also
-# verifies, and it carries no tenant binding, so check() must refuse it as seal() does.
-DUAL_SCHEME = "ed25519+ml-dsa-65"
 PROVES = "this key signed these lines, and nothing has changed since"
 DOES_NOT_PROVE = "that the steps it records ran truthfully, or whose key it is"
 
@@ -233,8 +229,8 @@ class CheckResult:
 
     ``reason`` is one of ``pass``, ``chain-broken``, ``no-seal``,
     ``unreadable-ledger-line``, ``wrong-kind``, ``weak-seal``, ``unverified``,
-    ``head-mismatch`` or ``tenant-mismatch``. Tests assert on ``reason``, never on ``detail``'s wording --
-    the wording may change; the code is the stable contract."""
+    ``head-mismatch`` or ``tenant-mismatch``. Tests assert on ``reason``, never on
+    ``detail``'s wording -- the wording may change; the code is the stable contract."""
 
     passed: bool
     detail: str
@@ -285,6 +281,11 @@ def _first_invalid_record(records: list[PrecogIDR]):
     once every record is clean."""
     from lib.audit_chain import Verdict
     from lib.idr_forest import _verify_node
+    # Function-local, not a module constant: a module-level import of
+    # lib.pq_dual_sign would reach into IDR's signing stack from ledger.py's own
+    # top level, breaking the stdlib-only promise the module docstring makes for
+    # the WHOLE file -- not only append_step.
+    from lib.pq_dual_sign import SCHEME
 
     for idr in records:
         if idr.kind != "suite-setup-record":
@@ -294,7 +295,11 @@ def _first_invalid_record(records: list[PrecogIDR]):
                 reason="wrong-kind",
             )
         scheme = idr.audit.get("scheme") if isinstance(idr.audit, dict) else None
-        if scheme != DUAL_SCHEME:
+        # The only scheme check() accepts is a tenant's own dual key, the seal
+        # seal() writes. The demo seal (hmac-sha256 under one shared key,
+        # lib/precog/idr.py's _demo_audit) also verifies, and it carries no
+        # tenant binding, so check() must refuse it here as seal() does.
+        if scheme != SCHEME:
             return CheckResult(
                 False,
                 f"record {idr.id} is sealed with {scheme!r}, not a tenant's own dual key",
@@ -341,10 +346,10 @@ def check(step_file: Path, ledger_file: Path, *, expected_tenant_id: str) -> Che
     """Recompute the step chain and verify every sealed record in ``ledger_file`` with
     IDR's own verifier. PASS only when: the chain holds; every non-blank ledger line is
     a readable record; at least one sealed record exists; every record is a
-    ``suite-setup-record``, sealed with a tenant's own dual key (``DUAL_SCHEME``), that
-    verifies; the newest commits to the chain's current
-    head hash and line count; and the newest names ``expected_tenant_id``. See the
-    module docstring's limits paragraph for what PASS does not rule out.
+    ``suite-setup-record``, sealed with a tenant's own dual key
+    (``lib.pq_dual_sign.SCHEME``), that verifies; the newest commits to the chain's
+    current head hash and line count; and the newest names ``expected_tenant_id``. See
+    the module docstring's limits paragraph for what PASS does not rule out.
 
     ``expected_tenant_id`` is REQUIRED, with no default. ``_verify_node`` checks a
     record's signature against the keys of the tenant NAMED IN ITS OWN

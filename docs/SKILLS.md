@@ -123,6 +123,7 @@
 ## knowledge-work
 
 - `reasoning-with-ai` — PARAMOUNT: articulate-first pattern, confidence display, emergent UI, human+AI thought partnership
+- `idea` — one operator idea as a signed causal chain: settle its meaning, claim, test, record what came of it
 
 ## renewal
 
