@@ -357,7 +357,7 @@ def rule_paths(root: Path) -> list[Path]:
 def _canonical_slug(claude_dir: Path) -> str:
     """Harness project-dir slug for the install path.
 
-    ``~/.grip`` -> ``-Users-x--grip``. Derived from the resolved install
+    ``~/.grip`` -> ``-Users-you--grip``. Derived from the resolved install
     path rather than hardcoded, per ``rules/path-portability.md``.
     """
     real = os.path.realpath(str(claude_dir))

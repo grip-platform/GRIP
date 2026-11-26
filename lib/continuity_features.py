@@ -10,7 +10,7 @@ Zero LLM calls; zero network; zero wall-clock reads — the same inputs always
 yield the same dict.
 
 Transcript shape (verified 2026-08-30 against a real transcript under
-``~/.grip/projects/-Users-void--grip/``; record-type census and field lists in
+``~/.grip/projects/-Users-you--grip/``; record-type census and field lists in
 the fleet pool round-0 learnings):
 
 - ``type == "assistant"`` records carry ``message.content`` blocks including

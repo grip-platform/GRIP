@@ -24,8 +24,8 @@ see_also:
 # /adding-agora-ci-workflow — the AGORA council gate on any repository
 
 AGORA is GRIP's exogenous PR review: 3 speakers (DeepSeek V4 Flash, Qwen4-Max,
-xAI Grok 4.3) write a descriptive 4-section review, Google Gemini 3.1
-Pro renders the judge verdict. **None of them shares the PR-author model
+xAI Grok 4.3) write a descriptive 4-section review, Google Gemini 4
+Carbon renders the judge verdict. **None of them shares the PR-author model
 family.** The workflow that runs it lives in the GRIP repo — this skill is the
 recipe for installing it anywhere else.
 
@@ -95,7 +95,7 @@ git ls-remote https://github.com/grip-platform/HAL.git main | cut -f1
    | `DEEPSEEK_API_KEY` | DeepSeek V4 Flash | Speaker |
    | `DASHSCOPE_API_KEY` | Alibaba Qwen4-Max | Speaker |
    | `XAI_API_KEY` | xAI Grok 4.3 | Speaker |
-   | `GEMINI_API_KEY` | Google Gemini 3.1 Pro | Judge (exogenous) |
+   | `GEMINI_API_KEY` | Google Gemini 4 Carbon | Judge (exogenous) |
    | `APPROVE_PAT` | classic PAT, `contents:read` on GRIP + HAL | private checkouts |
 
    `GH_TOKEN` needs NO secret — the workflow passes `${{ secrets.GITHUB_TOKEN }}`

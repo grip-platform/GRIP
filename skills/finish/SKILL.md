@@ -153,11 +153,13 @@ git -C <tree> add <paths>
 git -C <tree> commit -m "$(cat <<'EOF'
 type(scope): description
 
-Primary Author: V>>
+Primary Author: <operator signature>
 EOF
 )"
 git -C <tree> push origin <feature-branch>
 ```
+
+Fill `<operator signature>` with what `bin/grip-operator-signature` prints.
 
 No emoji, no AI attribution, subject ≤ 72 chars. On a shared `~/.claude` tree
 with concurrent sessions, prefer the temp-index plumbing path

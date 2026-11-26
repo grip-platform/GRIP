@@ -154,7 +154,7 @@ out is recorded as degraded. This is RAILLM, the Redundant Array of Independent 
 | Seat | Rung 1 | Rung 2 | Rung 3 | Rung 4 |
 |------|--------|--------|--------|--------|
 | fable | `fable-5.2` (claude-fable-5-2) | `fable-5.1` (claude-fable-5-1) | `opus-5.5` (claude-opus-5-5) | none |
-| astra | `astra-codex` (gpt-6-astra, Codex subscription) | `astra-hal` (openai/gpt-6-astra through HAL; paid, so only with `GRIP_CODEX_ALLOW_PAID=1` and an OpenAI key) | `grok-4.6` (xAI) | `gemini-pro` (gemini-3.1-pro-preview) |
+| astra | `astra-codex` (gpt-6-astra, Codex subscription) | `astra-hal` (openai/gpt-6-astra through HAL; paid, so only with `GRIP_CODEX_ALLOW_PAID=1` and an OpenAI key) | `grok-4.6` (xAI) | `gemini-carbon` (gemini-4-carbon) |
 | deepseek | `deepseek-v4-pro` (through HAL) | `deepseek-flash` (through HAL) | `groq-gpt-oss-120b` (Groq) | `gemini-flash` (gemini-2.5-flash) |
 
 - The Fable seat has no third rung: an Anthropic seat never falls to another vendor

@@ -119,7 +119,7 @@ Optional pre-push hook for public remote:
 #!/bin/bash
 # .git/hooks/pre-push
 
-remote="$1"
+remote="${1}"
 if [[ "$remote" == "public" ]]; then
     echo "Running public release sanitizer..."
     git diff origin/main...HEAD | ~/.claude/lib/sanitizer.sh

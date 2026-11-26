@@ -45,8 +45,8 @@ CLAUDE_DIR = get_claude_dir()
 # in-function `sys.path.insert(...)` ran on EVERY _read_instance_index /
 # _read_latest_next_up call → cumulative sys.path pollution + per-call
 # import churn. The guarded insert is idempotent; the import resolves once.
-if str(CLAUDE_DIR / "lib") not in sys.path:
-    sys.path.insert(0, str(CLAUDE_DIR / "lib"))
+if str(_LIB) not in sys.path:  # own lib (GRIP#9857), not CLAUDE_DIR's
+    sys.path.insert(0, str(_LIB))
 from next_step_block import (
     encode_project_path,
     read_instance_index as _read_instance_index,
@@ -100,12 +100,13 @@ def _resolve_next_up(project: Path) -> dict:
     that degrades to an older verified node emits one loud stderr line inside the
     resolver (never fabricates). Never raises — a launch is never crashed."""
     # Sibling-import convention (matches L48-50 / L186-187 / L236): ensure
-    # CLAUDE_DIR/lib is on sys.path so the bare `from context_warmstart` resolves
+    # this checkout's own lib (_LIB) is on sys.path, never CLAUDE_DIR's
+    # (GRIP#9857 pass 4), so the bare `from context_warmstart` resolves
     # under a PRODUCTION PYTHONPATH (cwd != ~/.claude/lib). Without this guard the
     # import raised ModuleNotFoundError, was swallowed by a broad `except
     # Exception: pass`, and the P6 chain path SILENTLY never fired in production.
-    if str(CLAUDE_DIR / "lib") not in sys.path:
-        sys.path.insert(0, str(CLAUDE_DIR / "lib"))
+    if str(_LIB) not in sys.path:  # own lib (GRIP#9857), not CLAUDE_DIR's
+        sys.path.insert(0, str(_LIB))
     try:
         from context_warmstart import resolve_next_up
     except ImportError:
@@ -116,7 +117,7 @@ def _resolve_next_up(project: Path) -> dict:
         print(
             "[GRIP WARM-START] context_warmstart import failed - P6 chain path "
             "INACTIVE, using legacy next_up (this is a BUG, not absent-chain "
-            "fallback; check CLAUDE_DIR/lib is importable)",
+            "fallback; check this checkout's own lib is importable)",
             file=sys.stderr,
         )
         return _read_latest_next_up(project) or {}
@@ -220,7 +221,8 @@ def _recall_kono_memories(
         # Lazy import is load-bearing: it must raise INSIDE the worker so the
         # executor boundary converts it to an honest "unavailable:" status —
         # the module itself stays importable under an apsw-less system python3.
-        sys.path.insert(0, str(CLAUDE_DIR / "lib"))
+        if str(_LIB) not in sys.path:  # own lib (GRIP#9857), not CLAUDE_DIR's
+            sys.path.insert(0, str(_LIB))
         from kono_substrate import MemorySubstrate
 
         return MemorySubstrate()
@@ -337,7 +339,8 @@ def _get_latest_generation(project_path: Path) -> tuple:
         (gen_label: str, achievement: str, summary: str)
         where gen_label is "Gen N" or "new project (no GRIP history here)".
     """
-    sys.path.insert(0, str(CLAUDE_DIR / "lib"))
+    if str(_LIB) not in sys.path:  # own lib (GRIP#9857), not CLAUDE_DIR's
+        sys.path.insert(0, str(_LIB))
     try:
         from grip_generation import resolve_generation
 

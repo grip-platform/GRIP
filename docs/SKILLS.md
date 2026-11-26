@@ -10,6 +10,7 @@
 - `authenticating-with-claude` — unified auth + identity wizard, @asking-users compliant
 - `onboarding-users` — v2.2: bespoke config, redirects to /activate-grip
 - `context-refresh` — mental model, 7-step
+- `mental-model` — one up-to-date picture of GRIP from the readers it has; a contract, every gap named
 - `session-resume` — GRIP+--resume bridge
 - `check-last-plan` — plan persistence
 - `preplan` — intent injection

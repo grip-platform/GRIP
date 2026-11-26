@@ -38,7 +38,7 @@ triggers:
 !`gh pr list --head $(git branch --show-current 2>/dev/null) --json number,title,state --jq '.[] | "#\(.number) [\(.state)]: \(.title)"' 2>/dev/null || echo "none"`
 
 **Remote tracking:**
-!`git rev-list --left-right --count HEAD...@{upstream} 2>/dev/null | awk '{print "ahead: "$1", behind: "$2}' || echo "no upstream (needs push -u)"`
+!`git rev-list --left-right --count HEAD...@{upstream} 2>/dev/null | awk '{print "ahead: "$(1)", behind: "$(2)}' || echo "no upstream (needs push -u)"`
 
 Use the above context to skip discovery. Proceed directly to PR title/body generation.
 

@@ -344,10 +344,10 @@ _PROVIDER_ROSTER: list[tuple[str, str, dict, str]] = [
         "Anthropic Claude Opus 4.7",
     ),
     (
-        "gemini-3.1-pro-preview",
-        "gemini/gemini-3.1-pro-preview",
+        "gemini-4-carbon",
+        "gemini/gemini-4-carbon",
         {"scheme": "apikey", "token": _token("GEMINI_API_KEY", "grip-gemini")},
-        "Google Gemini 3.1 Pro",
+        "Google Gemini 4 Carbon",
     ),
     (
         "gpt-oss-120b",
@@ -467,6 +467,24 @@ except ImportError:
     from lib.openai_billing import paid_openai_auth
 
 
+#: The operator's opt-in for the paid Anthropic key (rules/claude-cap-moves-to-the-next-subscription.md).
+_PAID_CLAUDE_OPT_IN = "GRIP_CLAUDE_ALLOW_PAID"
+
+
+def _paid_claude_auth(_api) -> dict:
+    """The paid Anthropic key's rung auth, present only when ``GRIP_CLAUDE_ALLOW_PAID`` is exactly "1".
+
+    The rule: never engage the paid Anthropic API key unless the operator set that
+    variable. Before GRIP#9985 a sitting rarely walked this far down the ladder;
+    once a failed fallback no longer ends a sitting, an ungated paid rung would be
+    reached whenever every vendor above it failed. Absent auth drops the rung from
+    every chain (_build_role_chains filters on it).
+    """
+    if os.environ.get(_PAID_CLAUDE_OPT_IN) != "1":
+        return {}
+    return _api("ANTHROPIC_API_KEY", "grip-anthropic-external")
+
+
 def _build_agora_speaker_roster() -> list[tuple[str, str, dict, str]]:
     """Construct the AGORA speaker fallback ladder (presence-gated auth).
 
@@ -500,23 +518,38 @@ def _build_agora_speaker_roster() -> list[tuple[str, str, dict, str]]:
         ("gpt-5.6-sol", "openai/gpt-5.6-sol", paid_openai_auth(),
          "OpenAI GPT-5.6 Sol frontier (fallback; auto-revives on credit)"),
         # Auto-revive fallbacks (dormant on CI; reached only if a funded speaker
-        # above is absent). Anthropic out for exogeneity + credit; Groq CI-blocked.
-        ("claude-sonnet-4-6-cch", "claude-sonnet-4-6", _cch_auth_or_absent(),
-         "Anthropic Claude Sonnet 4.6 via CCH OAuth (fallback; capability-locked claude -p)"),
-        ("claude-sonnet-4-6", "claude-sonnet-4-6", _api("ANTHROPIC_API_KEY", "grip-anthropic-external"),
-         "Anthropic Claude Sonnet 4.6 x-api-key (fallback; auto-revives on credit)"),
+        # above is absent). Groq is CI-blocked.
         ("gpt-oss-120b", "groq/openai/gpt-oss-120b", _api("GROQ_API_KEY", "grip-groq"),
          "OpenAI gpt-oss-120b via Groq (fallback; Cloudflare-blocks CI runner IPs)"),
-        ("kimi-k2.6", "moonshot/kimi-k2.6", _api("MOONSHOT_API_KEY", "grip-moonshot"),
-         "Moonshot Kimi K2.6 (fallback)"),
+        # Two reasoning fallbacks, measured 2026-11-26 on a 23,659-character technical
+        # prompt: kimi-k2.6 (this slot until then) returned an empty completion at the
+        # default budget and timed out at 240 s with the reasoning budget; these two
+        # answered in 97.7 s and 126.7 s with the budget their seat limits give them
+        # (agora_pr_review._SPEAKER_SEAT_LIMITS). Mistral streams its deltas as lists of
+        # content blocks, which _delta_text reads (folded in from GRIP#10024).
+        ("kimi-k3.1-pro-highspeed", "moonshot/kimi-k3.1-pro-highspeed", _api("MOONSHOT_API_KEY", "grip-moonshot"),
+         "Moonshot Kimi K3.1 Pro high-speed (fallback)"),
+        ("mistral-large-4", "mistral/mistral-large-4", _api("MISTRAL_API_KEY", "grip-mistral"),
+         "Mistral Large 4 (fallback)"),
+        # The two Claude rungs come LAST (GRIP#9985): a funded vendor's credit
+        # outage falls to another vendor before any Claude spawn. On 2026-11-26
+        # grok-4.3's 403 fell straight to the CCH spawn, which timed out at 120 s,
+        # so the sitting ended at 2/3. Anthropic is reached last, for exogeneity and
+        # credit, and the paid-key rung only with the operator's opt-in.
+        ("claude-sonnet-4-6-cch", "claude-sonnet-4-6", _cch_auth_or_absent(),
+         "Anthropic Claude Sonnet 4.6 via CCH OAuth (fallback; capability-locked claude -p)"),
+        ("claude-sonnet-4-6", "claude-sonnet-4-6", _paid_claude_auth(_api),
+         "Anthropic Claude Sonnet 4.6 x-api-key (fallback; auto-revives on credit)"),
     ]
 
 
 _AGORA_SPEAKER_ROSTER: list[tuple[str, str, dict, str]] = _build_agora_speaker_roster()
 
 
-# LLM-AS-JUDGE provider (Google Gemini 3.1 Pro Preview — exogenous to all
-# speakers above). V>>-ratified 2026-05-21. Tuple shape matches roster:
+# LLM-AS-JUDGE provider (Google Gemini 4 Carbon — exogenous to all speakers
+# above). V>>-ratified 2026-05-21 with Gemini 3.1 Pro Preview; moved to Carbon,
+# Google's "strongest reasoning model", on V>>'s instruction of 2026-11-26 to
+# replace 3.1 Pro with the new Gemini 4 models. Tuple shape matches roster:
 # (id, happi_provider_string, auth_dict, human_description).
 #
 # Fail-closed contract: if the judge timeouts, errors, returns invalid
@@ -525,10 +558,10 @@ _AGORA_SPEAKER_ROSTER: list[tuple[str, str, dict, str]] = _build_agora_speaker_r
 # rules/exogenous-anchor-law.md: a self-fulfilling judge from a speaker
 # provider is worse than no judge.
 _JUDGE_PROVIDER: tuple[str, str, dict, str] = (
-    "gemini-3.1-pro-judge",
-    "gemini/gemini-3.1-pro-preview",
+    "gemini-4-carbon-judge",
+    "gemini/gemini-4-carbon",
     {"scheme": "apikey", "token": _token("GEMINI_API_KEY", "grip-gemini")},
-    "Google Gemini 3.1 Pro Preview (judge — exogenous to speakers)",
+    "Google Gemini 4 Carbon (judge — exogenous to speakers)",
 )
 
 # Judges tried in order when the one above returns nothing at all (GRIP#6808).
@@ -695,6 +728,17 @@ _DEFAULT_SYSTEM_PROMPT = (
 )
 
 
+#: Council rungs that think before they answer and need more output room than
+#: the shared 2048 default. Gemini 4 Carbon thinks on every call, and Google's
+#: Carbon migration guide asks for at least 32,768 output tokens; on a
+#: 1,059-character ideation prompt its answer at 2048 came back shorter than at
+#: 32,768 (2,051 against 2,274 characters, 2026-11-26), and a longer prompt
+#: leaves its answer even less room.
+_COUNCIL_MAX_TOKENS_BY_PROVIDER: dict[str, int] = {
+    "gemini/gemini-4-carbon": 32768,
+}
+
+
 def _build_envelope(
     provider_id: str,
     happi_provider: str,
@@ -738,7 +782,7 @@ def _build_envelope(
         "content": prompt,
         "flags": {
             "provider": happi_provider,
-            "max_tokens": 2048,
+            "max_tokens": _COUNCIL_MAX_TOKENS_BY_PROVIDER.get(happi_provider, 2048),
             "system": system_prompt,
         },
         "auth": auth,
@@ -832,6 +876,25 @@ def _subprocess_failure_reason(hal_bin: str) -> str:
     return _TIMEOUT_REASON if shutil.which(hal_bin) else _UNUSABLE_BINARY_REASON
 
 
+def _delta_text(text) -> str:
+    """A delta's visible answer text.
+
+    Some HAL adapters pass a provider's content blocks through as a list instead
+    of a string: Mistral Large 4 streams ``[{"type": "thinking", ...}]`` (measured
+    2026-11-26), and joining that raised "sequence item 0: expected str instance,
+    list found", which ended the rung. Plain strings and ``text`` blocks are the
+    answer; thinking blocks and anything else are not.
+    """
+    if isinstance(text, str):
+        return text
+    if not isinstance(text, list):
+        return ""
+    return "".join(item if isinstance(item, str) else item.get("text", "")
+                   for item in text
+                   if isinstance(item, str)
+                   or (isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str)))
+
+
 def _parse_happi_events(stdout: str) -> tuple[list[str], Optional[str]]:
     """Parse happi JSONL stdout into (delta_parts, error_reason).
 
@@ -850,7 +913,7 @@ def _parse_happi_events(stdout: str) -> tuple[list[str], Optional[str]]:
             continue
         t = event.get("type", "")
         if t == "delta":
-            parts.append(event.get("text", ""))
+            parts.append(_delta_text(event.get("text", "")))
         elif t == "error":
             error_reason = event.get("error") or event.get("message") or json.dumps(event)
     return parts, error_reason
@@ -963,6 +1026,47 @@ def _log_nonzero_exit(proc, envelope_id: str, provider: str) -> Optional[str]:
     return f"nonzero_exit_{proc.returncode}"
 
 
+# HAL's HAPPI providers keep their own HTTP timeout (120 s in
+# lib/hal/happi/providers/gemini.py, openai_compat.py and anthropic.py)
+# unless the envelope's flags.timeout_s says otherwise, so a subprocess-level
+# timeout alone never reaches the model call: a speaker whose seat limit is
+# raised past 120 s (e.g. 734 s for a slow reasoning rung) still fails at
+# 120 s underneath it. GRIP#10013 fixed this for the AGORA judge only, by
+# setting flags.timeout_s in agora_pr_review.py's _judge_envelope. GRIP#10086
+# makes it the one shared rule, here where every HAPPI envelope meets its
+# subprocess timeout, so every caller of _call_happi_ex / _call_happi gets it
+# for free instead of needing its own per-call copy.
+_PROVIDER_TIMEOUT_MARGIN_S = 5
+
+
+def _apply_default_provider_timeout(envelope: dict, timeout: Optional[int]) -> None:
+    """MUTATES envelope["flags"]["timeout_s"] in place from timeout, unless
+    already set.
+
+    setdefault at both levels: a caller's explicit flags.timeout_s (the
+    judge's, via _judge_envelope) always stands, and an envelope with no
+    "flags" dict degrades to one being created rather than crashing. A
+    falsy timeout (None or 0) means "no deadline" and is left alone.
+
+    AGORA review (GRIP#10086) asked what happens if the SAME envelope dict
+    is later reused for a retry or a fallback with a SHORTER timeout --
+    setdefault is sticky, so the first, longer timeout_s would survive.
+    Checked against every call site that reaches this function
+    (_dispatch_attempt, _dispatch_speaker, _ask_judge): each builds a FRESH
+    envelope via _build_envelope / _judge_envelope for every attempt,
+    including every retry and every fallback rung, so no caller today
+    reuses one envelope object across two calls with different timeouts.
+    test_a_second_call_with_a_shorter_timeout_does_not_shrink_it pins the
+    behaviour this relies on, so a future caller that DOES reuse an
+    envelope gets the sticky-first-value contract documented here, not a
+    surprise.
+    """
+    if not timeout:
+        return
+    envelope.setdefault("flags", {}).setdefault(
+        "timeout_s", max(1, int(timeout) - _PROVIDER_TIMEOUT_MARGIN_S))
+
+
 def _call_happi_ex(envelope: dict, hal_bin: str, timeout: int) -> tuple[str, Optional[str]]:
     """Call `hal --happi-api`; return (delta_text, error_reason).
 
@@ -971,6 +1075,7 @@ def _call_happi_ex(envelope: dict, hal_bin: str, timeout: int) -> tuple[str, Opt
     callers inspect it to detect HTTP 429 rate-limiting and retry/fall back
     BEFORE counting a provider as non-responding. Origin: 2026-05-06.
     """
+    _apply_default_provider_timeout(envelope, timeout)
     envelope_id = envelope.get("id", "<no-id>")
     provider = envelope.get("flags", {}).get("provider", "<unknown>")
     proc = _run_and_meter(envelope, hal_bin, timeout)

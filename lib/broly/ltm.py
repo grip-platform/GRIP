@@ -55,11 +55,11 @@ def _encode_project_path(project_path: str) -> str:
     Examples::
 
         >>> _encode_project_path("~/my-project")
-        '-Users-dev-my-project'
+        '-Users-you-my-project'
         >>> _encode_project_path("~/.claude")
-        '-Users-dev--claude'
+        '-Users-you--claude'
         >>> _encode_project_path("~/my.app")
-        '-home-user-my-app'
+        '-home-you-my-app'
 
     Args:
         project_path: Absolute filesystem path (forward slashes).

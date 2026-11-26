@@ -4,7 +4,7 @@ Single source of truth for Claude Code's project path encoding
 
 FORMULA:
     Replace '/', '\', ':', '.' and ' ' with '-'
-    Example (POSIX):   ~/.claude       -> -Users-foo--claude
+    Example (POSIX):   ~/.claude       -> -Users-you--claude
     Example (Windows): C:\Users\<first> <last>\.grip -> C--Users-<first>-<last>--grip
 
     The backslash, colon and space rules are NOT cosmetic. Without them a
@@ -72,7 +72,7 @@ def encode_project_path(path: str | Path) -> str:
         path: Filesystem path (str or Path)
 
     Returns:
-        Encoded path string (e.g., '-Users-foo--claude')
+        Encoded path string (e.g., '-Users-you--claude')
     """
     return str(path).translate(_ENCODE_TABLE)
 

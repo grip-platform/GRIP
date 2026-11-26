@@ -165,9 +165,11 @@ At end of Phase 3, if files changed:
 git add <specific files> && \
 git commit -m "type: terse description
 
-Primary Author: operator" && \
+Primary Author: <operator signature>" && \
 git push
 ```
+
+Fill `<operator signature>` with what `bin/grip-operator-signature` prints.
 
 If the branch is a feature branch, create the PR (`gh pr create`). If CI
 passes and admin-merge is allowed, merge. If protected branch, HALT and

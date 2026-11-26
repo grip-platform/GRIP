@@ -1,6 +1,6 @@
 ---
 name: ultralearn
-description: 'The lean RSI-witness kernel — ONE idempotent cycle (introspect → exogenous grip-sovereign-council deliberation → harvest the sha256+IDR seal → publish to the witness ledger). Banach f∘f=f, a re-run on unchanged RSI state makes ZERO new council calls. Use for "/ultralearn", "run a sealed introspection cycle", "witness the self-improvement with a fresh exogenous deliberation". NOT a mega-command — a cross-provider sovereign council explicitly de-scoped it (verdict BUILD-MINIMAL, seal 530ddaa79e8086d4) to its single external-value anchor: a third-party-auditable, cryptographically-sealed proof that GRIP deliberated over its own RSI state. Composes lib/ultracode (idempotent kernel) + grip-sovereign-council (Pool-B, $0) + the internal strat-ops witness page.'
+description: 'The lean RSI-witness kernel — ONE idempotent cycle (introspect → exogenous grip-sovereign-council deliberation → harvest the sha256+IDR seal → publish to the witness ledger). Banach f∘f=f, a re-run on unchanged RSI state makes ZERO new council calls. Use for "/ultralearn", "run a sealed introspection cycle", "witness the self-improvement with a fresh exogenous deliberation". NOT a mega-command — a cross-provider sovereign council explicitly de-scoped it (verdict BUILD-MINIMAL, seal 530ddaa79e8086d4) to its single external-value anchor: a third-party-auditable, cryptographically-sealed proof that GRIP deliberated over its own RSI state. Composes lib/ultracode (idempotent kernel) + grip-sovereign-council (Pool-B, no cost) + the internal strat-ops witness page.'
 ---
 
 # /ultralearn — the lean RSI-witness kernel
@@ -11,7 +11,7 @@ cryptographically-sealed record that GRIP ran an exogenous, cross-provider delib
 over its own recursive-self-improvement state.
 
 It is deliberately **not** a be-all-and-end-all mega-command. A grounded sovereign council
-(4 non-Anthropic speakers + a non-Anthropic judge, Pool-B, $0) voted **unanimous
+(4 non-Anthropic speakers + a non-Anthropic judge, Pool-B, no cost) voted **unanimous
 BUILD-MINIMAL** and rejected the 20-skill-pipe / delight++ framing as internal theatre.
 `/ultralearn` is the 20% that survived that cut. Provenance of the de-scope decision:
 `grip-sovereign-council --verify 530ddaa79e8086d4`.

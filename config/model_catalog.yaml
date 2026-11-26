@@ -654,6 +654,30 @@ models:
       Free tier available; implicit caching only. Listed, not a default: no
       chain, pin, or seat names it.
 
+  # Gemini 4 Neon, onboarded 2026-11-26 through /dogfood-domain. Facts read from
+  # ai.google.dev/gemini-api/docs/models/gemini-4-neon, .../pricing and
+  # .../changelog, plus deepmind.google/models/model-cards/gemini-4-neon/ for the
+  # knowledge cutoff, all on 2026-11-26. Served and working on GRIP's key the
+  # same day: one call through lib/hal/registry.py came back from
+  # 'gemini-4-neon' with finish_reason stop.
+  - address: gemini/gemini-4-neon
+    tier: frontier
+    paid: true
+    modality: multimodal
+    context_window: 1048576
+    tags: [frontier, reasoning, coding, agentic, science, long-context, multimodal]
+    strengths:
+      - GA 2026-11-18 (vendor changelog); knowledge cutoff March 2026 (model card)
+      - 1,048,576-token unified input+output window; 65,536 output tokens by default, up to 1,048,576 with long decode
+      - Thinking levels low / medium / high (default) / xhigh; input text, image, video, audio, PDF
+    description: >
+      Google's Gemini 4 generation model between Hydrogen and Carbon, "frontier-level
+      intelligence with fast end-to-end task completion", read from
+      ai.google.dev/gemini-api/docs/models/gemini-4-neon on 2026-11-26. $3.00 in /
+      $15.00 out / $0.15 cached per 1M tokens, flat (no dated change). Not on the
+      Free tier; implicit caching only. Listed, not a default: no chain, pin, or
+      seat names it.
+
   # ─────────────────────────────────────────────
   # MOONSHOT KIMI
   # ─────────────────────────────────────────────

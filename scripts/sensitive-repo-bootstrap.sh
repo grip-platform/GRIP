@@ -31,6 +31,17 @@ if [[ -z "$DIR" || -z "$REPO" ]]; then
     exit 1
 fi
 
+# ── Signature: the bootstrap commit is pseudonymous, so it carries the operator's
+#    signature and never a real name (rules/commit-standards.md; --strict). Resolved
+#    before anything is created, so a missing signature leaves nothing behind.
+GRIP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$GRIP_ROOT/scripts/lib/venv-utils.sh"
+PY="$(resolve_venv_python "${CLAUDE_DIR:-$HOME/.claude}/venv" || true)"
+SIGNATURE="$("${PY:-python3}" "$GRIP_ROOT/bin/grip-operator-signature" --strict)" || {
+    echo "ERROR: could not resolve an operator signature (bin/grip-operator-signature --strict; its message is above)" >&2
+    exit 1
+}
+
 KEY_PATH="$HOME/CodeTonight/.${REPO}-git-crypt.key"
 
 echo "[sensitive-repo-bootstrap] Creating ${ORG}/${REPO} at ${DIR}"
@@ -96,10 +107,10 @@ fi
 
 # ── Step 8: initial commit ───────────────────────────────────────────────────
 git add .
-git -c user.name="V>>" -c user.email="licensing@codetonight.co.za" \
+git -c user.name="$SIGNATURE" -c user.email="licensing@codetonight.co.za" \
     commit -m "feat: initialise ${REPO} with symmetric git-crypt encryption
 
-Primary Author: V>>"
+Primary Author: ${SIGNATURE}"
 
 # ── Step 9: create private GitHub repo (no --license, no --gitignore) ─────────
 # Never pass --license or --gitignore: server-side init commit is author-attributed

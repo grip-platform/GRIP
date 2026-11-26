@@ -158,7 +158,7 @@ echo "Verifying..."
 gh secret list --repo "$REPO"
 
 echo ""
-echo "DELETE THIS FILE NOW: rm $0"
+echo "DELETE THIS FILE NOW: rm ${0}"
 ```
 
 ---

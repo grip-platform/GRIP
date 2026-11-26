@@ -31,8 +31,8 @@ Opus 4.7 defaults to 1M context since April 2026. This command is retained for s
 
 ## Cost Awareness
 
-- Opus 1M: ~$15/MTok input, ~$75/MTok output (1M default)
-- Sonnet 1M: ~$3/MTok input, ~$15/MTok output (1M max)
+- Opus 1M: about 15 US dollars per million tokens in, about 75 out (1M default)
+- Sonnet 1M: about 3 US dollars per million tokens in, about 15 out (1M max)
 - Sonnet is cheaper per token but trades off reasoning depth
 
 ## Integration

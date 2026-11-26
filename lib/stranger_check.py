@@ -110,8 +110,8 @@ TARGETS: dict = {
         readme_url="https://raw.githubusercontent.com/grip-platform/HAL/main/README.md",
         lines=(
             Line("install", pattern=r"^git clone https://github\.com/grip-platform/HAL ~/\.hal$"),
-            Line("install", pattern=r"^python3 -m venv ~/\.hal-test-venv && ~/\.hal-test-venv/bin/pip install .+$"),
-            Line("test", pattern=r"^cd ~/\.hal && HAL_HOME=~/\.hal ~/\.hal-test-venv/bin/python -m pytest .*tests$"),
+            Line("install", pattern=r"^(?:python3 -m venv ~/\.hal-test-venv && ~/\.hal-test-venv/bin/pip install .+|bash ~/\.hal/bin/test-venv\.sh)$"),
+            Line("test", pattern=r"^cd ~/\.hal && HAL_HOME=~/\.hal (?:~/\.hal-test-venv/bin/python|bash bin/test-venv\.sh python) -m pytest .*tests$"),
         ),
     ),
     "happi": Target(

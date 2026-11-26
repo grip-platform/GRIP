@@ -34,8 +34,8 @@ EVOLVE_LOG = CLAUDE_DIR / "learning" / "evolve_runs.jsonl"
 
 # Single path registration — all lib/ modules importable from here down.
 # Phases accept injectable callables for testability (DIP compliance).
-if str(CLAUDE_DIR / "lib") not in sys.path:
-    sys.path.insert(0, str(CLAUDE_DIR / "lib"))
+if str(Path(__file__).resolve().parent) not in sys.path:  # own lib (GRIP#9857)
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 @dataclass

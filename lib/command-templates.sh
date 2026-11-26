@@ -37,9 +37,9 @@ set -euo pipefail
 
 # Encode filesystem path for Claude project directory format
 # Input:  ~/project
-# Output: -Users-username-project (WITH leading dash, dots become dashes)
+# Output: -Users-you-project (WITH leading dash, dots become dashes)
 # Claude Code's ACTUAL encoding: replace / with -, replace . with -
-# Example: ~/.claude → -Users-foo--claude
+# Example: ~/.claude → -Users-you--claude
 encode_project_path() {
     local path="${1:-$(pwd)}"
     # Step 1: Replace all slashes with dashes (keeps leading dash from /)
@@ -116,7 +116,7 @@ CORRECT BASH PATTERNS (memorise these!)
 
 1. PATH ENCODING (Claude Code's actual format - leading dash + dots become dashes)
    ✗ WRONG: pwd | sed 's|^/||' | sed 's|/|-|g'   → Users-foo-.claude (FAILS!)
-   ✓ RIGHT: pwd | sed 's|/|-|g' | sed 's|\.|-|g' → -Users-foo--claude (MATCHES!)
+   ✓ RIGHT: pwd | sed 's|/|-|g' | sed 's|\.|-|g' → -Users-you--claude (MATCHES!)
 
 2. COMMAND CHAINING (avoid parse errors)
    ✗ BAD:  VAR=$(cmd); echo $VAR         → parse error near ')'
@@ -124,7 +124,7 @@ CORRECT BASH PATTERNS (memorise these!)
 
 3. DASH-PREFIXED PATHS (use -- to end flag parsing)
    ✗ BAD:  fd -t d "$path"               → unexpected argument '-U'
-   ✓ GOOD: fd -t d -- "$path"            → works with -Users-foo--claude
+   ✓ GOOD: fd -t d -- "$path"            → works with -Users-you--claude
 
 4. COMPLETE PROJECT HISTORY PATTERN
    ✓ GOOD: PROJECT_DIR=$(pwd | sed 's|/|-|g' | sed 's|\.|-|g') && fd -t d -- "$PROJECT_DIR" ~/.claude/projects

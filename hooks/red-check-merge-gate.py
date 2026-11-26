@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """PreToolUse gate: DENY `gh pr merge` while the Codex reviewer holds the pull
 request by the merge sweep's rule, while a GitHub Actions job on its head is
-red and the base branch's newest finished reading of that job is not, or while
-a run on the head has not finished.
+red and the base branch's newest finished reading of that job is not, while
+a run on the head has not finished, or while its target cannot be told
+because a shell variable or command substitution has not yet been filled in.
 
 Origin: V>> 2026-10-15 chose, for the merge sweep, to hold a pull request for a
 red non-required check unless main carries the same red (GRIP#8343). Within
@@ -61,6 +62,20 @@ defers the merge to GitHub past the moment this gate reads the head, so a job
 still running could turn red after the reading (AGORA on GRIP#8454); drop it
 and merge once the checks have finished.
 
+THE UNREADABLE TARGET (GRIP#10064)
+-----------------------------------
+A target or repository the shell fills in -- `gh pr merge "$n"`, `$n`,
+`${n}`, or `gh pr merge $(cat number) ...` -- is not merely unresolved: the
+value this gate reads is the two characters `$n`, never the pull request the
+shell would later substitute, so it can never be told which pull request is
+meant. Seen live 2026-11-26 (HAL#908 and HAL#910, merged in one loop over a
+shell variable): the gate let the merge through with a note, and neither
+hold ran. V>> decided the same day that this denies outright, with a reason
+naming the fix: type the literal pull request number. A bare `gh pr merge`
+(the current branch's own pull request) and a pull request URL are read
+exactly as before; only a target or repository the shell would still have to
+expand is refused.
+
 WHY DENY, AND WHY FAIL OPEN
 ---------------------------
 A merge past the pull request's own red is what the rule exists to stop, and
@@ -74,11 +89,9 @@ proceeds with an audit row and a one-line advisory that names the cause and
 says the rule was not applied. The unattended sweep fails closed on the same
 reads, but a person at the keyboard should not deadlock on an API hiccup. A
 run the head's listing showed still going denies even when another read then
-failed: it was seen, not guessed (Codex, round six). A target the shell
-expands (`gh pr merge "$PR"`) cannot be read before the shell runs, so it is
-an uncertainty too. The reading is a point in time, as the sweep's is: a push
-between it and the merge is not seen, and `--match-head-commit` pins a merge
-to the head it was judged on.
+failed: it was seen, not guessed (Codex, round six). The reading is a point
+in time, as the sweep's is: a push between it and the merge is not seen, and
+`--match-head-commit` pins a merge to the head it was judged on.
 `GRIP_RED_CHECK_GATE=0` in front of a merge (`GRIP_RED_CHECK_GATE=0 gh pr merge
 11`, or after `env`) allows that merge alone, and in the environment allows
 every merge. Each is logged, and read before anything is resolved, so it is
@@ -96,7 +109,10 @@ The unfinished hold resolves the same way: the run finishes on its own, or
 `gh run cancel` ends one that can never finish (a cancelled run has finished),
 and neither is a merge command. The Codex hold resolves when its thread is
 resolved (`gh api graphql` with resolveReviewThread), when Codex reviews, or
-when the wait ends, and none of those is a merge command either.
+when the wait ends, and none of those is a merge command either. A target or
+repository the shell fills in denies the same way: its resolution is to type
+the literal pull request number, which this gate reads in full and never
+denies for being unreadable, or the logged override.
 
 Judgement: lib/red_check.py and bin/grip-pr-monitor --codex-hold (both shared
            with the merge sweep)
@@ -367,13 +383,24 @@ def _current_repo(cwd: str, deadline: float) -> str | None:
     return f"{_host_prefix(url['host'])}{url['owner']}/{url['repo']}"
 
 
+def _shell_fills_in(target: str | None, repo: str | None) -> bool:
+    """True when TARGET or REPO is a parameter (`"$PR"`, `$n`, `${n}`) or a
+    command substitution (`$(...)`, backticks) the shell fills in only after
+    this gate has already run, so it is not merely unresolved: it cannot be
+    read at all. Denied outright (V>> 2026-11-26, GRIP#10064) rather than
+    allowed with a note -- typing the literal pull request number is the
+    only way to be checked, and it is never inside this denied set
+    (rules/gate-resolution-escape-hatch.md, Invariant 1)."""
+    return any(_EXPANDS.search(word) for word in (target, repo) if word)
+
+
 def _resolve(target: str | None, repo: str | None, cwd: str, deadline: float) -> tuple[str, int] | None:
-    """(repo, number) the merge is aimed at, or None when it cannot be told.
-    A target or repository the shell expands (`"$PR"`, `$(...)`) is filled in
-    only after this hook has run, so it cannot be told, and gh is not asked
-    about a branch literally named `$PR` (AGORA on GRIP#8454, round seven)."""
-    if any(_EXPANDS.search(word) for word in (target, repo) if word):
-        return None
+    """(repo, number) the merge is aimed at, or None when it cannot be told:
+    the repository could not be read, or no pull request matches the target.
+    A target or repository the shell fills in later is caught before this is
+    called (_shell_fills_in) and denies instead of reaching here; gh is not
+    asked about a branch literally named `$PR` (AGORA on GRIP#8454, round
+    seven)."""
     url = _PR_URL.match(target or "")
     if url:
         return f"{_host_prefix(url['host'])}{url['owner']}/{url['repo']}", int(url["number"])
@@ -435,10 +462,19 @@ def _codex_hold(repo: str, number: int, deadline: float) -> str:
 
 def _judge_one(red_check, prefix: list[str], tail: list[str], cwd: str, deadline: float) -> tuple[str, str]:
     """(denial, note) for one merge segment; each is empty when it has nothing
-    to say. The Codex hold comes first and the red check after it, as in the
-    sweep, and a Codex denial ends the judgement as the sweep's first hold does."""
+    to say. A target or repository the shell fills in later denies outright,
+    before the Codex hold or the red check, which this gate never applies to
+    it (GRIP#10064). Otherwise the Codex hold comes first and the red check
+    after it, as in the sweep, and a Codex denial ends the judgement as the
+    sweep's first hold does."""
     target, repo = _positional(tail)
-    target = _resolve(target, _with_env_target(repo, prefix), cwd, deadline)
+    repo = _with_env_target(repo, prefix)
+    if _shell_fills_in(target, repo):
+        _audit({"decision": "deny-unreadable", "tail": tail[:8]})
+        return ("which pull request this merge is aimed at could not be told: a shell variable or command "
+                "substitution is filled in only after this gate runs, so it cannot be read. Type the literal "
+                "pull request number."), ""
+    target = _resolve(target, repo, cwd, deadline)
     if target is None:
         why = ("the judgement ran out of its budget" if _remaining(deadline) <= 0
                else "which pull request this merge is aimed at could not be told")

@@ -54,7 +54,8 @@ LEARNING_DIR = CLAUDE_DIR / "learning"
 EVO_CONVERGENCE = LEARNING_DIR / "evo-convergence.jsonl"
 
 try:
-    sys.path.insert(0, str(CLAUDE_DIR / "lib"))
+    if str(Path(__file__).resolve().parent) not in sys.path:  # own lib (GRIP#9857)
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
     from converge import converge
 except ImportError:
     def converge(state, criterion, improve, depth=0, max_depth=3,

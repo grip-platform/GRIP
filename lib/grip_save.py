@@ -67,7 +67,7 @@ FAILURE_LOG = CLAUDE_DIR / "logs" / "grip-save-failures.jsonl"
 # run measured 25.86s real, matching the old baseline's ballpark. It is the
 # shared index this step reads, appends to, and rewrites WHOLE on every save
 # (_write_index_with_lock_ladder -> _load_index + atomic_write_json):
-# ~/.claude/projects/-Users-void--grip/grip/index.json measured at 11MB / 13,143
+# ~/.claude/projects/-Users-you--grip/grip/index.json measured at 11MB / 13,143
 # entries (368 distinct sessions, ~36 saves/session average, 85 days of
 # accumulated history, 2026-06-22 to present) -- an O(index size) cost paid by
 # EVERY session on EVERY save, growing every day this environment stays in use.
@@ -303,11 +303,20 @@ def _detect_achievement() -> str:
 
 
 def _get_project_info() -> tuple[str, str, str]:
-    """Get CWD, encoded project path, and grip index path."""
+    """Get CWD, encoded project path, and grip index path.
+
+    The folder is the one Claude Code names for the working directory, found
+    through path_encoding.project_dir (GRIP#6821). The name used to be built
+    by hand from '/' and '.' only, so on Windows it kept the drive colon and
+    the backslashes, joined onto projects/ as an absolute path, and /save read
+    a stray ~/-grip folder instead of the project's own.
+    """
+    from path_encoding import project_dir
+
     cwd = os.getcwd()
-    encoded = cwd.replace("/", "-").replace(".", "-")
-    grip_index = CLAUDE_DIR / "projects" / encoded / "grip" / "index.json"
-    return cwd, encoded, str(grip_index)
+    project = project_dir(cwd, CLAUDE_DIR)
+    grip_index = project / "grip" / "index.json"
+    return cwd, project.name, str(grip_index)
 
 
 def _check_memory_md(encoded: str) -> str:

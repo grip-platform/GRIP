@@ -69,7 +69,7 @@ Keep the concepts separate:
    - For Codex/OpenAI-compatible clients, use the `:4010` HAL Gateway and `/v1/responses` or `/v1/chat/completions`.
    - For GRIP internal LLM calls, keep `lib/hal_llm_adapter.py` as the path; do not add direct Gemini SDK calls.
    - For Claude Code sessions routed through Gemini, prefer `grip-gemini` or `grip-hal --provider gemini` rather than hand-exporting provider keys.
-   - For persistent model preference, use `python3 -m lib.active_llm pin gemini/gemini-3.1-pro-preview` or a cheaper Gemini marker when explicitly requested.
+   - For persistent model preference, use `python3 -m lib.active_llm pin gemini/gemini-4-carbon` or a cheaper Gemini marker when explicitly requested.
 
 3. **Plan startup wiring**
    - Prefer a launchd user agent for `python3 -m lib.hal.gateway --port 4010` from `~/.hal`.

@@ -116,10 +116,15 @@ REGISTRY = {
     "deepseek-reasoner": ("https://api.deepseek.com/v1/chat/completions", "deepseek-v4-pro", "grip-deepseek"),
     "gemini":     ("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "gemini-3.5-flash-lite", "grip-gemini"),
     "gemini-pro": ("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "gemini-3.1-pro-preview", "grip-gemini"),
-    # Gemini 4 Argon, GA 2026-10-13 (vendor changelog). Seatable by name as a judge;
-    # DEFAULT_JUDGE stays gemini-pro, because moving it is GRIP#8566's decision, held
-    # while H834 is open (Argon and 3.1 Pro agreed on 8 of 20 replayed PRs).
+    # Gemini 4 Argon, GA 2026-10-13 (vendor changelog). Seatable by name as a judge.
+    # GRIP#8566 proposed it as DEFAULT_JUDGE (H834: Argon and 3.1 Pro agreed on 8 of
+    # 20 replayed PRs); V>>'s 2026-11-26 instruction moved the judge to Carbon instead.
     "gemini-argon": ("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "gemini-4-argon", "grip-gemini"),
+    # Gemini 4 Carbon, GA 2026-11-10 (vendor changelog), "Our strongest reasoning
+    # model" (ai.google.dev/gemini-api/docs/models, read 2026-11-26). V>> 2026-11-26:
+    # Carbon replaces 3.1 Pro wherever 3.1 Pro was a seat choice; gemini-pro stays
+    # seatable by name, because the model is still served and priced.
+    "gemini-carbon": ("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "gemini-4-carbon", "grip-gemini"),
     "groq":       ("https://api.groq.com/openai/v1/chat/completions", "openai/gpt-oss-120b", "grip-groq"),
     # grok-3 retired at the provider; grok-4.5 live-verified against
     # api.x.ai/v1/models 2026-07-17.
@@ -133,7 +138,8 @@ REGISTRY = {
 }
 # GEMINI REMOVED FROM THE PANEL, 2026-08-19 — it shared a vendor with the judge.
 #
-# The judge is gemini-3.1-pro and a speaker was gemini-3.5-flash-lite (formerly
+# The judge was gemini-3.1-pro (gemini-4-carbon from 2026-11-26) and a speaker was
+# gemini-3.5-flash-lite (formerly
 # gemini-2.5-flash, repointed 2026-11-24, GRIP#9389), so Google both
 # argued and adjudicated. That is the producer-equals-verifier shape
 # exogenous-anchor-law.md exists to forbid, and AGORA's own roster already
@@ -157,7 +163,9 @@ REGISTRY = {
 # below — they reason on every call, so the 45s default is too tight.
 # Astra keeps its default chair; both OpenAI seats use the ChatGPT subscription.
 DEFAULT_SPEAKERS = ["deepseek", "xai", "astra", "groq"]
-DEFAULT_JUDGE = "gemini-pro"
+# Gemini 4 Carbon from 2026-11-26 (V>>: "replace 3.1 Pro" with the new Google
+# models). Google, so still disjoint from every default speaker's vendor.
+DEFAULT_JUDGE = "gemini-carbon"
 
 # SUBSCRIPTION-AUTHENTICATED SEATS (V>> 2026-09-24: "We need to use
 # the operator's own Codex ChatGPT subscription (business), not API
@@ -291,6 +299,12 @@ def _env_positive_int(name: str, default: int) -> int:
 _READ_TIMEOUT_S = {"xai": 90, "deepseek": 90, "deepseek-reasoner": 90, "openai": 300,
                    # The budget AGORA's seat trial set for Qwen4-Max (GRIP#9510).
                    "qwen": 150,
+                   # Gemini 4 Carbon thinks on every call (61-89 thinking tokens on
+                   # a one-word prompt, 2026-11-26), so it is a reasoning leg, not a
+                   # fast one, and it is the default judge. One call through this
+                   # transport took 108.3 s for a 3,501-byte prompt with a
+                   # 24,000-token cap (2026-11-26), past a 90 s limit.
+                   "gemini-carbon": 180,
                    "astra": _env_positive_int("GRIP_COUNCIL_ASTRA_TIMEOUT_S", 300),
                    # CLI spawns pay process start-up + agent overhead on top
                    # of inference; a 90s ceiling cuts a healthy seat mid-answer.
@@ -783,6 +797,12 @@ _TRUNCATED_FINISH_REASONS = frozenset({"length", "max_tokens", "model_length", "
 #: it thinks on the way there, and it is a cap, not a spend.
 _JUDGE_MAX_TOKENS = 8192
 
+#: Per-seat overrides of _JUDGE_MAX_TOKENS. gemini-carbon gets 32768, the figure
+#: Google's Gemini 4 Carbon migration guide gives ("Raise max_output_tokens to at
+#: least 32,768"), the same override AGORA's judge has
+#: (lib/agora_pr_review._JUDGE_RUNG_MAX_TOKENS).
+_JUDGE_MAX_TOKENS_BY_SEAT: dict[str, int] = {"gemini-carbon": 32768}
+
 #: Cap on the judge's RAW reply when it did not parse as JSON. Was 300, which
 #: discarded the judge's reasoning at exactly the moment a human most needed to
 #: read it — the parse had already failed, so those characters were the only
@@ -1217,7 +1237,7 @@ def judge(prompt: str, results: list, judge_name: str) -> dict:
         '{"best": "<model-name>", "synthesis": "<one sentence>"}'
     )
     res = provider_call(judge_name, [{"role": "user", "content": ask}], time.time(),
-                        max_tokens=_JUDGE_MAX_TOKENS)
+                        max_tokens=_JUDGE_MAX_TOKENS_BY_SEAT.get(judge_name, _JUDGE_MAX_TOKENS))
     verdict = _parse_judge_reply(res["text"])
     verdict["judge_model"] = res["model"]
     verdict["judge_ok"] = res["ok"]

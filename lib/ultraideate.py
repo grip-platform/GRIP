@@ -571,14 +571,19 @@ def _shortlists_log_path() -> Path:
     return get_claude_dir() / "logs" / "ultraideate-shortlists.jsonl"
 
 
-def record_shortlist(topic: str, ranked: Sequence[Ranked], *, log_path: Optional[Path] = None) -> str:
+def record_shortlist(topic: str, ranked: Sequence[Ranked], *, log_path: Optional[Path] = None,
+                     shuffled: bool = False) -> str:
     """Append one shortlist as it is shown to the operator and return its run id.
 
     One line per `rank` run: ``ts``, ``run_id``, a digest of the topic (never the
-    topic's words, which are the operator's), the ranked ids, and how many of the
+    topic's words, which are the operator's), the ranked ids, how many of the
     run's criterion readings Jev settled out of how many it was asked -- the only
     record of a whole run's coverage, since ``rank --json`` shows the top ideas
-    alone. A later picks row
+    alone -- and ``shown_order``: "shuffled" when ``rank --shuffle`` displayed the
+    top ideas in random order instead of Jev's own rank, else "ranked". Without
+    this tag a shuffled round and a ranked round are indistinguishable in the log,
+    and the measure cannot separate Jev's ranking from the operator favouring
+    whatever is shown first (GRIP#9471). A later picks row
     carrying the same ``run_id`` closes it; a shortlist with no such row is a round
     the operator never came back to, which the always-on tick (``lib/grip_tick.py``)
     reports after a day (GRIP#8793). Advisory: never raises into the rank flow, and
@@ -595,7 +600,8 @@ def record_shortlist(topic: str, ranked: Sequence[Ranked], *, log_path: Optional
     _append_jsonl(path, {"ts": time.time(), "run_id": run_id, "topic_digest": _topic_digest(topic),
                          "ranked_ids": [r.scored.idea.id for r in ranked], "scored_ideas": scored_ideas,
                          "settled_readings": sum(len(r.scored.scores) for r in ranked),
-                         "readings": len(ranked) * len(CRITERIA)})
+                         "readings": len(ranked) * len(CRITERIA),
+                         "shown_order": "shuffled" if shuffled else "ranked"})
     return run_id
 
 
@@ -633,18 +639,22 @@ def _jsonl_rows(path: Path) -> List[dict]:
     return rows
 
 
-def _picks_row(topic: str, ranked_ids: Sequence[str], picked_ids: Sequence[str], k: int, run_id) -> dict:
+def _picks_row(topic: str, ranked_ids: Sequence[str], picked_ids: Sequence[str], k: int, run_id,
+              shown_order: str = "ranked") -> dict:
     return {"ts": time.time(), "topic": topic, "k": int(k), "run_id": run_id,
-            "ranked_ids": list(ranked_ids), "picked_ids": list(picked_ids)}
+            "ranked_ids": list(ranked_ids), "picked_ids": list(picked_ids), "shown_order": shown_order}
 
 
 def record_picks(topic: str, ranked: Sequence[Ranked], picked_ids: Sequence[str], *,
-                 k: int, log_path: Optional[Path] = None, run_id: Optional[str] = None) -> None:
+                 k: int, log_path: Optional[Path] = None, run_id: Optional[str] = None,
+                 shown_order: str = "ranked") -> None:
     """Append one picking session: the full ranked order, which ids the
-    operator picked, the top-k size that session was judged against, and the
+    operator picked, the top-k size that session was judged against, the
     ``run_id`` of the shortlist it answers (from ``record_shortlist`` or the
-    rank command's output), which is what marks that shortlist as picked from.
-    An EMPTY ``run_id`` is a run that scored nothing and recorded no shortlist
+    rank command's output), which is what marks that shortlist as picked from,
+    and ``shown_order`` ("ranked" or "shuffled") so ``report`` can separate
+    Jev's ranking from position bias (GRIP#9471). An EMPTY ``run_id`` is a run
+    that scored nothing and recorded no shortlist
     (GRIP#8824): there is nothing to pick from, so nothing is written, and the
     precision measure never sees a row ranked by arrival order. Advisory
     bookkeeping -- never raises into the operator's pick flow. A caller in
@@ -652,7 +662,7 @@ def record_picks(topic: str, ranked: Sequence[Ranked], picked_ids: Sequence[str]
     if run_id == "":
         return
     path = Path(log_path) if log_path is not None else _picks_log_path()
-    _append_jsonl(path, _picks_row(topic, [r.scored.idea.id for r in ranked], picked_ids, k, run_id))
+    _append_jsonl(path, _picks_row(topic, [r.scored.idea.id for r in ranked], picked_ids, k, run_id, shown_order))
 
 
 def record_picks_for_run(topic: str, run_id: str, picked_ids: Sequence[str], *, k: int,
@@ -663,8 +673,11 @@ def record_picks_for_run(topic: str, run_id: str, picked_ids: Sequence[str], *, 
     used to rebuild one by hand, and 3 of the 23 picks rows that name a recorded
     shortlist (logs as of 2026-11-24) carry a shorter ranked order than that
     shortlist -- 10 ids of 281 on run 81baf51511c1, whose random baseline then
-    read 5/10 instead of 5/281. Here the order is copied from the shortlist row.
-    Nothing is written, and the reason is returned, when the run id has no
+    read 5/10 instead of 5/281. Here the order is copied from the shortlist row,
+    and so is its ``shown_order`` tag (GRIP#9471) -- the picks row must carry the
+    same "ranked"/"shuffled" value the shortlist did, or ``report``'s breakdown
+    by that tag would be checking the wrong thing. Nothing is written, and the
+    reason is returned, when the run id has no
     shortlist, the topic's digest differs from the one that shortlist was ranked
     for, a picked id is not in it, the run already has a picks row (a second row
     would count one session twice in ``precision_at_k``), ``k`` is below 1, or
@@ -672,8 +685,8 @@ def record_picks_for_run(topic: str, run_id: str, picked_ids: Sequence[str], *, 
     valid answer and is recorded."""
     if k < 1:
         return "k must be at least 1"
-    ranked_ids, why = _shortlist_order(run_id, topic, Path(shortlists_path) if shortlists_path is not None
-                                       else _shortlists_log_path())
+    ranked_ids, shown_order, why = _shortlist_order(run_id, topic, Path(shortlists_path)
+                                                    if shortlists_path is not None else _shortlists_log_path())
     if why:
         return why
     known = set(ranked_ids)
@@ -681,7 +694,7 @@ def record_picks_for_run(topic: str, run_id: str, picked_ids: Sequence[str], *, 
     if unknown:
         return "not in this shortlist: " + ", ".join(unknown)
     picks_path = Path(log_path) if log_path is not None else _picks_log_path()
-    return _append_picks_once(picks_path, run_id, _picks_row(topic, ranked_ids, picked_ids, k, run_id))
+    return _append_picks_once(picks_path, run_id, _picks_row(topic, ranked_ids, picked_ids, k, run_id, shown_order))
 
 
 #: How long a picks write waits for another writer to release the log, in seconds.
@@ -707,14 +720,15 @@ def _append_picks_once(picks_path: Path, run_id: str, row: dict) -> str:
     return ""
 
 
-def _shortlist_order(run_id: str, topic: str, path: Path) -> Tuple[List[str], str]:
-    """The ranked ids of shortlist ``run_id`` and "", or no ids and the reason a pick cannot be checked against it."""
+def _shortlist_order(run_id: str, topic: str, path: Path) -> Tuple[List[str], str, str]:
+    """The ranked ids of shortlist ``run_id`` and its ``shown_order`` tag, with "" for the reason; or no
+    ids, "ranked", and the reason a pick cannot be checked against it."""
     rows = [r for r in _jsonl_rows(path) if run_id and r.get("run_id") == run_id]
     if not rows:
-        return [], f"no shortlist has run id {run_id!r}"
+        return [], "ranked", f"no shortlist has run id {run_id!r}"
     if rows[-1].get("topic_digest") != _topic_digest(topic):
-        return [], "the topic differs from the one this shortlist was ranked for"
-    return [str(i) for i in rows[-1].get("ranked_ids") or []], ""
+        return [], "ranked", "the topic differs from the one this shortlist was ranked for"
+    return [str(i) for i in rows[-1].get("ranked_ids") or []], rows[-1].get("shown_order") or "ranked", ""
 
 
 def _mean(values: Sequence[float]) -> Optional[float]:
@@ -723,7 +737,9 @@ def _mean(values: Sequence[float]) -> Optional[float]:
 
 
 def _row_precision(row: dict) -> dict:
-    """One session's precision at k and its random baseline. A run with fewer ideas than k is judged at its
+    """One session's precision at k, its random baseline, and whether the round was shown "ranked" (Jev's
+    own order) or "shuffled" (GRIP#9471: a row logged before that tag existed carries no such field and
+    reads as "ranked", the only mode that existed then). A run with fewer ideas than k is judged at its
     own length: otherwise picking the only idea of a one-idea run read precision 0.2 against a baseline of 1.0
     (Codex on GRIP#9364), when a run that short cannot rank better than chance at all."""
     ranked_ids = row.get("ranked_ids") or []
@@ -731,7 +747,18 @@ def _row_precision(row: dict) -> dict:
     picked_ids = set(row.get("picked_ids") or [])
     precision = (len(set(ranked_ids[:k]) & picked_ids) / k) if k else None
     random_baseline = (len(picked_ids) / len(ranked_ids)) if ranked_ids else None
-    return {"topic": row.get("topic", ""), "k": k, "precision": precision, "random_baseline": random_baseline}
+    return {"topic": row.get("topic", ""), "k": k, "precision": precision, "random_baseline": random_baseline,
+           "shown_order": row.get("shown_order") or "ranked"}
+
+
+def _summarise(rows: Sequence[dict]) -> dict:
+    """Rows, mean precision@k, mean random baseline and their margin for one group of ``_row_precision``
+    rows. Handles an empty group: every mean is None, never a division by zero."""
+    precisions = [r["precision"] for r in rows if r["precision"] is not None]
+    baselines = [r["random_baseline"] for r in rows if r["random_baseline"] is not None]
+    mean_p, mean_b = _mean(precisions), _mean(baselines)
+    return {"rows": len(rows), "mean_precision_at_k": mean_p, "mean_random_baseline": mean_b,
+           "margin": (mean_p - mean_b) if (mean_p is not None and mean_b is not None) else None}
 
 
 def precision_at_k(log_path: Optional[Path] = None) -> dict:
@@ -741,16 +768,21 @@ def precision_at_k(log_path: Optional[Path] = None) -> dict:
     fraction is the expected precision@k of a uniformly random ordering of the
     same ideas, for any k. Handles an empty or missing log: ``rows`` is 0 and
     every mean is None, never a division by zero.
+
+    ``by_shown_order`` breaks the same two numbers down by whether that round
+    was displayed in Jev's own rank or shuffled (``rank --shuffle``): the
+    combined figure above cannot tell Jev's ranking apart from the operator
+    favouring whatever is shown first, because every round used to be shown in
+    Jev's order. If the "shuffled" group's precision stays near its own
+    margin, picks are tracking Jev's rank; if it collapses toward its own
+    random baseline, picks were tracking screen position instead (GRIP#9471).
     """
     path = Path(log_path) if log_path is not None else _picks_log_path()
     rows = [_row_precision(json.loads(line)) for line in path.read_text(encoding="utf-8").splitlines()
            if line.strip()] if path.exists() else []
-    precisions = [r["precision"] for r in rows if r["precision"] is not None]
-    baselines = [r["random_baseline"] for r in rows if r["random_baseline"] is not None]
-    mean_p, mean_b = _mean(precisions), _mean(baselines)
-    return {"rows": len(rows), "mean_precision_at_k": mean_p, "mean_random_baseline": mean_b,
-           "margin": (mean_p - mean_b) if (mean_p is not None and mean_b is not None) else None,
-           "per_row": rows}
+    by_shown_order = {mode: _summarise([r for r in rows if r["shown_order"] == mode])
+                      for mode in ("ranked", "shuffled")}
+    return {**_summarise(rows), "per_row": rows, "by_shown_order": by_shown_order}
 
 
 # --------------------------------------------------------------------------
@@ -894,10 +926,22 @@ def _ideas_for(args: argparse.Namespace, cwd: str) -> Tuple[List[Idea], str, fro
                    f"council copies credited to a seed: {credited}"), seed_ids
 
 
-def _shown(ranked: Sequence[Ranked], top: int, seed_ids: frozenset) -> List[Ranked]:
+def _shown(ranked: Sequence[Ranked], top: int, seed_ids: frozenset, *, shuffle: bool = False,
+          rng: Optional[object] = None) -> List[Ranked]:
     """The first ``top`` ranked ideas, then every seed ranked below them: the operator's own
-    idea is always shown, whatever its rank."""
-    return list(ranked[:top]) + [r for r in ranked[top:] if r.scored.idea.id in seed_ids]
+    idea is always shown, whatever its rank.
+
+    ``shuffle`` randomises the DISPLAY order of that head alone (never the always-shown seed
+    tail, and never Jev's own rank, which ``ranked_ids`` keeps as the true order precision is
+    measured against) -- so a round can separate Jev's ranking from the operator's tendency to
+    pick whatever is shown first (GRIP#9471). ``rng`` defaults to the ``random`` module's own
+    default instance; a test injects an object with a ``shuffle`` method instead, for a
+    deterministic reorder."""
+    import random
+    head = list(ranked[:top])
+    if shuffle:
+        (rng or random).shuffle(head)
+    return head + [r for r in ranked[top:] if r.scored.idea.id in seed_ids]
 
 
 def _run_rank(args: argparse.Namespace) -> int:
@@ -910,16 +954,18 @@ def _run_rank(args: argparse.Namespace) -> int:
     weights, weights_source = operator_weights()
     ranked = combine(scored, weights)
     note = "; ".join(part for part in (note, _converge_note(scored)) if part)
-    run_id = record_shortlist(args.topic, ranked)
-    shown = _shown(ranked, args.top, seed_ids)
+    run_id = record_shortlist(args.topic, ranked, shuffled=args.shuffle)
+    shown_order = "shuffled" if args.shuffle else "ranked"
+    shown = _shown(ranked, args.top, seed_ids, shuffle=args.shuffle)
     if args.json:
         entries = [dict(_ranked_entry(r), seed=r.scored.idea.id in seed_ids) for r in shown]
         print(json.dumps({"note": note, "run_id": run_id, "weights": weights, "weights_source": weights_source,
-                         "ranked": entries}, indent=2))
+                         "shown_order": shown_order, "ranked": entries}, indent=2))
     else:
         _print_ranked(shown, weights, weights_source, note, seed_ids)
         if run_id:
-            print(f"run id {run_id} (when the operator has picked: "
+            tag = " (shown shuffled, to separate Jev's rank from position bias)" if args.shuffle else ""
+            print(f"run id {run_id}{tag} (when the operator has picked: "
                   f"python -m lib.ultraideate picks {run_id} <ids> --topic <the same topic>)")
     if args.seal:
         _print_seal_outcome(seal_ranking(args.topic, ranked, weights, weights_source))
@@ -936,6 +982,12 @@ def _run_report(args: argparse.Namespace) -> int:
     else:
         print(f"{report['rows']} picking session(s); mean precision@k = {report['mean_precision_at_k']:.2f}; "
              f"random baseline = {report['mean_random_baseline']:.2f}; margin = {report['margin']:.2f}")
+        for mode in ("ranked", "shuffled"):
+            group = report["by_shown_order"][mode]
+            if group["rows"]:
+                print(f"  shown {mode}: {group['rows']} session(s); precision@k = "
+                     f"{group['mean_precision_at_k']:.2f}; baseline = {group['mean_random_baseline']:.2f}; "
+                     f"margin = {group['margin']:.2f}")
     return 0
 
 
@@ -966,6 +1018,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                       help="how many ranked ideas to show (default 10), plus any seed ranked below them")
     rank.add_argument("--json", action="store_true")
     rank.add_argument("--seal", action="store_true", help="seal the full ranked set as a signed IDR leaf")
+    rank.add_argument("--shuffle", action="store_true",
+                      help=("show the --top ideas in random order instead of Jev's rank, and tag the "
+                            "shortlist (and, via picks, its pick) \"shown_order\": \"shuffled\" -- so "
+                            "report can separate Jev's ranking from the operator picking whatever is "
+                            "shown first (GRIP#9471); Jev's own rank is unchanged either way"))
 
     report = sub.add_parser("report", help="precision@k of Jev's ranking against operator picks")
     report.add_argument("--log-file", help="an alternate picks log (default: logs/ultraideate-picks.jsonl)")

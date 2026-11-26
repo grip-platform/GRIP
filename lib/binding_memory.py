@@ -41,6 +41,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import logging
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -94,6 +95,14 @@ class BindingError(ValueError):
 
 class PinnedBudgetExceeded(Exception):
     """The pinned set does not fit, and a named incumbent must give way."""
+
+
+#: Tolerated at BOTH read sites in ``pinned_records`` - the first pass
+#: (``binding_of`` on the record's own text) and the second (``is_pinned``,
+#: which also resolves the declared incident). A single shared constant so
+#: the two sites cannot drift the way stage two once drifted from stage one
+#: (GRIP#9647/#9648; the duplication this closes was GRIP#9744).
+_SKIP_EXCEPTIONS = (BindingError, OSError, UnicodeDecodeError)
 
 
 @dataclass(frozen=True)
@@ -298,14 +307,46 @@ def is_pinned(path: Path, *, root: Path | None = None, corpus=None) -> bool:
     return True
 
 
+def _skip_other_path(exc: Exception) -> Path | None:
+    """The file named by ``exc.filename``, decoded to a ``Path``, or None.
+
+    ``OSError.filename`` may be ``bytes`` rather than ``str``. ``os.fsdecode``
+    turns either into a string via the filesystem encoding without ever
+    raising on an undecodable byte (surrogateescape) — a ``TypeError`` from
+    some other, truly unexpected type still returns None rather than
+    escape, since that would abort the very scan ``_log_skip`` exists to
+    protect (GRIP#10102).
+    """
+    other = getattr(exc, "filename", None)
+    if other is None:
+        return None
+    try:
+        return Path(os.fsdecode(other))
+    except TypeError:
+        return None
+
+
 def _log_skip(path: Path, exc: Exception) -> None:
     """Leave a trace for a record ``pinned_records`` excludes.
 
     Names the file and the exception's CLASS only — never ``str(exc)``,
     which can echo back a malformed frontmatter value or a slice of body
-    text. A skip that leaves no trace is indistinguishable from a record
-    that never declared at all, which is the gap this closes.
+    text (GRIP#9648). ``is_pinned`` can also fail resolving the declared
+    incident, which names a DIFFERENT file (GRIP#9744) — identity is
+    decided on the FULL path, never the basename alone (a basename match
+    would conflate two distinct files in different directories, the
+    opposite misattribution, GRIP#10102); only the basename is ever
+    PRINTED, once they are confirmed different, since that value is as
+    author-controlled as a frontmatter string.
     """
+    other_path = _skip_other_path(exc)
+    if other_path is not None and other_path != path:
+        logger.warning(
+            "pinned_records: skipping %s (%s resolving its declared incident "
+            "against %s)",
+            path.name, type(exc).__name__, other_path.name,
+        )
+        return
     logger.warning("pinned_records: skipping %s (%s)", path.name, type(exc).__name__)
 
 
@@ -337,7 +378,7 @@ def pinned_records(memory_dir: Path, *, root: Path | None = None) -> list[str]:
         try:
             if binding_of(p.read_text(encoding="utf-8"), name=p.name):
                 declared.append(p)
-        except (BindingError, OSError, UnicodeDecodeError) as exc:
+        except _SKIP_EXCEPTIONS as exc:
             _log_skip(p, exc)
             continue
     if not declared:
@@ -348,7 +389,7 @@ def pinned_records(memory_dir: Path, *, root: Path | None = None) -> list[str]:
         try:
             if is_pinned(p, root=base, corpus=corpus):
                 pinned.append(p.stem)
-        except (BindingError, OSError, UnicodeDecodeError) as exc:
+        except _SKIP_EXCEPTIONS as exc:
             _log_skip(p, exc)
             continue
     return pinned
@@ -388,10 +429,23 @@ def check_pinned_budget(
         )
     sufficient = [e for e in candidates if e.cost() >= overflow]
     victim = sufficient[0] if sufficient else candidates[-1]
-    subject = newcomer or "this record"
+    if not newcomer:
+        # No pin is being attempted (e.g. the live-cap test calling with the
+        # existing entries only) -- say what is true: the block already is
+        # over cap, not that pinning "would" push it there (GRIP#9892).
+        # `not newcomer` (not `is None`) so an empty string degrades the same
+        # way it did before this change, instead of rendering an unfilled
+        # "To pin  you must first unpin" slot (GRIP#9892).
+        raise PinnedBudgetExceeded(
+            f"the pinned block is {total} chars, {overflow} over the "
+            f"{cap}-char cap; unpin {victim.record} (frees "
+            f"{victim.cost()} chars) or shorten an entry. The cap is not a "
+            "budget to widen: past it, pinning one more record protects "
+            "nothing, it only dilutes what pinning means."
+        )
     raise PinnedBudgetExceeded(
         f"the pinned block would be {total} chars, {overflow} over the "
-        f"{cap}-char cap. To pin {subject} you must first unpin "
+        f"{cap}-char cap. To pin {newcomer} you must first unpin "
         f"{victim.record} (frees {victim.cost()} chars). The cap is not a "
         "budget to widen: past it, pinning one more record protects nothing, "
         "it only dilutes what pinning means."

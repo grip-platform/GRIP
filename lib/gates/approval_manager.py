@@ -392,7 +392,7 @@ AFFIRMATIVE_ANSWER_MARKERS = (
 
 # Consent in the wild is rarely the word "yes". Measured over every
 # AskUserQuestion answer in this machine's transcripts
-# (~/.claude/projects/-Users-void--grip/*.jsonl): of the 12 answers to questions
+# (~/.claude/projects/-Users-you--grip/*.jsonl): of the 12 answers to questions
 # that request an approvable action, ZERO carried any marker above. They were
 # instructions — "Deploy now", "Push + deploy live now", "Discard it",
 # "Kill previews, keep production", "force push the rebase". The workflow was
@@ -473,7 +473,7 @@ def classify_answer(answer) -> str:
 
     `answer` is whatever the harness put in tool_response["answers"][question].
     Verified shape (transcript toolUseResult, e.g.
-    projects/-Users-void--grip/5d9e47a9-*.jsonl): a string carrying the label of
+    projects/-Users-you--grip/5d9e47a9-*.jsonl): a string carrying the label of
     the selected option, or — for multiSelect — the selected labels joined with
     ", ", or the operator's free text when they used the Other box.
 

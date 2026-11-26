@@ -49,7 +49,7 @@ executed successfully the next day with every task shipping;
 One line: how the next session should launch (e.g. `/frontier /ultrathink`),
 and the Pool-A/Pool-B routing note per `rules/pool-a-offload-routing.md` — route
 LLM-heavy councils/deliberation through Pool-B (`grip-sovereign-council`,
-`lib/broly_council.py`, `grip-council --roster open` — $0 weekly), keep the
+`lib/broly_council.py`, `grip-council --roster open` — no weekly-limit cost), keep the
 interactive REPL (Pool-A) for the deep synthesis + edits it structurally cannot
 offload. If the prior session hit a limit, say so and say what to do.
 

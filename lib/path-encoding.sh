@@ -3,23 +3,24 @@
 # Path Encoding Library (Unified)
 # Single source of truth for Claude Code's project path encoding
 #
-# FORMULA:
-#   - Replace all '/' with '-'
-#   - Replace all '.' with '-'
-#   - Replace all ' ' with '-'
-#   Example: ~/.claude -> -Users-foo--claude
+# FORMULA (the same set as lib/path_encoding.py, measured against the folders
+# Claude Code itself makes):
+#   - Replace every '/', '\', ':', '.' and ' ' with '-'
+#   Example: ~/.claude -> -Users-you--claude
 #
 # CROSS-PLATFORM:
-#   - macOS/Linux: ~/... -> -Users-name-...
+#   - macOS/Linux: ~/... -> -Users-you-...
 #   - Windows Git Bash: /c~ -> c--Users-...
+#   - Windows paths, such as a hook payload's cwd:
+#     C:\Users\<name>\.grip or C:/Users/<name>/.grip -> C--Users-<name>--grip
 #
 # USAGE:
 #   source ~/.claude/lib/path-encoding.sh
 #   encoded=$(encode_project_path "~/.claude")
 #   encoded=$(encode_current_path)
 #
-# VERSION: 1.0.0
-# DATE: 2025-12-18
+# VERSION: 1.1.0
+# DATE: 2026-11-26
 #
 
 # Guard against multiple sourcing
@@ -28,7 +29,7 @@ readonly _PATH_ENCODING_LOADED=1
 
 # Encode a filesystem path to Claude's project directory format
 # Cross-platform: macOS, Linux, Windows Git Bash
-# Input: ~/project -> -Users-name-project
+# Input: ~/project -> -Users-you-project
 encode_project_path() {
     local path="$1"
 
@@ -43,8 +44,11 @@ encode_project_path() {
             ;;
     esac
 
-    # Universal: Replace slashes, dots, spaces with dashes
-    echo "$path" | sed 's|/|-|g' | sed 's|\.|-|g' | sed 's| |-|g'
+    # Universal: the five characters lib/path_encoding.py collapses become
+    # dashes. Before GRIP#6821 '\' and ':' were kept, so a Windows path gave a
+    # name no folder has. printf, not echo: zsh's echo reads the '\U' of
+    # C:\Users as an escape.
+    printf '%s\n' "$path" | tr '/\\:. ' '-----'
 }
 
 # Encode current working directory

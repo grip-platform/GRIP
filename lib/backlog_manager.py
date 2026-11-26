@@ -47,8 +47,13 @@ BACKLOG_DIR = CLAUDE_DIR / "backlog"
 INBOX_DIR = BACKLOG_DIR / "inbox"
 PROCESSED_DIR = BACKLOG_DIR / "processed"
 ARCHIVED_DIR = BACKLOG_DIR / "archived"
+# Where a dropped .json file is kept once scan_inbox_folder finds it is not a
+# backlog item (GRIP#9812): the same folder scripts/backlog-scanner.py's own
+# inbox/dropped/ drop path keeps its files in (GRIP#9809), outside every
+# folder _iter_item_paths reads as *.json items.
+KEPT_DIR = BACKLOG_DIR / "kept-files"
 
-for d in (INBOX_DIR, PROCESSED_DIR, ARCHIVED_DIR):
+for d in (INBOX_DIR, PROCESSED_DIR, ARCHIVED_DIR, KEPT_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 # ── Item Schema ─────────────────────────────────────────────────────────────
@@ -160,6 +165,41 @@ def _extract_domain(url: str) -> str:
 
 # ── Item CRUD ───────────────────────────────────────────────────────────────
 
+def _claim_item_id(content: str) -> tuple[str, Path]:
+    """Mint a unique id for ``content`` and atomically claim its inbox file.
+
+    _generate_id's timestamp has 1-second resolution, so two creates of
+    identically-describable content within the same second -- two
+    same-named file drops, for instance -- can compute the same id.
+    Checking across every backlog directory first keeps the id globally
+    unique against an item long since moved to processed/ or archived/;
+    claiming the inbox/ file with O_CREAT | O_EXCL and retrying on the
+    next suffix when that loses the race closes the window a plain
+    check-then-write would leave open for two calls landing at the same
+    instant, not just one strictly after the other -- the same
+    claim-a-free-name discipline move_into() already uses for filenames
+    (Codex + AGORA speaker B on GRIP#10117).
+    """
+    item_id = base_id = _generate_id(content)
+    suffix = 1
+    dirs = _all_backlog_dirs()
+    while True:
+        # Every candidate, the retried ones included, is checked against every
+        # directory, so losing the race never mints an id already in processed/.
+        if any((directory / f"{item_id}.json").exists() for directory in dirs):
+            suffix += 1
+            item_id = f"{base_id}-{suffix}"
+            continue
+        path = INBOX_DIR / f"{item_id}.json"
+        try:
+            # 0o666 is what write_text gives, so the claim adds no exec bit.
+            os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
+            return item_id, path
+        except FileExistsError:
+            suffix += 1
+            item_id = f"{base_id}-{suffix}"
+
+
 def create_item(
     content: str,
     content_type: Optional[str] = None,
@@ -177,7 +217,7 @@ def create_item(
         print(f"  WARNING: Credential detected and redacted. Not stored in plaintext.",
               file=sys.stderr)
 
-    item_id = _generate_id(content)
+    item_id, path = _claim_item_id(content)
     urls = _extract_urls(content)
 
     item = {
@@ -203,9 +243,16 @@ def create_item(
         "metadata": metadata or {},
     }
 
-    # Save to inbox
-    path = INBOX_DIR / f"{item_id}.json"
-    path.write_text(json.dumps(item, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    # path is already claimed by _claim_item_id, so this only ever fills a
+    # NEW file, never silently overwrites one; clean up the empty claim on
+    # a write failure rather than leave it behind (same discipline
+    # move_into() uses for its own claim-then-replace).
+    try:
+        path.write_text(json.dumps(item, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except (OSError, TypeError, ValueError):  # json.dumps raises TypeError on unserialisable metadata
+        with contextlib.suppress(OSError):
+            path.unlink()
+        raise
 
     return item
 
@@ -662,6 +709,29 @@ def is_hidden(path: Path) -> bool:
     return bool(attributes & (stat.FILE_ATTRIBUTE_HIDDEN | stat.FILE_ATTRIBUTE_SYSTEM))
 
 
+# The three fields create_item() always writes, so a .json file carrying
+# every one of them is a genuine backlog item rather than something that was
+# merely dropped into inbox/ (GRIP#9812).
+_ITEM_FIELDS = {"id", "status", "created_at"}
+
+
+def _is_backlog_item(path: Path) -> bool:
+    """True when ``path`` holds the backlog item schema this module writes.
+
+    A parse failure, a value that is not a JSON object, or an object missing
+    any of ``_ITEM_FIELDS`` means ``path`` is not an item — it is a .json
+    document someone dropped into inbox/, such as a stray settings.json, and
+    scan_inbox_folder keeps it instead of leaving it there to be misread by
+    list_items() as a phantom item with none of the fields real code expects
+    (GRIP#9812).
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(data, dict) and _ITEM_FIELDS <= data.keys()
+
+
 def scan_inbox_folder() -> list[dict]:
     """Detect regular files dropped into the inbox folder and ingest them.
 
@@ -672,12 +742,14 @@ def scan_inbox_folder() -> list[dict]:
     reported on stderr and left for the next scan. A file whose item then cannot be saved,
     for example text create_item cannot encode in the locale's encoding, stays in
     processed/ and its location is reported, so it is not ingested again and the scan goes
-    on. Folders (such as the hourly scanner's inbox/dropped/), hidden files and JSON items
-    are skipped (GRIP#8776).
+    on. Folders (such as the hourly scanner's inbox/dropped/) and hidden files are skipped
+    (GRIP#8776). A .json file already holding the item schema is left alone as an existing
+    item; one that does not is kept in KEPT_DIR instead of processed/, so it is never
+    misread by list_items() as a phantom item (GRIP#9812).
     """
     new_items = []
     for path in INBOX_DIR.iterdir():
-        if path.suffix == ".json":
+        if path.suffix == ".json" and _is_backlog_item(path):
             continue  # Already a backlog item
         if is_hidden(path):
             continue  # A dot-file, or one Windows marks hidden or system
@@ -686,7 +758,8 @@ def scan_inbox_folder() -> list[dict]:
 
         try:
             content, content_type = _describe_dropped_file(path)
-            dest = _move_to_processed(path)
+            dest = (move_into(path, KEPT_DIR) if path.suffix == ".json"
+                    else _move_to_processed(path))
         except OSError as exc:
             print(f"  Skipped {path.name}: {exc.strerror or exc}. "
                   "A later scan retries it if it is still in the inbox.", file=sys.stderr)

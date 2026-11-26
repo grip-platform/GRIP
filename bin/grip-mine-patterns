@@ -72,8 +72,8 @@ def _memory_dir(root: Path) -> Path | None:
     distinct corpora. Both halves are load-bearing.
 
     The projects tree aliases heavily: on this machine 252 paths match
-    `projects/*/memory/MEMORY.md`, and `-Users-void--claude-overnight-workspace/memory` and
-    `-Users-void--grip/memory` are the SAME directory (inode 1483414, identical contents).
+    `projects/*/memory/MEMORY.md`, and `-Users-you--claude-overnight-workspace/memory` and
+    `-Users-you--grip/memory` are the SAME directory (inode 1483414, identical contents).
     So a naive `sorted(...)[0]` returns an alias of the right corpus by luck rather than by
     reason — and on a machine where those paths were distinct it would silently measure the
     wrong one and report a confident number about it, which is the exact failure the

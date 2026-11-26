@@ -32,7 +32,7 @@ A Markdown deliverable at `state/ultraread/<slug>-<timestamp>.md` with:
 
 | Flag | Description |
 |---|---|
-| `--models` | Comma-separated model list (default: deepseek/deepseek-v4-pro,xai/grok-4.6,gemini/gemini-3.1-pro-preview,qwen/qwen3.7-plus -- none Anthropic, none OpenAI). `opus`/`sonnet` are requestable by name but spend the weekly Claude limit. |
+| `--models` | Comma-separated model list (default: deepseek/deepseek-v4-pro,xai/grok-4.6,gemini/gemini-4-carbon,qwen/qwen3.7-plus -- none Anthropic, none OpenAI). `opus`/`sonnet` are requestable by name but spend the weekly Claude limit. |
 
 ## Full documentation
 

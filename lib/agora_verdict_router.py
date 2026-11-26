@@ -353,7 +353,7 @@ def route_action(verdict: str | None) -> str:
     return ACTION_WAIT
 
 
-def is_bootstrap_excepted(changed_paths: list[str]) -> bool:
+def is_bootstrap_excepted(changed_paths: list[str] | str) -> bool:
     """Return True if the PR modifies the convergence loop itself or its rules.
 
     Per rules/exogenous-anchor-law.md "Bootstrap exception (non-negotiable)":
@@ -363,7 +363,14 @@ def is_bootstrap_excepted(changed_paths: list[str]) -> bool:
 
     `changed_paths` is the list returned by
         gh api repos/<o>/<r>/pulls/<n>/files --jq '[.[].filename]'
+    A bare string is read as one path per line, the way
+        gh api repos/<o>/<r>/pulls/<n>/files --jq '.[].filename'
+    prints them; blank text counts as no paths, so it fails safe-closed.
     """
+    if isinstance(changed_paths, str):
+        # A string is iterable, so without this each character was tested as a
+        # path, nothing matched, and an excepted file read as not excepted.
+        changed_paths = [p.strip() for p in changed_paths.splitlines() if p.strip()]
     if not changed_paths:
         # Defensive: empty / missing file list — refuse to auto-merge.
         # A failed gh-api call should fail-safe-closed.

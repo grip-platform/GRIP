@@ -3,8 +3,9 @@
 
 When the active model is non-vision (deepseek-v4-pro), route image inference
 here instead of asking the operator which model to use. The standing decision
-is recorded in memory/grip-vision-model-routing.md (primary: gemini-3.1-pro-preview,
-fallback: gpt-5.5).
+was recorded in memory/grip-vision-model-routing.md (primary then:
+gemini-3.1-pro-preview, fallback: gpt-5.5). V>> moved the primary to
+gemini-4-carbon on 2026-11-26 (GRIP#10009), which supersedes that record.
 
 Usage:
   grip-vision <image> ["prompt"]        # describe the image
@@ -25,7 +26,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
-PRIMARY = "gemini-3.1-pro-preview"
+PRIMARY = "gemini-4-carbon"
 FALLBACK = "gpt-5.5"
 # HAL gateway, OpenAI-compatible surface (see lib/sovereign_council.py).
 GATEWAY = os.environ.get("GRIP_VISION_GATEWAY", "http://127.0.0.1:4010")

@@ -274,7 +274,7 @@ See **[Memory Architecture](docs/MEMORY-ARCHITECTURE.md)**.
 
 ### Vision model routing (grip-vision)
 
-When the active model is non-vision (e.g. `deepseek-v4-pro`), `bin/grip-vision` routes image inference to a HAL vision model instead of stalling or asking — primary `gemini-3.1-pro-preview`, fallback `gpt-5.5`. Routing is transparent to the caller: the image API surface is unchanged, only the backend model differs. The gateway defaults to the local HAL gateway (`GRIP_VISION_GATEWAY`, default `http://127.0.0.1:4010`), so image routing needs the HAL gateway running (`cd ~/.hal && python3 -m lib.hal.gateway --port 4010`); set `GRIP_VISION_GATEWAY` explicitly only to point at a non-default gateway.
+When the active model is non-vision (e.g. `deepseek-v4-pro`), `bin/grip-vision` routes image inference to a HAL vision model instead of stalling or asking — primary `gemini-4-carbon`, fallback `gpt-5.5`. Routing is transparent to the caller: the image API surface is unchanged, only the backend model differs. The gateway defaults to the local HAL gateway (`GRIP_VISION_GATEWAY`, default `http://127.0.0.1:4010`), so image routing needs the HAL gateway running (`cd ~/.hal && python3 -m lib.hal.gateway --port 4010`); set `GRIP_VISION_GATEWAY` explicitly only to point at a non-default gateway.
 
 ### Live Meeting Intelligence (grip-meet)
 

@@ -1,6 +1,6 @@
 ---
 name: ultrareason
-description: Answer a hard reasoning question grounded in the GRIP moat (what GRIP has verified + been contradicted on) via a cost-tiered escalation ladder on Pool-B ($0, off the weekly Anthropic limit) — a cheap single-expert pass first, escalating to the sovereign council only if a confidence criterion is unmet. Use for a genuine reasoning/decision question where GRIP's own verified knowledge should ground the answer and cost should scale with difficulty. NOT for external research (use research-council), code review (ultrajudge), or a generic iterate-until-done loop (converge).
+description: Answer a hard reasoning question grounded in the GRIP moat (what GRIP has verified + been contradicted on) via a cost-tiered escalation ladder on Pool-B (no cost, off the weekly Anthropic limit) — a cheap single-expert pass first, escalating to the sovereign council only if a confidence criterion is unmet. Use for a genuine reasoning/decision question where GRIP's own verified knowledge should ground the answer and cost should scale with difficulty. NOT for external research (use research-council), code review (ultrajudge), or a generic iterate-until-done loop (converge).
 disable-model-invocation: true
 ---
 
@@ -78,7 +78,7 @@ print(render_provenance_card(r))   # the delight surface of the provability moat
 The card is operator-facing; its moat-fact paths are internal — do not publish it
 on an external surface.
 
-## Sovereignty (Pool-B, $0)
+## Sovereignty (Pool-B, no cost)
 
 Both tiers run on **Pool-B** — HAL `grip_infer` (cheap) and
 `bin/grip-sovereign-council` (escalation), which are non-Anthropic and **off the

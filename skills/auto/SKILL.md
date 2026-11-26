@@ -98,10 +98,11 @@ git add <files>
 git commit -m "$(cat <<'EOF'
 type(scope): description
 
-Primary Author: V>>
+Primary Author: <operator signature>
 EOF
 )"
 ```
+Fill `<operator signature>` with what `bin/grip-operator-signature` prints.
 No emojis, no AI attribution, subject ≤ 72 chars. Hook failure: fix, retry
 once. Still failing: HALT and ask.
 
@@ -113,7 +114,7 @@ once. Still failing: HALT and ask.
 ```bash
 gh pr create --title "<type>(<scope>): <summary>" --body "..." --base main
 ```
-Body: bullet per batch, inferred test plan, `Primary Author: V>>`.
+Body: bullet per batch, inferred test plan, `Primary Author: <operator signature>`.
 Branch already has PR → skip creation, output existing URL.
 
 **Stage 6 — Merge**: when CI green (or no CI) and no conflicts:

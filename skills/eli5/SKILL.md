@@ -55,7 +55,7 @@ Every `/eli5` rewrite follows the same five rules. They are the whole skill.
 | "Hypothesis H091 registered with a falsification deadline of 2026-05-17." | "HAL wrote down what he thought would happen, and picked a day to check if he was right." |
 | "The council returned a RETHINK verdict on the design claim." | "HAL's team said 'wait, let's think about this more first.'" |
 | "Opus 4.7's 1M context window enables long-session memory." | "The newest version of Claude can remember a lot at once, so sessions don't forget things." |
-| "Prompt-cache-aware CCH subscription reuse saves ~\$0.011/turn." | "HAL can remember what he said last time, so he doesn't have to pay to explain it again." |
+| "Prompt-cache-aware CCH subscription reuse saves about 0.011 US dollars a turn." | "HAL can remember what he said last time, so he doesn't have to pay to explain it again." |
 
 ## The sibling relationship
 

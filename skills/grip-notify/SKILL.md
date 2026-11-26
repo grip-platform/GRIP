@@ -196,7 +196,7 @@ keep that path silent.
 
 - **Pushover / ntfy / custom APNs backends** — would give a branded
   "GRIP" identity on iPhone notifications instead of "Messages" or
-  "Slack", at the cost of requiring a $5 app install (Pushover) or
+  "Slack", at the cost of requiring a 5 US dollar app install (Pushover) or
   self-hosted infrastructure (ntfy).
 - **Per-notification routing rules** — "emergency → all backends",
   "info → only macos_local". Current implementation fans out to every

@@ -93,7 +93,7 @@ rg -i "search_term" "$LATEST" -C 3
 ### Path Encoding
 
 Forward slashes replaced with hyphens:
-- `~/project/` → `-Users-name-project`
+- `~/project/` → `-Users-you-project`
 
 ### Message Schema
 

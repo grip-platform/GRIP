@@ -345,7 +345,7 @@ _reject_path_inside_repo() {
 # the SessionStart rules injection was truncated:
 #
 #   [Hook additionalContext truncated at 10000 chars - persist-to-disk failed:
-#    tool-results path refused: .../-Users-void--grip-worktrees-... is a link
+#    tool-results path refused: .../-Users-you--grip-worktrees-... is a link
 #    or not a directory]
 #
 # The session then ran believing it held the extended rules when it held a

@@ -36,7 +36,7 @@ Comprehensive system cleanup automation for developer workstations. macOS-first 
 vm_stat | head -10
 
 # Top memory consumers (macOS)
-ps aux -m | head -20 | awk '{printf "%-6s %5s%% %s\n", $2, $4, $11}'
+ps aux -m | head -20 | awk '{printf "%-6s %5s%% %s\n", $(2), $(4), $(11)}'
 
 # Count node processes
 pgrep -fl "node" | wc -l

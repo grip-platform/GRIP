@@ -24,7 +24,7 @@ DIVERGE, CONVERGE, COMBINE -- in that order, with the operator deciding last.
 
 Backing module: `lib/ultraideate.py`. CLI: `~/.grip/venv/bin/python -m
 lib.ultraideate rank "<topic>" [--ideas-file FILE | --seeds-file FILE] [--top N]
-[--json] [--seal]`, `... picks <run_id> [ID ...] --topic "<topic>" [--k K] [--seal]`
+[--json] [--seal] [--shuffle]`, `... picks <run_id> [ID ...] --topic "<topic>" [--k K] [--seal]`
 to record (and seal) the operator's pick, and `... report [--log-file FILE] [--json]`
 for the measure.
 
@@ -173,6 +173,22 @@ lib.ultraideate report` reads `logs/ultraideate-picks.jsonl` and prints both
 numbers and their margin; empty log, it says so rather than dividing by zero.
 This is the measure a later `/dfi-fib` tuning loop over the criteria wording
 would use -- that loop itself is explicitly out of scope for this skill.
+
+### Position bias: shown order vs Jev's rank (GRIP#9471)
+
+Every round used to SHOW the top ideas in Jev's own order, so a precision
+above the random baseline could be Jev ranking well, or the operator
+favouring whatever sits first on screen -- the measure alone cannot tell
+them apart. `rank --shuffle` shows that same head in a random order instead
+(Jev's true rank, in `ranked_ids`, is unchanged; only the DISPLAY order is
+randomised, and the always-shown seed is never shuffled), and tags the round
+`shown_order: "shuffled"` in the shortlist row and, through `picks`, in the
+picks row too. `report` then splits precision@k into `by_shown_order.ranked`
+and `by_shown_order.shuffled`: if the shuffled group's precision stays near
+its own margin, picks track Jev's rank; if it collapses toward its own
+random baseline, picks were tracking screen position instead. Running that
+comparison is the operator's choice -- this fix makes it possible, not
+automatic, and changes no pre-registered hypothesis.
 
 ## Data limit
 

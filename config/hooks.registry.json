@@ -9,8 +9,8 @@
     "baseline_counts": {
       "production": {
         "events": 19,
-        "groups": 121,
-        "handlers": 150
+        "groups": 120,
+        "handlers": 149
       },
       "install": {
         "events": 13,
@@ -830,10 +830,11 @@
       "owner": "GRIP",
       "classification": "advisory",
       "failure_mode": "open",
-      "purpose": "DENY a git commit / gh pr create|edit|comment|close whose text claims a test count (\"12 passed\") that no test-runner summary line in the session transcript reports; WARN when the session holds no summary; GRIP_MEASURED_CLAIM_GATE=0 on the command overrides, logged. Fails open on its own errors, like guardrail-evasion-gate.py (rules/measured-claims-read-the-output-first.md).",
+      "purpose": "DENY a git commit / gh pr create|edit|comment|close whose text claims a test count (\"12 passed\") that no test-runner summary line in the session transcript reports; WARN when the session holds no summary; GRIP_MEASURED_CLAIM_GATE=0 on the command overrides, logged. Unless that check already denies: also DENY a git commit -F / gh pr or issue create|edit|comment --body-file whose named file still lacks the change of an Edit, Write or MultiEdit that failed in this turn (GRIP#9394); GRIP_STALE_POST_GATE=0 overrides, logged; this second DENY outranks the first check's own WARN. Fails open on its own errors, like guardrail-evasion-gate.py (rules/measured-claims-read-the-output-first.md).",
       "verification": [
         "tests/test_hooks_registry.py",
-        "tests/test_measured_claim_gate.py"
+        "tests/test_measured_claim_gate.py",
+        "tests/test_stale_post_gate.py"
       ],
       "status": "legacy-adapter",
       "legacy_hal_dispatch": false,
@@ -1240,20 +1241,6 @@
       "purpose": "Canonical policy for recall-toolresult-gate.py",
       "verification": [
         "tests/test_hooks_registry.py"
-      ],
-      "status": "legacy-adapter",
-      "legacy_hal_dispatch": false,
-      "legacy_classification_detail": {}
-    },
-    "policy.relay-context-firewall-py": {
-      "identity": "relay-context-firewall.py",
-      "owner": "GRIP",
-      "classification": "hard",
-      "failure_mode": "closed",
-      "purpose": "Canonical policy for relay-context-firewall.py",
-      "verification": [
-        "tests/test_hooks_registry.py",
-        "tests/test_relay_context_firewall.py"
       ],
       "status": "legacy-adapter",
       "legacy_hal_dispatch": false,
@@ -3886,35 +3873,6 @@
           ]
         },
         {
-          "id": "group.pretooluse.db90d9e0c28c0b21",
-          "group": {
-            "matcher": "mcp__grip-channel__channel_reply|mcp__grip-channel__channel_post_rich|mcp__grip-channel__channel_send_file|mcp__grip-channel__channel_react|mcp__slack__slack_post_message|mcp__slack__slack_reply_to_thread|mcp__claude_ai_Slack__slack_post_message|mcp__claude_ai_Slack__slack_reply_to_thread|mcp__grip-pair__slack_post_blocks|mcp__grip-pair__slack_upload_file"
-          },
-          "profile_order": {
-            "production": 18
-          },
-          "bindings": [
-            {
-              "id": "binding.pretooluse.d610e40884bc2787",
-              "policy_id": "policy.relay-context-firewall-py",
-              "profiles": [
-                "production"
-              ],
-              "profile_order": {
-                "production": 0
-              },
-              "disposition": "legacy-adapter",
-              "required": {},
-              "hook": {
-                "command": "bash \"${CLAUDE_DIR:-$HOME/.claude}/lib/grip-python.sh\" \"${CLAUDE_DIR:-$HOME/.claude}/hooks/relay-context-firewall.py\"",
-                "statusMessage": "Context firewall",
-                "timeout": 3,
-                "type": "command"
-              }
-            }
-          ]
-        },
-        {
           "id": "group.pretooluse.84da122109911ed1",
           "group": {
             "matcher": "Agent|Task"
@@ -4057,7 +4015,7 @@
               },
               "disposition": "legacy-adapter",
               "required": {
-                "description": "Denies a commit or PR command whose test count no run in the session reported (rules/measured-claims-read-the-output-first.md)"
+                "description": "Denies a commit or PR command whose test count no run in the session reported, or whose named file still lacks the change of an Edit/Write/MultiEdit refused in this turn (GRIP#9394; rules/measured-claims-read-the-output-first.md)"
               },
               "hook": {
                 "command": "bash \"${CLAUDE_DIR:-$HOME/.claude}/lib/grip-python.sh\" \"${CLAUDE_DIR:-$HOME/.claude}/hooks/measured-claim-gate.py\"",

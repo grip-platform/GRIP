@@ -89,7 +89,7 @@ overrides only when he disagrees.
 | `inline` | A | depth 0, the default |
 | `background` | A | hides latency, **not cost** |
 | `fleet` | A | Workflow tool — no pool switch exists on it |
-| `pool-b` | B | HAL grip_infer, ~$0 |
+| `pool-b` | B | HAL grip_infer, close to free |
 | `pool-c` | C | `bin/grip-codex`, ChatGPT subscription |
 | `pool-d` | D | Kimi Code subscription — **unarmed** until the keychain entry `grip-kimi-coding` exists; never offered before then |
 | `council` | B | synchronous, exogenous non-Anthropic judge |

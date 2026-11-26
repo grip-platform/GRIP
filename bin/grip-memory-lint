@@ -570,7 +570,7 @@ def default_memory_dir(root: Path) -> Path:
     """Derive the operator memory dir from the root's realpath slug.
 
     The harness encodes a cwd as path.replace('/', '-').replace('.', '-'), so
-    ~/.grip becomes -Users-x--grip. The root is resolved first because
+    ~/.grip becomes -Users-you--grip. The root is resolved first because
     ~/.claude is usually a symlink and the symlink's own slug names a different,
     near-empty directory.
     """

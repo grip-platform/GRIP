@@ -129,7 +129,7 @@ Update the `kono_types` list and `genome` flag to match the user's choices befor
 Show the Tailscale IP so peers can connect directly over the VPN:
 
 ```bash
-tailscale ip -4 2>/dev/null || ifconfig | grep '100\.' | awk '{print $2}'
+tailscale ip -4 2>/dev/null || ifconfig | grep '100\.' | awk '{print $(2)}'
 ```
 
 Peer connection URL will be: `http://<tailscale-ip>:3099`

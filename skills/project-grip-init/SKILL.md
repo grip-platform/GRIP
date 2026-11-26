@@ -95,7 +95,7 @@ Project not initialised for GRIP.
 Creating GRIP infrastructure:
   ✓ .claude/CLAUDE.md
   ✓ .claude/next_up.template.md
-  ✓ ~/.claude/projects/-Users-dev-projects-my-new-app/grip/
+  ✓ ~/.claude/projects/-Users-you-projects-my-new-app/grip/
 
 GRIP initialised for my-new-app.
 Session tracking enabled.

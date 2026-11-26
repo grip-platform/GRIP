@@ -271,7 +271,7 @@ def _query_llm(provider: str, selector_prompt: str) -> str:
         llm = GeminiProvider()
         if provider == "pro":
             model = _resolve_model(
-                "gemini/gemini-3.1-pro", "gemini-3.1-pro-preview")
+                "gemini/gemini-4-carbon", "gemini-4-carbon")
         else:
             model = _resolve_model(
                 "gemini/gemini-3.5-flash-lite", "gemini-3.5-flash-lite")

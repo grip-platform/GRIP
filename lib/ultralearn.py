@@ -117,7 +117,7 @@ def introspect() -> dict:
         "genome_genes": genome.get("gene_count"),
         "insights_milestone": (insights // 50) if insights is not None else None,
         "memory_generation": _memory_generation(
-            CLAUDE_DIR / "projects" / "-Users-void--grip" / "memory" / "MEMORY.md"
+            CLAUDE_DIR / "projects" / "-Users-you--grip" / "memory" / "MEMORY.md"
         ),
         # Claude Code's own /insights analysis of how sessions actually went (facet count in
         # tens + the most frequent friction types), coarse enough that the cache still hits

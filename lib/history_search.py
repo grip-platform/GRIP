@@ -25,7 +25,7 @@ def get_project_history_dir(project_path: str = None) -> Optional[Path]:
     if not project_path:
         project_path = os.getcwd()
 
-    # Encode path: ~/project -> -Users-name-project
+    # Encode path: ~/project -> -Users-you-project
     encoded = project_path.replace("/", "-").replace(".", "-")
     if encoded.startswith("-"):
         encoded = encoded  # Keep leading dash

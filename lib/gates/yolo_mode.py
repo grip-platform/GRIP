@@ -188,11 +188,21 @@ YOLO_L1_BYPASS = frozenset({
 # important safety invariant.
 YOLO_L2_BYPASS = YOLO_L1_BYPASS  # intentionally identical
 
-# Quality-off preset: yolo_l1 PLUS the JIT correct-by-construction gates
-# (quality-pretool covers DRY/KISS/BIG-O/YAGNI/ISP, cc-gate covers
+# Quality-only preset: ONLY the two JIT correct-by-construction checks
+# (quality-pretool covers DRY/KISS/BIG-O/YAGNI/ISP; the other covers
 # cyclomatic complexity). Opt-in only — default activators (/ultrado,
 # /rsi-optimal, /sneak, autonomous-rsi-sprint) stay on yolo_l1 so RSI
 # loops retain their auto-optimisation feedback.
+#
+# GRIP#9697 (2026-11-26, V>>'s decision D): this preset is now a
+# narrower ALTERNATIVE to the default one, never a superset of it.
+# Before this change, activating it under the --quality flag also
+# silently relaxed push-to-main, hard reset, and the other halting
+# checks the default preset covers -- every quality window was as wide
+# as the default one, and neither the help text (bin/grip-yolo) nor the
+# docs (rules/efficiency-rules.md, docs/SAFETY-GATES.md) said so. A
+# session wanting both kinds of relief now activates the default preset
+# instead (one marker holds one preset per session).
 #
 # Trade-off: enabling this preset lets unrelated quality violations
 # anywhere in the touched file ship without correction. Reach for it
@@ -200,13 +210,25 @@ YOLO_L2_BYPASS = YOLO_L1_BYPASS  # intentionally identical
 # in a long-standing models.py that already trips KISS on an unrelated
 # 80-line method, or applying a vendor patch you can't refactor. Force
 # push is still NEVER bypassed.
-YOLO_QUALITY_BYPASS = YOLO_L1_BYPASS | frozenset({
+YOLO_QUALITY_BYPASS = frozenset({
     "quality-pretool",   # DRY/KISS/BIG-O/YAGNI/ISP deny tier
     "cc-gate",           # cyclomatic complexity deny tier
 })
 
 # Named preset -> bypass set lookup. Activators choose the preset by name
 # so future presets (yolo_docs, yolo_tests, yolo_sandbox) are additive.
+#
+# GRIP#9697: two other checks have their own ids too -- the channel-scope
+# one (lib/channel_scope_gate.py) and the repo-protection one
+# (lib/grip_hal_repo_protection.py) -- but those ids are DELIBERATELY
+# absent from every preset below. Before this change both libraries asked
+# only "is ANY preset active?" (ignoring which one), so turning this on
+# for any reason -- including --quality -- silently relaxed them too.
+# Both now ask specifically for their own id, so turning any preset here
+# on leaves them fully enforced; only a preset that NAMES one of those
+# ids on purpose would relax it, and none does today. The channel-scope
+# and repo-protection tests each pin this as a structural anchor, the
+# same way the main secrets check pins itself absent from every preset.
 _PRESETS = {
     "yolo_l1": YOLO_L1_BYPASS,
     "yolo_l2": YOLO_L2_BYPASS,

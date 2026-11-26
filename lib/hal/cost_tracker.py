@@ -211,6 +211,12 @@ _PRICING: dict[str, tuple[float, float, float, float]] = {
     # neither page lists a prompt-length tier.
     "gemini-4-carbon":       (2.00,  10.00, 0.10,  2.00),
     "gemini-4-hydrogen":     (1.50,  7.50,  0.075, 1.50),
+    # Gemini 4 Neon -- ai.google.dev/gemini-api/docs/pricing, read 2026-11-26
+    # (paid/Standard tier): "$3.00" in, "$15.00" out (thinking included), "$0.15"
+    # cached, with no dated change and no prompt-length tier, so no schedule row.
+    # Not on the Free tier; implicit caching only, so cache_write carries the
+    # input rate like the rows above.
+    "gemini-4-neon":         (3.00,  15.00, 0.15,  3.00),
     # DeepSeek -- api-docs.deepseek.com/quick_start/pricing, read live
     # 2026-10-01. These are PEAK rates, so an upper bound: off-peak is half, and
     # peak is 01:00-04:00 and 06:00-10:00 UTC on weekdays. "Use deepseek-flash as
@@ -708,6 +714,21 @@ def _priced_key(model: str) -> str | None:
     if model in _PRICING:
         return model
     return max((k for k in _PRICING if _inherits_row(model, k)), key=len, default=None)
+
+
+def list_price(model: str) -> tuple[float, float] | None:
+    """The published (input, output) USD price per million tokens a pricing row gives ``model``, or None.
+
+    Unlike calculate_cost, which bills an unpriced model at the local rate or a
+    default tier, this answers None when no row prices the id (a provider-qualified
+    address resolves as in _pricing_key), so a caller that must bound spend before
+    the call -- /connect's dictated seats -- refuses instead of guessing.
+    """
+    key = _pricing_key(model)
+    if key is None:
+        return None
+    rates = _scheduled(key, _PRICING[key])
+    return rates[0], rates[1]
 
 
 def _request_rates(model: str, prompt_tokens: int) -> tuple[float, float, float, float]:

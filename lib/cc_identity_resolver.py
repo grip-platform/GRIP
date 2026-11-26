@@ -55,6 +55,30 @@ def _read_env_var(candidates: list[str]) -> str | None:
     return None
 
 
+# A fully quoted value first, so a "#" inside quotes survives; then a bare or
+# loosely quoted value. Either may carry a trailing "# comment", as every line of
+# facts/identity.md.template does (GRIP#10006: the old pattern rejected them all).
+# As in YAML, "#" starts a comment only after whitespace, so `tag: a#b` keeps "a#b".
+_QUOTED_FIELD = re.compile(r'^(\w+):\s*"([^"]*)"(?:\s+#.*)?\s*$')
+_LOOSE_FIELD = re.compile(r'^(\w+):\s*"?([^"]*?)"?(?:\s+#.*)?\s*$')
+
+
+def _field(line: str) -> tuple[str, str] | None:
+    """``(key, value)`` for a ``key: value`` line, or None when the line is not one.
+
+    As in YAML, an unquoted value that starts with "#" is a comment, so
+    `signature:   # Your command prefix (optional)` is empty, never that text.
+    """
+    quoted = _QUOTED_FIELD.match(line)
+    if quoted:
+        return quoted.group(1), quoted.group(2).strip()
+    loose = _LOOSE_FIELD.match(line)
+    if not loose:
+        return None
+    value = loose.group(2).strip()
+    return loose.group(1), "" if value.startswith("#") else value
+
+
 def _parse_identity_file(path: Path | None = None) -> dict:
     """Parse facts/identity.md for manual identity configuration.
 
@@ -80,12 +104,9 @@ def _parse_identity_file(path: Path | None = None) -> dict:
         if stripped == "```" and in_yaml:
             break
         if in_yaml:
-            match = re.match(r'^(\w+):\s*"?([^"]*)"?\s*$', stripped)
-            if match:
-                key = match.group(1)
-                value = match.group(2).strip()
-                if value:
-                    result[key] = value
+            field = _field(stripped)
+            if field and field[1]:
+                result[field[0]] = field[1]
 
     return result
 

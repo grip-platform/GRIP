@@ -5,7 +5,7 @@ status: Active
 effort: medium
 version: 1.0.0
 created: 2026-10-02
-updated: 2026-10-02
+updated: 2026-11-26
 user_invocable: true
 command: fleet-inspection
 triggers:
@@ -15,9 +15,11 @@ triggers:
 integrates:
   - ultraprompt
   - prove-it
+  - mesh
 see_also:
   - converge-fleet
   - grip-fleet-quit
+  - mesh
 ---
 
 # Fleet inspection
@@ -43,10 +45,30 @@ expert lanes inside one converge loop.
    `<GRIP>/tmp/fleet-landing/<run>/`, renders the landing prompt for it from
    `config/fleet-landing-prompt.md` and copies it to the clipboard. N is how many sessions
    are running. A note is a fact every session should read before landing.
-2. **The operator pastes it into every session.** Each session lands its own work through
-   a worktree and a PR, never by writing in the shared tree, then writes ONE record with
-   six fixed headings (who, landed, work this session, unfinished, needs V>>, left
-   uncommitted). The headings are what the parser reads, so the template pins them.
+2. **Deliver the landing prompt over the mesh** (`skills/mesh/SKILL.md`, "Inform all
+   sessions: queue, wake, report") instead of asking the operator to paste it into every
+   session by hand.
+
+   1. Queue it with grip-presence's `session_broadcast` (`from_name` your harness,
+      `body` the prompt, `kind: "broadcast"`, `from_id` your own session id so you are
+      left out).
+
+   2. Wake every local peer. Call `ListAgents`, then send one `SendMessage` per peer: a
+      self-contained first line, the operator's request quoted, the prompt verbatim, and
+      `notify_when_idle: true`.
+
+   3. Report per session: sent, held for approval, refused, or unreachable. Name any peer
+      shown as `waiting` -- it may need the operator to answer an open prompt first.
+
+   Hand-pasting stays the fallback for a session the mesh cannot reach: another harness,
+   another machine, or a session absent from `ListAgents`. A session reported held or
+   refused is the operator's own call, not an automatic paste that runs past why it held
+   or declined.
+
+   Each session lands its own work through a worktree and a PR, never by writing in the
+   shared tree, then writes ONE record with six fixed headings (who, landed, work this
+   session, unfinished, needs V>>, left uncommitted). The headings are what the parser
+   reads, so the template pins them.
 3. **Wait.** `grip-fleet wait` (in the background) prints each record as it arrives and
    exits 0 when all N are in, or 3 at the timeout.
 4. **Read every record, then write `summary.json` in the run folder.** This is the judged

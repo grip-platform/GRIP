@@ -4,7 +4,7 @@ description: "Runs a whole brainstorm in one command, with the operator deciding
 user_invocable: true
 command: brainstorm
 status: Active
-version: 1.0.0
+version: 1.1.0
 created: 2026-11-24
 triggers:
   - /brainstorm
@@ -159,10 +159,10 @@ Climb the ladder in `rules/reasoning-lenses.md` for each pick, and stop at the f
 
 1. Write the load-bearing claim of the pick and the observation that would kill it. Register the claim with `lib.hypothesis_engine.register`, and start the claim with `[brainstorm <run_id>]`. The engine needs a metric, a prediction, a deadline and a measure plan. Write the prediction as a comparison on the metric, such as `>= 0.5` for a share of KEEP votes. `register` warns about free text, which the engine grades "inconclusive" (H1009 to H1020), so put the fact check in the kill clause. This is step 2 of the ladder, done first, so that a pick killed by the first count still leaves a record.
 2. Run the cheap steps for every pick. They are a count against a control, the naive prior, and the analogy check when an analogy carries weight.
-3. Send four picks at most to the red team, the best-ranked survivors first. Outside seats attack them through `bin/grip-sovereign-council`, which has no Anthropic seat, and an outside judge seals the result. Four matches the cap of `.claude/workflows/attack-fanout.js`, which attacks four claims with three lenses each. Mark each other pick "not red-teamed".
-4. Propose `.claude/workflows/attack-fanout.js` for a claim that gates an irreversible call. Launch it only when the operator asks for it or agrees, because it spends Claude agents. Arm `bin/grip-fleet-watch` when you launch it.
+3. Send every pick that step 2 did not kill to the red team, in one framed prompt. Outside seats attack them through `bin/grip-sovereign-council`, which has no Anthropic seat and spends nothing from the weekly limit. An outside judge seals the result. Each seat gives one objection, a KEEP or KILL for every pick, and its best combination of at most three. Tally the KEEP votes per pick, next to the fate from step 2, and say how many seats voted. A seat can run out of budget on a long prompt and give no verdict, so the tally never stands for every seat.
+4. Propose `.claude/workflows/attack-fanout.js` for a claim that gates an irreversible call. It still caps at four claims, with three lenses each. Launch it only when the operator asks for it or agrees, because it spends Claude agents. Arm `bin/grip-fleet-watch` when you launch it.
 
-Each pick ends with one fate: KILLED, SURVIVED SO FAR or UNTESTABLE, with "not red-teamed" added when the cap stopped it. Show the fates through `/simple`, with the evidence for each kill. SURVIVED SO FAR is not proof.
+Each pick ends with one fate: KILLED, SURVIVED SO FAR or UNTESTABLE. Show the fates through `/simple`, with the evidence for each kill and the seat tally from step 3. SURVIVED SO FAR is not proof.
 
 ## 6. DECIDE
 
@@ -184,7 +184,7 @@ Every result that the operator reads goes through the `simple` preset of `/clari
 ## Budget and stop conditions
 
 - DIVERGE and CONVERGE run on outside models, so they spend nothing from the Claude weekly limit. A Broly CLUSTER fan-out, the Deep workflow of brainstorm-mode, runs only when the operator asks for it.
-- ATTACK sends four picks at most to the red team, and `attack-fanout.js` runs only as step 4 of ATTACK says.
+- ATTACK sends every surviving pick to the council, because `bin/grip-sovereign-council` also spends nothing from the Claude weekly limit. `attack-fanout.js` still caps at four claims, and it runs only as step 4 of ATTACK says.
 - Nothing reruns or loops on its own. Each rerun of phase 2 needs the operator's word.
 
 ## Honest limits
@@ -219,10 +219,11 @@ V>> asked for it on 2026-11-24, in these words:
 /create `/brainstorm` that is a one-shot command that uses the full workflow of /brainstorm-mode and /brainstorm-mode-orchestration -- from the Divergent -> X -> Y -> Convergent ideation, which can maybe be combined with /hitl and /ultraideate and /hitl-decision-matrix and /simple to be the be-all-and-end-all BRAINSTORM command
 ```
 
-His X and Y name the phases that he left unnamed: CLUSTER, and the pick and ATTACK steps of the full loop in brainstorm-mode. This command codifies two runs done by hand: run 9b6d07fc8c41 on 2026-11-11 and run b58e370627d1 on 2026-11-24. The rules for coverage, duplicates and an everything-picked answer come from the second run. The Codex review of GRIP#9364 added the one id for each option, the sealed pick and the closed shortlist before a rerun. Claude Opus 5.5 (`claude-opus-5-5`) wrote this file.
+His X and Y name the phases that he left unnamed: CLUSTER, and the pick and ATTACK steps of the full loop in brainstorm-mode. This command codifies two runs done by hand: run 9b6d07fc8c41 on 2026-11-11 and run b58e370627d1 on 2026-11-24. The rules for coverage, duplicates and an everything-picked answer come from the second run. The Codex review of GRIP#9364 added the one id for each option, the sealed pick and the closed shortlist before a rerun. GRIP#9525 removed the council's four-pick cap and added the seat tally. Claude Opus 5.5 (`claude-opus-5-5`) wrote this file.
 
 ## Changelog
 
 | Version | Date | Changes |
 |---|---|---|
 | 1.0.0 | 2026-11-24 | First version: the seven phases, the 16-option pick list, the sealed picks record with one id for each option, the capped ATTACK and the falsifier |
+| 1.1.0 | 2026-11-26 | ATTACK's council step sends every surviving pick, with a KEEP tally and a seat count, and `attack-fanout.js` keeps its own four-claim cap (GRIP#9525) |

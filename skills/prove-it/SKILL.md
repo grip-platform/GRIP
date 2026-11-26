@@ -94,8 +94,8 @@ needs). The artifact embeds this as `<script id="provenance">`.
 (standard mode: Gemini 2.5 Flash, Groq Llama-3.3-70B, Qwen3-32B,
 Llama-4 Scout, Anthropic Haiku; `proof` mode also adds DeepSeek R1) asking
 "does the quote SUPPORT the claim?", takes a MoE majority (ties break toward
-caution), and synthesises through a judge ladder (Gemini 3.1 Pro → Anthropic →
-Groq → MoE majority). Two invariants: **monotonicity** — L2 only annotates
+caution), and synthesises through a judge ladder (Gemini 4 Carbon → Groq → MoE
+majority). Two invariants: **monotonicity** — L2 only annotates
 citations L1 already located, so a `not_found` quote can never earn a support
 badge — and **fail-open** — provider/judge/network failure degrades to majority
 or "unavailable"; L1 always still renders. The artifact gains a "Citation

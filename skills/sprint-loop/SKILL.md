@@ -89,9 +89,9 @@ cross-machine signal and is advisory, not a lock.
 ## Review Lifecycle (Cost Cascade)
 
 ```text
-1. LOCAL MoE ($0)      Llama 3.2 3B, 5 experts, generalist scoring
-2. PR + CI ($0)        GitHub Actions pre-review (analyze-pr.py)
-3. RALPH ($0.02-0.05)  Anthropic Claude LLM-as-Judge, authoritative
+1. LOCAL MoE (free)    Llama 3.2 3B, 5 experts, generalist scoring
+2. PR + CI (free)      GitHub Actions pre-review (analyze-pr.py)
+3. RALPH (2-5 cents)   Anthropic Claude LLM-as-Judge, authoritative
 4. AUTO-FIX (local)    Parse Ralph feedback, fix, re-score locally
 5. RE-SUBMIT           Push fixes, re-trigger Ralph (max 3 attempts)
 6. MERGE or ESCALATE   >= 80: squash merge. 3 failures: human tag

@@ -21,7 +21,10 @@ from pathlib import Path
 from typing import Optional
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR", Path.home() / ".claude"))
-sys.path.insert(0, str(CLAUDE_DIR / "lib"))
+_LIB = str(Path(__file__).resolve().parent)
+if _LIB in sys.path:  # own lib (GRIP#9857); always first, not merely present --
+    sys.path.remove(_LIB)  # a stale shared-tree lib may already lead it (Codex, GRIP#10125)
+sys.path.insert(0, _LIB)
 
 
 def pr_review_diff_budget() -> int:

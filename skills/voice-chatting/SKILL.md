@@ -133,9 +133,9 @@ Each switch changes the voice profile for subsequent responses without ending ch
 
 ## Cost Profile
 
-Uses Google AI Studio **free tier** via `grip-gemini` keychain entry; Google's pricing page, read 2026-11-24, lists `gemini-3.8-flash-tts` as free of charge on that tier. For personal conversation volume (10-100 turns/day), effectively $0. The rate limits recorded here (~10-15 RPM, 1,500 requests/day) were for the retired 2.5 preview model and have not been re-checked for 3.8.
+Uses Google AI Studio **free tier** via `grip-gemini` keychain entry; Google's pricing page, read 2026-11-24, lists `gemini-3.8-flash-tts` as free of charge on that tier. For personal conversation volume (10-100 turns/day), effectively free. The rate limits recorded here (~10-15 RPM, 1,500 requests/day) were for the retired 2.5 preview model and have not been re-checked for 3.8.
 
-If billing is ever enabled, Google's pricing page (read 2026-11-24) puts `gemini-3.8-flash-tts` on the paid Standard tier at $0.50 per million text tokens in and $9.00 per million audio tokens out through 31 December 2026, doubling to $1.00 / $18.00 from 1 January 2027. The free tier itself stays free of charge either side of that date.
+If billing is ever enabled, Google's pricing page (read 2026-11-24) puts `gemini-3.8-flash-tts` on the paid Standard tier at 0.50 US dollars per million text tokens in and 9.00 per million audio tokens out through 31 December 2026, doubling to 1.00 and 18.00 US dollars per million from 1 January 2027. The free tier itself stays free of charge either side of that date.
 
 True billing visibility: `aistudio.google.com` → API keys → billing. Enable billing only if you hit free tier limits at scale.
 

@@ -30,17 +30,20 @@ if str(_LIB) not in sys.path:
     sys.path.insert(0, str(_LIB))
 from claude_dir import get_claude_dir  # noqa: E402
 
-# Imported from _LIB, BEFORE CLAUDE_DIR/lib goes on the path below, so a
+# Imported from _LIB, which is inserted again (idempotently) below, so a
 # checkout always partitions with its own copy rather than the shared tree's
-# (rules/shared-tree-is-not-canonical.md). Deliberately not guarded by
-# try/except: a memory writer that has silently lost its pin-protection must
-# fail loudly, not quietly resume evicting binding records.
+# (rules/shared-tree-is-not-canonical.md; GRIP#9857 pass 4 — the insert below
+# used to be CLAUDE_DIR's, which this comment named before the fix).
+# Deliberately not guarded by try/except: a memory writer that has silently
+# lost its pin-protection must fail loudly, not quietly resume evicting
+# binding records.
 from binding_memory import partition_pinned  # noqa: E402
 
 CLAUDE_DIR = get_claude_dir()
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 
-sys.path.insert(0, str(CLAUDE_DIR / "lib"))
+if str(_LIB) not in sys.path:  # own lib (GRIP#9857), not CLAUDE_DIR's
+    sys.path.insert(0, str(_LIB))
 from path_encoding import encode_project_path  # noqa: E402
 from memory_lock import locked_write  # noqa: E402
 import next_step_block  # noqa: E402

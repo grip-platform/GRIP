@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR", str(Path.home() / ".claude")))
-sys.path.insert(0, str(CLAUDE_DIR / "lib"))
+if str(Path(__file__).resolve().parent) not in sys.path:  # own lib (GRIP#9857)
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 logger = logging.getLogger(__name__)
 

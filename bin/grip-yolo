@@ -20,6 +20,18 @@
 # enforcement: violations introduced by the edit STILL deny, but pre-existing
 # violations in the touched file pass through with an audit advisory.
 #
+# GRIP#9697 (2026-11-26): --quality is a narrower ALTERNATIVE to the
+# default preset above, never a superset of it. Before this change it
+# also silently carried every check in that list (push-to-main, hard
+# reset, and the rest) -- a quality-only window was as wide as the
+# default one. One marker holds one preset per session, so choose
+# --quality for the quality relief alone, or omit it for the default
+# preset's halting-check relief; the two are alternatives.
+#
+# The channel-scope-isolation and repo-protection checks are never lifted
+# by any preset above, or by --quality -- neither carries their ids by
+# default, so arming yolo here does not relax either one.
+#
 # Force push NEVER passes yolo — rewriting remote history still needs
 # GRIP_AUTONOMOUS L2 or manual approval. Secrets detection is never passed
 # by yolo OR by GRIP_AUTONOMOUS at any level: there is no route that stages
@@ -155,12 +167,20 @@ Usage:
   grip-yolo status
   grip-yolo log
 
-  --quality   Differential quality enforcement. PRE-EXISTING DRY/KISS/BIG-O/
-              YAGNI/ISP and CC errors in a file stop blocking edits to it;
-              errors this edit INTRODUCES still deny, always. Reach for it when
-              unrelated debt in a file refuses the very edit that would fix it.
+  --quality   Narrower ALTERNATIVE to the default preset, never a superset
+              of it (GRIP#9697, 2026-11-26). Lifts ONLY the two code-quality
+              checks: PRE-EXISTING DRY/KISS/BIG-O/YAGNI/ISP and CC errors in
+              a file stop blocking edits to it; errors this edit INTRODUCES
+              still deny, always. It does NOT also lift push-to-main, hard
+              reset, or the other default-preset checks -- one marker holds
+              one preset per session, so pick this for quality relief alone,
+              or omit it for the default preset's halting-check relief.
+              Reach for it when unrelated debt in a file refuses the very
+              edit that would fix it.
               e.g. grip-yolo on --reason "land hotfix in legacy file" --quality
 
+Channel-scope-isolation and repo-protection checks are never lifted by any
+preset -- neither carries their ids by default.
 Force push is NEVER bypassed. Use GRIP_AUTONOMOUS L2 for that.
 See plans/yolo-mode-unified-autonomous.md for the full gate matrix.
 HELP

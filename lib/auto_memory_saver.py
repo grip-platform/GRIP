@@ -131,7 +131,7 @@ def _derive_project_path(transcript_path: str) -> str:
     """
     try:
         tp = Path(transcript_path)
-        # Parent is the project dir (e.g. -Users-foo--claude)
+        # Parent is the project dir (e.g. -Users-you--claude)
         project_dir = tp.parent.name
         return project_dir
     except Exception:

@@ -67,14 +67,14 @@ function Get-WindowsBuild {
     return [System.Environment]::OSVersion.Version.Build
 }
 
-# Test-PythonOk: true when the command runs Python 3.11 or newer, and on Windows for Arm
-# only when it is the x64 build. The Microsoft Store alias (WindowsApps\python.exe) prints
-# a message and fails, so it never passes.
+# Test-PythonOk: true when the command runs Python 3.11 or newer and is the x64 build.
+# GRIP's core packages have no 32-bit wheels any more than they have Windows-Arm ones
+# (the reason Test-WindowsOnArm gives), so this is checked everywhere, not only on
+# Windows for Arm: off Arm, a 32-bit install used to sail past a version-only check
+# (GRIP#9885). The Microsoft Store alias (WindowsApps\python.exe) prints a message
+# and fails, so it never passes.
 function Test-PythonOk([string]$Exe, [string[]]$Prefix) {
-    $check = 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'
-    if (Test-WindowsOnArm) {
-        $check = "import sys, sysconfig; sys.exit(0 if sys.version_info >= (3, 11) and sysconfig.get_platform() == 'win-amd64' else 1)"
-    }
+    $check = "import sys, sysconfig; sys.exit(0 if sys.version_info >= (3, 11) and sysconfig.get_platform() == 'win-amd64' else 1)"
     try {
         & $Exe @Prefix -c $check 2>$null | Out-Null
         return ($LASTEXITCODE -eq 0)
@@ -165,14 +165,21 @@ function Install-WithWinget([string]$Id, [string[]]$Extra = @()) {
     return ($LASTEXITCODE -eq 0)
 }
 
-# Get-WingetExtra: extra winget arguments for one package. On Windows for Arm, Python is
-# the x64 build, for the reason Test-WindowsOnArm gives. --force is needed because winget
-# treats a second build of an installed Python as an upgrade and installs nothing
-# (measured in a Windows 11 Arm VM on 2026-11-25: "No available upgrade found", exit
-# -1978335189). With --force, it installs beside the other build.
+# Get-WingetExtra: extra winget arguments for one package. Python is always the x64
+# build -- off Arm because GRIP's core packages have no 32-bit wheels (Test-PythonOk's
+# reason), on Arm because they have no Windows-Arm wheels either (Test-WindowsOnArm's
+# reason) -- so this forces x64 for Python on every host, not only on Arm (Codex on
+# GRIP#10108; the installer-repair step had stayed Arm-only after the version check
+# became universal). --force is needed because winget treats a second build of an
+# installed Python as an upgrade and installs nothing (measured in a Windows 11 Arm VM
+# on 2026-11-25: "No available upgrade found", exit -1978335189; the same happens off
+# Arm when the existing build is 32-bit). With --force, it installs beside the other
+# build.
 function Get-WingetExtra([string]$Id) {
-    if ($Id -like 'Python.*' -and (Test-WindowsOnArm)) {
-        Write-Host "Windows on Arm: this installs the x64 Python, which Windows runs under emulation, because GRIP's core packages have no Windows-Arm wheels."
+    if ($Id -like 'Python.*') {
+        if (Test-WindowsOnArm) {
+            Write-Host "Windows on Arm: this installs the x64 Python, which Windows runs under emulation, because GRIP's core packages have no Windows-Arm wheels."
+        }
         return ,@('--architecture', 'x64', '--force')
     }
     return ,@()

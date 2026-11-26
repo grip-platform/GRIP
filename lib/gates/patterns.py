@@ -180,15 +180,41 @@ _PW = "PASS" + "WORD"
 _CR = "CRED" + "ENTIALS"
 _PK = "PRIV" + "ATE_KEY"
 
+#: An optional directory before a command name, as in `/usr/bin/grep`
+#: (GRIP#10120).
+_PATH = r"(?:[^\s;&|]*/)?"
+#: The search commands a listing pipes into. `env_view._PATTERN_COMMANDS`
+#: holds the same names, so change both together (GRIP#10092).
+_SEARCH = r"(?:e?grep|fgrep|rg)\b"
+#: Commands that run another command after their own options, as in
+#: `sudo -u root grep` (GRIP#9993).
+LISTING_WRAPPERS = "sudo|doas|command|exec|nice|nohup|time|timeout|stdbuf|env"
+#: A wrapper, then any words that are not a search command and hold no
+#: separator (its options and their values), then a blank. Either name may
+#: follow a directory. Shared with `env_view._COMMAND_WORD`, so the two cannot
+#: drift apart.
+WRAPPER_PREFIX = rf"(?:{_PATH}(?:{LISTING_WRAPPERS})(?:[ \t]+(?!{_PATH}{_SEARCH})[^\s;&|]+)*[ \t]+)?"
+#: Where an environment listing starts: `env` (or the end of `printenv`), a
+#: pipe, then a search command, which may open a subshell or a brace group,
+#: follow a wrapper and its options, or follow a directory (GRIP#9991,
+#: GRIP#9993, GRIP#10120). A brace group's `{` needs a blank after it, as in
+#: the shell.
+_LISTING = rf"env\s*\|\s*(?:\(\s*|\{{\s+)?{WRAPPER_PREFIX}{_PATH}{_SEARCH}"
+
 SENSITIVE_ENV_PATTERNS = [
     rf"\$[A-Z_]+(?:{_AK}|{_SC}|{_TK}|{_PW}|{_CR}|{_PK})",
     rf"\$\{{[A-Z_]+(?:{_AK}|{_SC}|{_TK}|{_PW}|{_CR}|{_PK})",
     r"printenv\s*\|?\s*(?:grep|rg)?\s*(?:" + _SC + "|KEY|" + _TK + "|PASS|CRED)",
     # `env` also matches the end of `printenv`. The second alternative lets
     # options, a quote or a word prefix sit between the search command and the
-    # secret word, which the first does not allow (GRIP#9958).
+    # secret word, which the first does not allow (GRIP#9958). It crosses later
+    # pipes, as in a chain of filters, and stops at `;`, `&`, a newline or the
+    # start of the next listing, where a match is tried in turn: a chain is
+    # read in full and each part once (GRIP#9984). On the Bash path the view
+    # removes quotes, and turns a separator or blank inside a search pattern
+    # into `_` (GRIP#9983, GRIP#10120).
     rf"env\s*\|?\s*(?:grep|rg)?\s*(?:{_SC}|KEY|{_TK}|PASS|CRED)"
-    rf"|env\s*\|\s*(?:e?grep|fgrep|rg)\b[^;&\n]*?(?:{_SC}|KEY|{_TK}|PASS|CRED)",
+    rf"|{_LISTING}(?:(?!{_LISTING})[^;&\n])*?(?:{_SC}|KEY|{_TK}|PASS|CRED)",
     r"echo\s+\$[A-Z_]*(?:" + _AK + "|" + _SC + "|" + _TK + "|" + _PW + "|AWS_|ANTHRO" + "PIC_|OPEN" + "AI_)",
     # Narrowed 2026-07-08 (V>>--<<V ratified): a source-code env-secret READ is
     # only flagged when its value is ALSO passed to an output/exposure sink

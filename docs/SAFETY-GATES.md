@@ -359,7 +359,11 @@ All decisions logged to `~/.grip/gates-audit.jsonl`:
 **Scope**: `/ultrado` and `/rsi-optimal` need to run to completion without
 stopping for halting gates. A marker file at
 `~/.claude/state/session/yolo-mode.json` opts the session into a reduced
-bypass mode; the gate pipeline consults the marker at fire-time.
+bypass mode; the gate pipeline consults the marker at fire-time. The
+table below is the **default** preset (`yolo_l1`/`yolo_l2` — what
+`/ultrado` and `/rsi-optimal` activate automatically). The opt-in
+`--quality` preset is a separate, narrower set — see "The `--quality`
+preset is a narrower alternative" below, not an addition to this table.
 
 ### What yolo DOES bypass (halting gates)
 
@@ -376,6 +380,67 @@ bypass mode; the gate pipeline consults the marker at fire-time.
 | `pre-check-dispatch` | Blocks unclear subagent prompts | Loop can retry on clarity failure |
 | `confidence-gate` | Denies on low council confidence | Loop's JIT gates catch quality issues |
 
+### The `--quality` preset is a narrower alternative (GRIP#9697)
+
+`grip-yolo on --quality` selects the `yolo_quality` preset, which lifts
+ONLY two checks:
+
+| Gate ID | What it does | Why yolo can bypass |
+|---------|--------------|---------------------|
+| `quality-pretool` | DRY/KISS/BIG-O/YAGNI/ISP deny tier, *pre-existing* violations only | Lands a narrow edit in a file with known debt, without forcing an unrelated refactor |
+| `cc-gate` | Cyclomatic-complexity deny tier, *pre-existing* violations only | Same — reach for it when unrelated complexity blocks a legitimate edit |
+
+Violations the edit itself INTRODUCES still deny under `--quality`,
+always.
+
+**`yolo_quality` is an alternative to the default preset above, never a
+superset of it.** Before GRIP#9697 (2026-11-26) it was built as
+`YOLO_L1_BYPASS` unioned with the two ids above, so arming `--quality`
+silently also lifted `git-push-protected`, `destructive-git-nonforce`,
+and the other eight rows in the table above — the help text in
+`bin/grip-yolo` never said so, and neither did `rules/efficiency-rules.md`
+or this document. A session that wanted only the quality relief got the
+push-to-main and hard-reset relief for free, every time. `YOLO_QUALITY_BYPASS`
+is now exactly the two ids above; a session that also needs halting-check
+relief activates the default preset (no flag) instead — one marker holds
+one preset per session, so the two are alternatives.
+
+### Channel-scope and repo-protection: no default preset lifts these
+
+`lib/channel_scope_gate.py` (cross-org / scope-isolation relay posts) and
+`lib/grip_hal_repo_protection.py` (client specifics and credential shapes
+committed into the public-readable GRIP/HAL repos) are gated by yolo too,
+each with its own id: `channel-scope-gate` and `grip-hal-repo-protection`
+respectively (the exact values of `CHANNEL_SCOPE_GATE_ID` and
+`REPO_PROTECTION_GATE_ID`). Neither id appears in `yolo_l1`, `yolo_l2`, or
+`yolo_quality` above. Before GRIP#9697 both checks asked only "is any
+preset active?" and ignored which one — so arming yolo for any reason,
+`--quality` included, silently relaxed them as well. Both now ask
+specifically for their own id, so activating any preset in this document
+leaves them fully enforced. A future preset could name one of those ids
+on purpose (for example, a short, explicitly-named preset for a public
+post-mortem both V>> and the affected client have authorised) — none
+does today, so the only way out of a denial is to retarget the post to
+an allowed channel, or reword the content so it no longer matches the
+sensitive pattern.
+
+**Credential shapes never relax, at any preset, including a future
+named one.** A credential-token match (API key / bot token / PAT shape)
+in `lib/grip_hal_repo_protection.py` denies unconditionally — the same
+hard-blocked treatment as the secrets check below, and for the same
+reason: a leaked key is unrecoverable once shipped, however the preset
+that let it through was named.
+
+**Scope of that guarantee, named precisely (AGORA review, GRIP#9697
+round 1):** the unconditional check is keyed on the built-in
+`credential_token` label, not on the content's shape. A pattern added to
+the gitignored `config/repo-protection.local.json` (meant for blocking a
+person's name or signature, per that file's own documented purpose) that
+happens to be credential-shaped but carries a different label stays
+preset-relaxable. Extending the unconditional set to local patterns is
+tracked as a follow-up, not done in GRIP#9697 — the built-in patterns
+cover every credential shape GRIP ships a detector for today.
+
 ### What yolo DOES NOT bypass (never, mechanically)
 
 | Gate | Why |
@@ -383,7 +448,7 @@ bypass mode; the gate pipeline consults the marker at fire-time.
 | `destructive-git-force` (`--force`, `-f`, `+refs/heads/main`) | Rewrites remote history. Different risk class. Needs `GRIP_AUTONOMOUS=<key>:2`. |
 | Secrets detection (API keys, passwords in commits) | Unrecoverable if shipped. |
 | git-crypt corruption guard (`.gitattributes` during rebase) | Corrupts encryption layer. |
-| DRY / KISS / BIG-O / CC at PreToolUse | **RSI loops rely on these to converge to optimal code.** |
+| DRY / KISS / BIG-O / CC at PreToolUse, under the default preset | **RSI loops rely on these to converge to optimal code.** The opt-in `yolo_quality` preset (`--quality`) is a narrow, separate exception for *pre-existing* violations only — see "The `--quality` preset is a narrower alternative" above. |
 | Knowledge-work-scorer (8-domain quality) | Same — this is how RSI knows when to stop improving. |
 | PostToolUse advisory signals (violation tracking) | Feeds the improvement-heatmap loop. |
 

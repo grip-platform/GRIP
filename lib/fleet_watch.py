@@ -21,7 +21,8 @@ rule it serves is ``rules/workflows-never-stuck-never-burning.md``; the skill is
 
 It reads Claude Code's transcript layout: ``projects/<cwd-slug>/<session>.jsonl`` for a
 session and ``projects/<cwd-slug>/<session>/subagents/agent-*.jsonl`` for its
-subagents. ``tests/test_fleet_watch.py`` pins that layout, so a change in it fails
+subagents, or ``.../subagents/workflows/<run>/agent-*.jsonl`` for the agents of a
+Workflow run. ``tests/test_fleet_watch.py`` pins that layout, so a change in it fails
 there first. The baseline it measures growth against is kept per session, so two
 sessions ticking at the same moment never overwrite each other's and read a false
 QUIET. Every tick appends one JSON line to ``logs/fleet-watch.jsonl``, which is where
@@ -177,9 +178,18 @@ def save_sizes(state: Path, sizes: dict) -> None:
 
 
 def classify(path: Path) -> Tuple[str, str]:
-    """(kind, owner) from the transcript's place in the projects tree."""
-    if "subagents" in path.parts:
-        return "subagent", path.parent.parent.name[:8]
+    """(kind, owner) from the transcript's path relative to the projects root.
+
+    The owner of a subagent is the session folder just above ``subagents``, not the
+    transcript's grandparent: a Workflow agent sits two folders deeper, and its
+    grandparent is ``workflows``. The path is relative to the root, so a folder
+    named ``subagents`` above the root counts for nothing; with no session folder
+    in view the owner is empty, never part of a file name.
+    """
+    parts = path.parts
+    if "subagents" in parts:
+        i = parts.index("subagents")
+        return "subagent", parts[i - 1][:8] if i else ""
     return "session", path.stem[:8]
 
 
@@ -266,7 +276,7 @@ def scan_transcripts(root: Path, prev: dict, now: float, window_s: int,
         growth = size - before
         if growth <= 0 and age > window_s:
             continue
-        kind, owner = classify(path)
+        kind, owner = classify(path.relative_to(root))
         stuck = repeated_error(path, before, size) if growth > 0 else ""
         rows.append(Transcript(key, kind, owner, size, growth, age, growth > hot_bytes, stuck))
     rows.sort(key=lambda t: -t.growth)

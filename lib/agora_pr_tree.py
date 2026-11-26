@@ -22,6 +22,12 @@ One merely CONFIGURED but unused, such as git-lfs's global ``filter.lfs.process`
 on a machine with no LFS-attributed file, does not (GRIP#9551). The export never
 touches the clone's checkout or branches: ``git fetch`` of one commit and
 ``git archive`` change neither.
+
+Before the real export, a second, throwaway ``git archive`` invocation
+(``archive_file_count``) lists the same archive to count how many regular files
+it will actually hold -- the floor the real export is checked against, so every
+export now costs one extra ``git archive`` on top of the one that writes it
+(GRIP#9643).
 """
 from __future__ import annotations
 
@@ -52,9 +58,16 @@ _REGULAR_FILE_MODES = frozenset({"100644", "100755"})
 
 # `git check-attr --source=<tree-ish>` (attributes read from a commit, never the
 # working tree) shipped in git 2.40. Below that, a repo-level attribute cannot be
-# read without a checkout, so both attribute-aware checks below fall back to their
-# pre-2026-11 behaviour (GRIP#9551).
+# read without a checkout, so the attribute-aware check below (process-filter
+# usage) falls back to its pre-2026-11 behaviour (GRIP#9551). tree_file_count no
+# longer reads an attribute at all, so it no longer needs this gate (GRIP#9643).
 _MIN_CHECK_ATTR_SOURCE_GIT = (2, 40)
+
+# Shared by archive_file_count's counting pass and export_tree's real extraction,
+# so the two invocations of the same archive can never silently diverge under a
+# future edit that changes one and not the other (xAI Grok 4.3, AGORA review on
+# PR for GRIP#9643).
+_ARCHIVE_TIMEOUT_S = 600
 
 
 def _git(git_dir: Path, *argv: str, timeout: int = 120) -> subprocess.CompletedProcess:
@@ -100,6 +113,12 @@ def _check_attr(git_dir: Path, sha: str, paths: list[str], attribute: str) -> di
     would let a live process filter run during the export on a machine where the
     check merely failed to answer (AGORA review on GRIP#9596, concern 1 -- the
     one genuine fail-open spot Speaker B found).
+
+    Also raises when the answer's field count does not match ``3 * len(paths) +
+    1`` -- the shape ``-z --stdin`` always gives for a well-formed answer -- so a
+    truncated or malformed response is never misread as fewer paths than were
+    asked, which could silently shift a later path onto the wrong attribute
+    value (GRIP#9643).
     """
     if not paths:
         return {}
@@ -111,6 +130,11 @@ def _check_attr(git_dir: Path, sha: str, paths: list[str], attribute: str) -> di
     if done.returncode != 0:
         raise RuntimeError(f"git check-attr {attribute!r} on {sha[:9]} failed: {done.stderr.strip()[:200]}")
     fields = done.stdout.split("\0")
+    if len(fields) != 3 * len(paths) + 1:
+        raise RuntimeError(
+            f"git check-attr {attribute!r} on {sha[:9]} returned {len(fields)} fields "
+            f"for {len(paths)} paths"
+        )
     return {fields[i]: fields[i + 2] for i in range(0, len(fields) - 2, 3)}
 
 
@@ -135,25 +159,24 @@ def _fetch_commit(git_dir: Path, sha: str) -> None:
 
 
 def tree_file_count(git_dir: Path, sha: str) -> int:
-    """How many regular files the commit lists, as ``git archive`` would write them.
+    """How many regular files ``sha``'s tree lists. Symlinks and submodules are
+    never counted.
 
-    Symlinks and submodules are never counted. Neither is a regular file whose OWN
-    ``.gitattributes`` sets ``export-ignore``: ``git archive`` leaves those out too,
-    so counting them would make the export's own file-count floor unreachable
-    (GRIP#9551). Skipped on a git too old for ``--source`` (see
-    ``_can_read_commit_attrs``): such files are then counted, as before.
+    This is the RAW count: a file whose own ``.gitattributes`` sets
+    ``export-ignore`` is still in the tree and still counted here. What ``git
+    archive`` itself will actually omit -- a file, or an entire folder marked
+    that way, which a per-file ``check-attr`` call can never see, since the
+    attribute is set on the folder's own path and never on each file beneath it
+    (GRIP#9643) -- is ``archive_file_count``'s job: it asks ``git archive``
+    directly instead of re-deriving its exclusion rule in Python.
     """
     listing = _git(git_dir, "ls-tree", "-r", "-z", sha)
     if listing.returncode != 0:
         raise RuntimeError(f"git ls-tree {sha[:9]} failed: {listing.stderr.strip()[:200]}")
-    paths = [
-        entry.split("\t", 1)[1] for entry in listing.stdout.split("\0")
+    return sum(
+        1 for entry in listing.stdout.split("\0")
         if entry and entry.split(" ", 1)[0] in _REGULAR_FILE_MODES
-    ]
-    if _can_read_commit_attrs(git_dir):
-        ignored = _check_attr(git_dir, sha, paths, "export-ignore")
-        paths = [p for p in paths if ignored.get(p) != "set"]
-    return len(paths)
+    )
 
 
 def _stored_blob_options(git_dir: Path, sha: str) -> list[str]:
@@ -219,24 +242,101 @@ def _end_archive(archive: subprocess.Popen, timeout: int = 10) -> int:
         return archive.wait()
 
 
+def _archive_listing(git_dir: Path, sha: str) -> str:
+    """Run ``git archive`` for ``sha`` and return its ``tar -tvf -`` text.
+
+    Raises on a timeout or any other failure; the archive process is always
+    reaped first, win or lose -- not only a timeout can strand it, so a bare
+    ``except BaseException`` covers a missing ``tar`` binary and anything
+    else too (GRIP#9548, hardened for GRIP#9643: Alibaba Qwen4-Max's AGORA
+    review on that PR found only the timeout path reaped it here).
+    """
+    archive = subprocess.Popen(
+        ["git", "-C", str(git_dir), *_stored_blob_options(git_dir, sha), "archive", sha],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    try:
+        # encoding/errors pinned the same way `_git` pins them: a filename that
+        # is not valid UTF-8 must never turn into an unhandled
+        # UnicodeDecodeError that silently demotes a genuine export to the
+        # working-folder fallback (same review).
+        listing = subprocess.run(["tar", "-tvf", "-"], stdin=archive.stdout,
+                                 capture_output=True, text=True, encoding="utf-8",
+                                 errors="replace", timeout=_ARCHIVE_TIMEOUT_S)
+    except subprocess.TimeoutExpired as exc:
+        archive_rc = _end_archive(archive)
+        raise RuntimeError(
+            f"could not count {sha[:9]}'s archive: tar timed out after {exc.timeout}s "
+            f"(git archive exit={archive_rc})"
+        ) from exc
+    except BaseException:
+        _end_archive(archive)
+        raise
+    archive_rc = _end_archive(archive)
+    if archive_rc != 0 or listing.returncode != 0:
+        raise RuntimeError(
+            f"could not count {sha[:9]}'s archive: git archive exit={archive_rc}, "
+            f"tar exit={listing.returncode}: {listing.stderr[:200]}"
+        )
+    return listing.stdout
+
+
+def archive_file_count(git_dir: Path, sha: str) -> int:
+    """How many regular files ``git archive`` itself writes for ``sha`` -- the
+    real floor ``export_tree`` checks its own output against.
+
+    ``git archive`` decides what ``export-ignore`` excludes, in every form the
+    attribute takes -- one file, a whole folder, a machine-wide attributes
+    file -- and on every git version. Asking it directly, by listing the SAME
+    archive ``export_tree`` would extract, never misses a case the way
+    re-deriving the rule in Python can: a per-file ``check-attr`` call reports
+    a file inside an export-ignore'd FOLDER as unspecified, because the
+    attribute is set on the folder's own path, never on each file beneath it
+    (GRIP#9643).
+
+    Known limitation, accepted by the decision brief this fix implements:
+    this floor and the real extraction both ultimately run ``git archive`` on
+    the same ``sha``, so a deterministic defect IN git archive itself (unlike
+    a transient I/O failure, which GRIP#9548's pipe handling still catches)
+    could pass both and go unnoticed -- the old ``ls-tree``-based floor was a
+    fully independent oracle, this one is not (Alibaba Qwen4-Max, AGORA
+    review on PR for GRIP#9643). ``_skipped_files``'s own comparison against
+    the raw tree count is the nearest available check on that.
+    """
+    listing = _archive_listing(git_dir, sha)
+    # tar -tv's permission column's first character is the entry type: '-' for a
+    # regular file, 'd' for a directory, 'l' for a symlink -- the same regular-
+    # file/symlink distinction `_count_files` makes after a real extraction. Split
+    # on tar's own line terminator explicitly, never str.splitlines()'s wider set
+    # (vertical tab, Unicode line/paragraph separators, ...): those are legal
+    # inside a FILENAME, which sits at the end of each line, and splitting on
+    # one there would miscount (same review). A tar implementation that instead
+    # escapes a literal newline WITHIN a filename as text (verified on this
+    # machine's bsdtar) sidesteps the one case splitting on "\n" alone cannot.
+    return sum(1 for line in listing.split("\n") if line.startswith("-"))
+
+
 def export_tree(git_dir: Path, sha: str, dest: Path, min_files: Optional[int] = None) -> int:
     """Write the tree of ``sha`` into ``dest`` and return its file count.
 
     A pipe's exit status is no evidence that files arrived (rules/sync-mirror-safety.md),
     so the export is judged by the regular files it produced: at least ``min_files``,
-    which by default is every regular file the commit lists.
+    which by default is however many regular files ``git archive`` itself writes
+    for ``sha`` (``archive_file_count``, GRIP#9643) -- never a count predicted
+    from ``.gitattributes``, which can diverge from what ``git archive``
+    actually excludes.
 
     Whichever way ``tar`` ends -- a clean exit, a failure, or a timeout -- the
     ``git archive`` process on the other end of the pipe is always closed down
     via ``_end_archive``, and never left running (GRIP#9548).
     """
     _fetch_commit(git_dir, sha)
-    floor = tree_file_count(git_dir, sha) if min_files is None else min_files
+    floor = archive_file_count(git_dir, sha) if min_files is None else min_files
     archive = subprocess.Popen(["git", "-C", str(git_dir), *_stored_blob_options(git_dir, sha), "archive", sha],
                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     try:
         untar = subprocess.run(["tar", "-x", "-C", str(dest)], stdin=archive.stdout,
-                               capture_output=True, timeout=600)
+                               capture_output=True, timeout=_ARCHIVE_TIMEOUT_S)
     except subprocess.TimeoutExpired as exc:
         archive_rc = _end_archive(archive)
         raise RuntimeError(
@@ -304,11 +404,45 @@ def _public_reason(detail: str, limit: int = 200) -> str:
 _ABSOLUTE_PATH = re.compile(r"(?<![\w.~-])(?:/|[A-Za-z]:\\)[^\s'\";,)]+")
 
 
-def _export_for_review(pr: int, repo: str) -> tuple[Optional[Path], Optional[str]]:
-    """The PR's commit exported for one review, or ``(None, reason)`` to read the
-    current folder instead. The log keeps the full detail, including any local
-    path; ``reason`` is the shorter, path-free, single-line form the posted
-    review names (GRIP#9551, hardened for GRIP#9596 concern 3)."""
+def _skipped_files(clone: Path, sha: str, files: int, pr: int) -> Optional[int]:
+    """How many of the commit's regular files a genuine export left out, or
+    None when that count could not be established safely -- never 0 for a
+    failure, which would read as "confirmed nothing was skipped" and conflate
+    exactly the two meanings this PR's own check-attr hardening separated for
+    a different caller, two functions earlier (Alibaba Qwen4-Max, AGORA
+    review on PR for GRIP#9643).
+
+    The tree can only ever list AT LEAST as many regular files as a correct
+    export writes -- git archive never invents a file. A smaller tree count
+    than the export's own file count is therefore a counting bug somewhere,
+    not "nothing was skipped", and is reported the same way: as None, logged
+    loudly rather than silently.
+    """
+    try:
+        tree_total = tree_file_count(clone, sha)
+    except Exception as exc:  # noqa: BLE001 -- a good export beats losing it over this count
+        logger.warning(
+            "AGORA: could not count PR #%s's full tree to compare against its export "
+            "(%s: %s); the skipped-files notice is omitted.", pr, type(exc).__name__, exc)
+        return None
+    if tree_total < files:
+        logger.warning(
+            "AGORA: PR #%s's tree count (%d) is less than its export's own file count "
+            "(%d); the skipped-files notice is omitted.", pr, tree_total, files)
+        return None
+    return tree_total - files
+
+
+def _export_for_review(pr: int, repo: str) -> tuple[Optional[Path], Optional[str], int]:
+    """The PR's commit exported for one review, or ``(None, reason, 0)`` to read
+    the current folder instead. The log keeps the full detail, including any
+    local path; ``reason`` is the shorter, path-free, single-line form the
+    posted review names (GRIP#9551, hardened for GRIP#9596 concern 3).
+
+    The third value is how many of the commit's regular files the export
+    itself left out (``export-ignore``, GRIP#9643): 0 when nothing was left
+    out, or when there was no genuine export to measure.
+    """
     clone = local_clone(repo)
     if clone is None:
         reason = f"no local clone is known for {repo}"
@@ -316,7 +450,7 @@ def _export_for_review(pr: int, repo: str) -> tuple[Optional[Path], Optional[str
             "AGORA: %s, so the review reads the current folder (%s), which may not hold "
             "PR #%s's own files. Pass --repo-root to name a folder that does.",
             reason, Path.cwd(), pr)
-        return None, _public_reason(reason)
+        return None, _public_reason(reason), 0
     try:
         dest, sha, files = export_pr(pr, repo, clone)
     except Exception as exc:  # noqa: BLE001 -- a review with weaker context still beats none
@@ -325,35 +459,45 @@ def _export_for_review(pr: int, repo: str) -> tuple[Optional[Path], Optional[str
             "current folder (%s) instead; its file context and quote checks may not match the PR.",
             pr, repo, clone, type(exc).__name__, exc, Path.cwd())
         reason = f"could not export PR #{pr} of {repo} ({type(exc).__name__}: {exc})"
-        return None, _public_reason(reason)
+        return None, _public_reason(reason), 0
     logger.info("AGORA: reading PR #%s's own files: commit %s exported from %s into %s (%d files).",
                 pr, sha[:9], clone, dest, files)
-    return dest, None
+    skipped = _skipped_files(clone, sha, files, pr) or 0
+    if skipped:
+        logger.info(
+            "AGORA: PR #%s's export left out %d file(s) that %s's tree lists (export-ignore).",
+            pr, skipped, sha[:9])
+    return dest, None, skipped
 
 
 @contextlib.contextmanager
 def review_root(
     pr: int, repo: str, repo_root: Optional[str] = None,
-) -> Iterator[tuple[Optional[str], Optional[str]]]:
+) -> Iterator[tuple[Optional[str], Optional[str], int]]:
     """The folder AGORA reads PR ``pr``'s files from, for the length of one review,
-    and why it fell back to the working folder when it did.
+    why it fell back to the working folder when it did, and how many of the
+    commit's files a genuine export still left out.
 
-    Yields ``(root, fallback_reason)``. ``fallback_reason`` is None when the review
-    reads an export of the PR's own commit, or an explicit ``repo_root`` — reading
-    the working folder inside GitHub Actions is correct by construction there, not a
-    fallback, so that case is also None. Otherwise it is the plain-English reason
-    the export did not happen, for a caller to put in front of a reader
-    (GRIP#9551): no known clone, or a failed or too-small export.
+    Yields ``(root, fallback_reason, files_skipped)``. ``fallback_reason`` is
+    None when the review reads an export of the PR's own commit, or an explicit
+    ``repo_root`` — reading the working folder inside GitHub Actions is correct
+    by construction there, not a fallback, so that case is also None.
+    Otherwise it is the plain-English reason the export did not happen, for a
+    caller to put in front of a reader (GRIP#9551): no known clone, or a
+    failed or too-small export. ``files_skipped`` is how many of the commit's
+    regular files ``git archive`` itself excluded (``export-ignore``,
+    GRIP#9643) from a genuine export; 0 when nothing was excluded, or when
+    there was no genuine export to measure.
     """
     if repo_root:
-        yield repo_root, None
+        yield repo_root, None, 0
         return
     if os.environ.get("GITHUB_ACTIONS") == "true":
-        yield None, None
+        yield None, None, 0
         return
-    dest, reason = _export_for_review(pr, repo)
+    dest, reason, skipped = _export_for_review(pr, repo)
     try:
-        yield (str(dest) if dest else None), reason
+        yield (str(dest) if dest else None), reason, skipped
     finally:
         if dest:
             shutil.rmtree(dest, ignore_errors=True)

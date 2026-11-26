@@ -7,7 +7,7 @@ overnight wave infrastructure, so this module stays a small, testable gate.
 
 Three safety properties live here:
 
-* The fire gate reuses ``overnight_loop.should_fire`` and adds the global
+* The fire gate reuses ``wave_gate.should_fire`` and adds the global
   outbound-stop brake, a dedicated STOP marker, and the weekly-spend throttle,
   so every operator halt wins over the schedule.
 * ``wave_mode`` can only ever return ``draft-pr`` for a PUBLIC product (GRASP,
@@ -27,7 +27,7 @@ from pathlib import Path
 _LIB = Path(__file__).resolve().parent.parent  # lib/
 if str(_LIB) not in sys.path:
     sys.path.insert(0, str(_LIB))
-import overnight_loop  # noqa: E402
+import wave_gate  # noqa: E402
 import throttle_flag  # noqa: E402
 from claude_dir import get_claude_dir  # noqa: E402
 
@@ -154,12 +154,12 @@ def should_run(config: LoopConfig, *, now_epoch: float, lock_held: bool = False,
     if throttle_flag.is_set():
         return RunDecision(False, "weekly-spend throttle engaged")
     cfg = {"enabled": config.enabled, "deadline_epoch": deadline_epoch}
-    decision = overnight_loop.should_fire(
+    decision = wave_gate.should_fire(
         cfg,
         now_epoch=now_epoch,
         lock_held=lock_held,
         stop_present=stop_marker(claude_dir).exists(),
-        outbound_stop=overnight_loop.outbound_stop_engaged(),
+        outbound_stop=wave_gate.outbound_stop_engaged(),
     )
     return RunDecision(decision.fire, decision.reason)
 

@@ -47,7 +47,7 @@ encode_path() {
 }
 
 # Decode a Claude project directory name back to filesystem path
-# Input: -Users-username--claude
+# Input: -Users-you--claude
 # Output: ~/.claude
 # Note: Decoding is lossy - cannot distinguish . from / in original
 decode_path() {

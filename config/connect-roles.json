@@ -1,8 +1,13 @@
 {
   "_about": "Seats for /connect (lib/connect_roles.py). assign() enumerates every planner x coder x reviewer triple, drops a triple that breaks R1 to R5, and takes the lowest planner rank, then coder rank, then reviewer rank; billing class breaks ties (flat-rate subscription or membership, then free, then metered). Metered prices are USD per million tokens from the vendors' own pages, read 2026-11-11: DeepSeek's peak rate, Google's rate for prompts up to 200k tokens, xAI's list rate. max_in bounds the prompt in bytes (a byte bounds a token) and max_out is the output cap each call sends. DeepSeek v4 Pro spends its output cap on hidden reasoning before any answer: a 16,384 cap returned nothing for a 13 KB review prompt and 64,000 answered it (measured 2026-10-05), so its seats get 64,000. The per-run cap is a worst-case reservation, not expected spend: it holds one review plus the repair round's re-review at DeepSeek's worst case. The coder seat names no Codex home: lib/connect.py picks a ready subscription home from the untracked config/codex-accounts.json at admit time.",
-  "per_run_cap_usd": 0.75,
+  "per_run_cap_usd": 1.15,
   "step_seconds": {"plan": 900, "run": 1200, "check": 300, "review": 900},
   "repair_rounds": 1,
+  "dictated": {
+    "_about": "Bounds for a HAL model the operator dictates with --planner, --coder or --reviewer (lib/connect_roles.dictate). A HAL seat is free only on a local catalogue tier; every other HAL call is metered, whatever the catalogue's paid flag or subscription tier says. A metered seat is priced from an override row under prices (USD per million tokens, both price_in and price_out above zero; max_out may override the role's bound), else from the published price lib/hal/cost_tracker.py bills; with neither, R3 refuses it, so it is never priced at zero.",
+    "bounds": {"planner": {"max_in": 60000, "max_out": 32000}, "reviewer": {"max_in": 30000, "max_out": 32000}},
+    "prices": {}
+  },
   "planner": [
     {"id": "fable-5.2", "vendor": "anthropic", "transport": "claude-p", "model": "claude-fable-5-2", "billing": "subscription", "rank": 1},
     {"id": "opus-5.5", "vendor": "anthropic", "transport": "claude-p", "model": "claude-opus-5-5", "billing": "subscription", "rank": 2},
@@ -15,8 +20,8 @@
   "reviewer": [
     {"id": "deepseek-v4-pro", "vendor": "deepseek", "transport": "council", "target": "deepseek", "model": "deepseek-v4-pro", "billing": "metered", "rank": 1,
      "price_in": 1.32, "price_out": 3.96, "max_in": 30000, "max_out": 64000},
-    {"id": "gemini-3.1-pro", "vendor": "google", "transport": "council", "target": "gemini-pro", "model": "gemini-3.1-pro-preview", "billing": "metered", "rank": 2,
-     "price_in": 2.0, "price_out": 12.0, "max_in": 30000, "max_out": 32000},
+    {"id": "gemini-4-carbon", "vendor": "google", "transport": "council", "target": "gemini-carbon", "model": "gemini-4-carbon", "billing": "metered", "rank": 2,
+     "price_in": 4.0, "price_out": 20.0, "max_in": 30000, "max_out": 32768},
     {"id": "grok-4.6", "vendor": "xai", "transport": "council", "target": "xai", "model": "grok-4.6", "billing": "metered", "rank": 3,
      "price_in": 2.0, "price_out": 6.0, "max_in": 30000, "max_out": 32000}
   ]

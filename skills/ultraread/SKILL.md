@@ -113,10 +113,12 @@ teammates, or attach to a hypothesis registration.
 ## Default Seats
 
 ```
-deepseek/deepseek-v4-pro, xai/grok-4.6, gemini/gemini-3.1-pro-preview, qwen/qwen3.7-plus
+deepseek/deepseek-v4-pro, xai/grok-4.6, gemini/gemini-4-carbon, qwen/qwen3.7-plus
 ```
 
-Four Pool B seats, each observed serving through the HAL gateway on 2026-11-12,
+Four Pool B seats, each observed serving through the HAL gateway (the Gemini
+seat, gemini-4-carbon, on 2026-11-26 when it replaced gemini-3.1-pro-preview; the
+others on 2026-11-12),
 none Anthropic and none OpenAI. A default run must not spend the weekly Claude
 limit (`rules/fan-out-spends-the-weekly-limit.md` point 4) or the paid OpenAI
 key (`rules/gpt-on-the-subscription-never-credits.md`). `opus` and `sonnet`

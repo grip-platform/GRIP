@@ -14,7 +14,7 @@ URI uploaded first) and a grounded description comes back. Stdlib only.
 
 Model: gemini-3.5-flash-lite (native audio input per ~/.hal/config/providers.yaml,
 repointed from gemini-2.5-flash on 2026-11-24, GRIP#9389) — NOT the -tts model.
-gemini-3.1-pro-preview for deeper analysis (--model).
+gemini-4-carbon for deeper analysis (--model).
 
 Usage:
     python3 grip-hear.py <audio-file> [--model gemini-3.5-flash-lite] [--prompt "..."]

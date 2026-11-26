@@ -96,7 +96,7 @@ _DEFAULT_TEMPERATURE = 0.1
 # (precedence: explicit model > this default). The AGORA judge + speakers do
 # NOT route through this adapter at all — they dispatch via
 # ``lib/hal_council_dispatch.py`` with their own hardcoded provider strings
-# (``_JUDGE_PROVIDER = gemini/gemini-3.1-pro-preview``), so the loop's
+# (``_JUDGE_PROVIDER = gemini/gemini-4-carbon``), so the loop's
 # exogenous anchor (rules/exogenous-anchor-law.md) is exempt BY CONSTRUCTION,
 # never captured by a cheap default here.
 #

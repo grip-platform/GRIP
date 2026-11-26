@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from lib.claude_dir import get_claude_dir
+from lib.path_encoding import project_dir
 from lib.recall.normalise import fts_query
 
 STORES = {"memory": "memory_dir", "rule": "rules_dir", "skill": "skills_dir",
@@ -33,6 +34,16 @@ class Doc:
     links: tuple[str, ...]
 
 
+def default_memory_dir(base: Path) -> Path:
+    """The memory folder Claude Code keeps for the GRIP install at ``base``.
+
+    Its name comes from path_encoding, which names it as Claude Code does. A
+    name built by hand kept the drive and the backslashes on Windows, so the
+    join dropped ``projects`` and recall read a stray folder (found 2026-11-26).
+    """
+    return project_dir(base.resolve(), base) / "memory"
+
+
 @dataclass(frozen=True)
 class CorpusRoots:
     memory_dir: Path | None = None
@@ -44,8 +55,7 @@ class CorpusRoots:
     @classmethod
     def default(cls) -> CorpusRoots:
         base = get_claude_dir()
-        slug = str(base.resolve()).replace("/", "-").replace(".", "-")
-        defaults = (base / "projects" / slug / "memory", base / "rules", base / "skills",
+        defaults = (default_memory_dir(base), base / "rules", base / "skills",
                     base / "docs", base.parent / ".hal" / "memory")
         names = ("MEMORY", "RULES", "SKILLS", "DOCS", "HAL")
         paths = [Path(os.environ.get(f"GRIP_RECALL_{name}_DIR") or path).expanduser()

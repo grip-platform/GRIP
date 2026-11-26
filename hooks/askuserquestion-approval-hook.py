@@ -16,7 +16,7 @@ cleared nothing.
 
 PostToolUse is the only seam where the human's answer exists. The payload shape
 is verified against real transcripts (``toolUseResult`` for an AskUserQuestion
-tool_use, e.g. ``projects/-Users-void--grip/5d9e47a9-*.jsonl``)::
+tool_use, e.g. ``projects/-Users-you--grip/5d9e47a9-*.jsonl``)::
 
     {"questions": [...], "answers": {"<question text>": "<selected label>"},
      "annotations": {}}

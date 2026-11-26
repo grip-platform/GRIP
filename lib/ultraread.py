@@ -47,9 +47,10 @@ STATE_DIR = CLAUDE_DIR / "state" / "ultraread"
 # adapter.generate(), a method with no model parameter, so every seat
 # answered down HAL's shared default route regardless of the label it was
 # given (GRIP#9187) — routing them now would start spending the weekly limit
-# on every default run.
+# on every default run. gemini-4-carbon replaced gemini-3.1-pro-preview on
+# 2026-11-26 (V>>) and was observed serving through the HAL gateway that day.
 DEFAULT_MODELS = ["deepseek/deepseek-v4-pro", "xai/grok-4.6",
-                   "gemini/gemini-3.1-pro-preview", "qwen/qwen3.7-plus"]
+                   "gemini/gemini-4-carbon", "qwen/qwen3.7-plus"]
 PROMPT_CHARS = 8000  # each model reads this many characters of the target
 # The bound /ultrathink gives a HAL seat (lib/ultrathink_trio.py
 # _TIMEOUT_S["hal"]) — a reading seat sending an 8,000-character prompt can

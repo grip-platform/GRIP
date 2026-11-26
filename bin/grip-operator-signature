@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""grip-operator-signature -- print the operator's signature for a "Primary Author:" line.
+
+The order is the one rules/commit-standards.md names: the session's active
+identity, then the signature in facts/identity.md, then the git config name.
+
+Usage:
+    bin/grip-operator-signature            # signature, else the git config name
+    bin/grip-operator-signature --strict   # signature only, never a real name
+
+Exit codes:
+    0  the signature (or name) is on stdout
+    1  nothing answered; stdout is empty and stderr says which rungs were tried
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+_LIB = Path(__file__).resolve().parent.parent / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+from operator_signature import resolve_signature  # noqa: E402
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="grip-operator-signature",
+                                     description="Print the operator's signature for a commit's Primary Author line.")
+    parser.add_argument("--strict", action="store_true",
+                        help="stop after the signature rungs; never fall back to the git config name")
+    args = parser.parse_args(argv)
+    signature = resolve_signature(strict=args.strict)
+    if signature:
+        print(signature)
+        return 0
+    tried = "state/session/active-identity and facts/identity.md"
+    print(f"grip-operator-signature: no signature (one capital letter and >>, such as V>>) in {tried}"
+          + ("" if args.strict else ", and no git config user.name"), file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

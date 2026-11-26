@@ -1,0 +1,4 @@
+{
+  "_comment": "Private: the operator's real GitHub login, read by scripts/build_oss_candidate.py to scrub it from a public OSS candidate (GRIP#10056). Git ignores config/oss-handles.local.json; this example holds an obviously fake value. Copy this file to config/oss-handles.local.json and fill in the real login.",
+  "github_login": "JaneExample"
+}

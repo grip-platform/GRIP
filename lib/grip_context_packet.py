@@ -66,7 +66,7 @@ class GRIPContextPacket:
 def get_grip_identity() -> tuple[str, int, str]:
     """Get current GRIP instance identity from project index."""
     # Claude Code's project-directory encoding, from the single shared encoder:
-    # ~/.bar -> -Users-foo--bar, C:\Users\<first> <last>\.bar -> C--Users-<first>-<last>--bar
+    # ~/.bar -> -Users-you--bar, C:\Users\<first> <last>\.bar -> C--Users-<first>-<last>--bar
     project_encoded = encode_project_path(Path.cwd())
     grip_index = CLAUDE_DIR / "projects" / project_encoded / "grip" / "index.json"
 

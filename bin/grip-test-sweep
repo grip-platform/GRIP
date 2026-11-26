@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# grip-test-sweep -- run every tracked GRIP test file on its own, with a time limit.
+# Thin wrapper: lib/grip_test_sweep.py runs one pytest process per file in its own
+# process group, kills the whole group if a file outruns --limit, and resumes a
+# run from its results.jsonl with --resume. Results live outside the checkout by
+# default (the system temp directory; --out moves it).
+# Exit 0 all green, 1 some file red or timed out, 2 the sweep itself could not run.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec "$here/bin/grip-py" "$here/lib/grip_test_sweep.py" "$@"

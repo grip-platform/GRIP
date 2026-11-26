@@ -27,6 +27,7 @@ Core libraries and utilities for GRIP.
 | `cc_auto_harness.py` | CC Auto-Harness convergence runner — fractal feature integration engine |
 | `cc_rate_limiter.py` | CC rate limit detection and adaptive backoff for RSI throttling |
 | `cc_identity_resolver.py` | CC org/account env var resolution with identity.md fallback |
+| `operator_signature.py` | The operator's signature for a commit's Primary Author line, in the order `rules/commit-standards.md` names (session identity, `facts/identity.md`, git config name); `strict=True` never falls back to a real name, for public or pseudonymous commits (`bin/grip-operator-signature [--strict]`) |
 | `cc_task_metrics.py` | Task completion metrics capture and genome fitness updates |
 | `floorplan.py` | Deterministic scaled floor-plan rendering — dimensioned SVG with scale bar |
 | `artifact_accuracy.py` | Accuracy instruments (rect/mask IoU, RMSE, SSIM, pixel accuracy) |

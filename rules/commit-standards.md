@@ -10,8 +10,16 @@
 ```
 type: brief description
 
-Details. Primary Author: [Name from git config]
+Details. Primary Author: <operator signature>
 ```
+
+The signature (such as V>>) resolves in this order: the session's active identity
+(`state/session/active-identity`), then the signature in `facts/identity.md`,
+then the name from git config when no signature is set (a clean clone, CI, or
+an install not yet activated). `bin/grip-operator-signature` prints it;
+`--strict` stops before the git config name, for a commit that must never carry
+a real name (a public repository, a pseudonymous bootstrap commit).
+
 Types: feat, fix, chore, docs, test, refactor, perf, style
 
 ## Eval-Bearing Commits (trailer convention)

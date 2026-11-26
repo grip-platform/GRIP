@@ -113,7 +113,7 @@
 #
 # CHANGELOG v2.4.0:
 #   - PARAMOUNT: Discovered correct project directory encoding formula
-#     path.replace('/', '-').replace('.', '-') e.g. ~/.claude -> -Users-foo--claude
+#     path.replace('/', '-').replace('.', '-') e.g. ~/.claude -> -Users-you--claude
 #   - FIX: CLAUDE.md, command-templates.sh, instance-serializer.py encoding
 #   - FIX: pattern-emergence.py engine.connect() and schema columns
 #   - NEW: scripts/repair-session.sh for tool-use corruption bug

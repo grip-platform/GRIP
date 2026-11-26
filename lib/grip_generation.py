@@ -91,8 +91,8 @@ NO_LINEAGE_LABEL = "new project (no GRIP history here)"
 # DRY: route through next_step_block's single D2-correct instance selector so
 # the splash and the memory line can never disagree again (the 430-vs-484 bug
 # class). Guarded like path_encoding — a splash must never crash on import.
-if str(CLAUDE_DIR / "lib") not in sys.path:
-    sys.path.insert(0, str(CLAUDE_DIR / "lib"))
+if str(_LIB) not in sys.path:  # own lib (GRIP#9857), not CLAUDE_DIR's
+    sys.path.insert(0, str(_LIB))
 try:
     from next_step_block import select_latest_instance
 except ImportError:  # pragma: no cover — present in a real install
@@ -122,8 +122,11 @@ def _index_path(project_path: str) -> Optional[Path]:
     so the splash and KONO can never key off different encodings. Returns None
     only if the encoder module is unavailable.
     """
-    # CLAUDE_DIR/lib is already on sys.path via the guarded module-level insert
-    # (no second, unguarded sys.path mutation here — AGORA #3425 Speaker C).
+    # This checkout's own lib (_LIB) is already on sys.path via the guarded
+    # module-level insert above, never CLAUDE_DIR's (GRIP#9857 pass 4 — this
+    # comment used to say "CLAUDE_DIR/lib", which stopped being true once the
+    # insert above started naming _LIB instead; no second, unguarded sys.path
+    # mutation here — AGORA #3425 Speaker C).
     try:
         from path_encoding import encode_project_path
     except ImportError:

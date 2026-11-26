@@ -325,8 +325,9 @@ given the same brief and asked to review this procedure against the run; the
 formal, cross-vendor ratification is the AGORA review of the resulting PRs.
 
 **Documented.** `claude-opus-5-5`, 1M context by default, 128K output, June
-2026 cutoff; $4 in, $5 and $8 for 5-minute and 1-hour cache writes, $0.20 for
-cache hits (0.05x input), $20 out - cheaper than Opus 5 on every column.
+2026 cutoff; per million tokens, 4 US dollars in, 5 and 8 for 5-minute and 1-hour
+cache writes, 0.20 for cache hits (0.05x input), 20 out - cheaper than Opus 5 on
+every column.
 Thinking cannot be disabled and the default effort is `medium`.
 
 **Served, and working per path.** `/v1/models` listed it first on both the

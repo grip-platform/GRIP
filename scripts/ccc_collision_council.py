@@ -58,9 +58,9 @@ CCC_MODELS = {
                   "Check whether the mathematical objects transform compatibly.",
     },
     "gemini_pro": {
-        "name": "Gemini 3.1 Pro",
+        "name": "Gemini 4 Carbon",
         "provider": "gemini",
-        "model": "gemini-3.1-pro-preview",
+        "model": "gemini-4-carbon",
         "role": "category theorist",
         "attack": "Is there a genuine functor between these mathematical structures, "
                   "or is this surface-level diagram matching?",
@@ -618,7 +618,7 @@ def generate_report() -> None:
         "",
         "## Methodology",
         "",
-        "- 5-model panel: Gemini 2.5 Flash, Gemini 3.1 Pro, "
+        "- 5-model panel: Gemini 2.5 Flash, Gemini 4 Carbon, "
         "Llama 3.3 70B, Qwen3 32B, Llama 4 Scout",
         "- Providers: Google Gemini, Groq (Meta Llama, Alibaba Qwen)",
         "- Kill threshold: 3/5 FALSIFIED = KILLED",

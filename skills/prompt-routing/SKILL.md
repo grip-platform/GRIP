@@ -184,7 +184,7 @@ A cost-driven downgrade fires only when ALL four conditions hold:
 4. A cheaper pattern with adequate capability exists.
    (Sprint → Focused, FullMesh → Sprint.)
 
-The default budget is `$5/session`, configurable via `GRIP_COST_BUDGET_USD`.
+The default budget is 5 US dollars per session, configurable via `GRIP_COST_BUDGET_USD`.
 
 ### Output fields
 

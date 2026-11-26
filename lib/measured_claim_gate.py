@@ -101,9 +101,16 @@ _ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b\n]*(?:\x07|\x1b\
 #: The number must not end a version or a name ("fable-5.2 failed", "v1.2
 #: passed", "gpt-4 failed"): on 2026-11-25 "the Fable 5.2 seat ... fable-5.2
 #: failed" was refused as a claim of "2 failed".
+#: A claimed number, with or without thousands separators. pytest never prints
+#: one, but a plain-language PR body often does, and on 2026-11-26 a claim with a
+#: separator was read as its last group and a true count refused (GRIP#10061).
+#: It must stay exactly one capture group: _claim_pair reads groups 1 to 3 by
+#: number. Other groupings (Indian "1,23,456", a space as the separator) are
+#: still read as their last group, as before.
+_NUM = r"(\d{1,3}(?:,\d{3})+|\d+)"
 _CLAIM_RE = re.compile(
-    r"(?<![\w.\-])(\d+)\s+(?:tests?\s+)?(" + _CLAIM_WORDS + r")\b"
-    r"|\bfails?\s+(\d+)\s+tests?\b",
+    r"(?<![\w.\-])" + _NUM + r"\s+(?:tests?\s+)?(" + _CLAIM_WORDS + r")\b"
+    r"|\bfails?\s+" + _NUM + r"\s+tests?\b",
     re.I,
 )
 
@@ -239,10 +246,15 @@ def _norm(word: str) -> str:
     return _PLURAL.get(word, word)
 
 
+def _count(number: str) -> int:
+    """A claimed number as an int, its thousands separators removed."""
+    return int(number.replace(",", ""))
+
+
 def _claim_pair(m) -> tuple:
     if m.group(3) is not None:
-        return int(m.group(3)), "failed"
-    return int(m.group(1)), _norm(m.group(2))
+        return _count(m.group(3)), "failed"
+    return _count(m.group(1)), _norm(m.group(2))
 
 
 def claimed_counts(text: str) -> list:

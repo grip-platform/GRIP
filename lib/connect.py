@@ -46,7 +46,8 @@ if str(_ROOT) not in sys.path:
 
 from lib import connect_check as chk  # noqa: E402
 from lib.connect_roles import (  # noqa: E402
-    ROLES, Budget, BudgetRefused, Roles, Seat, assign, explain, load_roles)
+    ROLES, Budget, BudgetRefused, DictateRefused, Roles, Seat, assign, dictate, explain, known_vendor,
+    load_roles)
 from lib._compat import windows_pid_alive  # noqa: E402
 
 CONDUCTOR = "grip-connect"
@@ -319,6 +320,16 @@ def new_run_id() -> str:
     return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(3)
 
 
+def _unsafe_driver_refusal(repo) -> str | None:
+    """The refusal text for a repository whose git config runs an editable command, or
+    None when it carries none -- shared so _validate and _default_roots (GRIP#9272 round
+    2) refuse identically whichever one checks first. unsafe_drivers() itself is a config
+    read, not a working-tree touch, so it is always safe to run before any other git call."""
+    unsafe = chk.unsafe_drivers(repo)
+    return ("the repository has git run a command that the coder could edit, and the "
+            "conductor runs git outside the sandbox: " + "; ".join(unsafe)) if unsafe else None
+
+
 def _validate(req: Request) -> None:
     if not req.task.strip():
         raise ConnectRefused("the task is empty")
@@ -328,10 +339,9 @@ def _validate(req: Request) -> None:
         raise ConnectRefused(f"{req.repo} is not a git checkout")
     if not req.plan_only and not req.accept_open_reads:
         raise ConnectRefused(OPEN_READS)
-    unsafe = chk.unsafe_drivers(req.repo)
+    unsafe = _unsafe_driver_refusal(req.repo)
     if unsafe:
-        raise ConnectRefused("the repository has git run a command that the coder could edit, and "
-                             "the conductor runs git outside the sandbox: " + "; ".join(unsafe))
+        raise ConnectRefused(unsafe)
 
 
 def _no_roster(roles: Roles, unavailable) -> str:
@@ -401,11 +411,7 @@ def admit(req: Request, deps: Deps) -> Run:
 
 
 def _known_vendor(model: str) -> str:
-    from lib.roundtable import VENDOR, vendor_of
-
-    bare = str(model).rsplit("/", 1)[-1]
-    vendor = vendor_of(bare)
-    return "" if vendor == bare and bare not in VENDOR else vendor
+    return known_vendor(model)
 
 
 def _served_fault(seat: Seat, served: str, text: str) -> str:
@@ -511,6 +517,8 @@ Return ONE JSON object and nothing else:
 
 Rules:
 - files_allowed lists every file the coder may create or change. Nothing else may change.
+- Every path in files_allowed must sit under one of these roots: {roots}. If the task needs a
+  file outside them, return an empty goal and say why in risks.
 - test_paths lists pytest files named test_*.py, inside files_allowed. They must FAIL on the
   current code and PASS once the change is made, so the check can prove the change.
 - Keep the change small. Never name hooks, CI workflows, settings, rules, agent instructions
@@ -531,8 +539,8 @@ def _fill(template: str, **values: str) -> str:
     return re.sub(r"\{(\w+)\}", lambda m: values.get(m.group(1), m.group(0)), template)
 
 
-def plan_prompt(task: str, pack: str) -> str:
-    return _fill(PLAN_CONTRACT, task=task, pack=pack)
+def plan_prompt(task: str, pack: str, roots: tuple = DEFAULT_ROOTS) -> str:
+    return _fill(PLAN_CONTRACT, task=task, pack=pack, roots=", ".join(roots))
 
 
 def _file_block(wt: Path, rel: str) -> str:
@@ -570,14 +578,30 @@ def _clean_path(path: str) -> str:
     return "" if norm.startswith(("/", "..")) or norm in (".", "") else norm
 
 
+def _under_roots(path: str, roots) -> bool:
+    """One place for the roots predicate (AGORA, GRIP#9272 round 2 -- it was written out
+    twice, a drift risk between two copies of the same rule)."""
+    return path.startswith(tuple(roots))
+
+
+def _out_of_roots_problem(clean, roots) -> list:
+    """A problem naming every path that does not sit under one of the roots, or [] when
+    they all do. Tests the roots predicate directly (AGORA round 1) rather than inferring
+    "outside" from clean - kept, which coupled this to whatever else might one day change
+    what `kept` holds and silently mislabel a path kept out for another reason."""
+    outside = sorted(c for c in clean if c and not _under_roots(c, roots))
+    return [f"outside the allowed roots (--roots {','.join(roots)}): " + ", ".join(outside)] if outside else []
+
+
 def _scope(paths, roots, forbidden, encrypted) -> tuple:
-    """(kept paths, problems): out-of-root paths are dropped; a protected path refuses the plan."""
+    """(kept paths, problems): a path outside the roots, forbidden, or git-crypt refuses the plan."""
     clean = [_clean_path(p) for p in paths]
     problems = [f"a path leaves the repository: {p!r}" for p, c in zip(paths, clean) if not c]
     problems += [f"names a protected path (CI, hooks, gates, rules, settings): {c}" for c in clean
                  if c and forbidden(c)]
     problems += [f"names a git-crypt path: {c}" for c in clean if c in encrypted]
-    return sorted({c for c in clean if c and c.startswith(tuple(roots))}), problems
+    problems += _out_of_roots_problem(clean, roots)
+    return sorted({c for c in clean if c and _under_roots(c, roots)}), problems
 
 
 def _test_problems(tests, kept) -> list:
@@ -596,9 +620,6 @@ def validate_plan(raw, r: Run) -> tuple:
         return {}, problems
     encrypted = set(chk.git_crypt_paths(r.wt, [_clean_path(p) for p in raw["files_allowed"]]))
     kept, problems = _scope(raw["files_allowed"], r.req.roots, r.forbidden, encrypted)
-    dropped = sorted({_clean_path(p) for p in raw["files_allowed"]} - set(kept) - {""})
-    if dropped:
-        r.notes.append("dropped from scope, outside the allowed roots: " + ", ".join(dropped))
     tests = sorted({_clean_path(t) for t in raw["test_paths"]} - {""})
     problems += _test_problems(tests, kept)
     problems += [f"more than {MAX_FILES} files"] if len(kept) > MAX_FILES else []
@@ -613,7 +634,7 @@ def _plan_reply_fault(text: str) -> str:
 
 def _plan(r: Run) -> dict:
     _checkpoint(r)
-    prompt = plan_prompt(r.req.task, _context_pack(r))
+    prompt = plan_prompt(r.req.task, _context_pack(r), r.req.roots)
     seat, reply = _call_role(r, "planner", prompt, r.deps.roles.step_seconds["plan"], _plan_reply_fault)
     plan, problems = validate_plan(parse_json(reply.text), r)
     _record(r, "plan", {"plan": plan, "problems": problems, **reply.facts()}, seat, reply.served)
@@ -1038,6 +1059,41 @@ def _council_call(seat: Seat, prompt: str, timeout: int) -> tuple:
     return text, str(res.get("model") or seat.model)
 
 
+def _hal_call(seat: Seat, prompt: str, timeout: int) -> tuple:
+    """A dictated HAL seat: one text-only call through GRIP's in-tree HAL registry.
+
+    The output cap is the seat's own bound, so the worst case the budget reserved
+    holds. Temperature 1 is the one value every catalogue model accepts, including
+    the ones that lock it (Kimi K3.1 Pro answers HTTP 400 to anything else). The
+    prompt reaching here is already shielded by ``_attempt``. ``timeout`` is not
+    passed on: the HAL provider applies its own configured request timeout
+    (``timeout_s``), and a stop or a veto abandons the call through ``_braked_call``.
+
+    Exactly one attempt is sent. The provider retries a timeout on its own, and
+    each retry is another billable request, while the budget reserved one call's
+    worst case; so the call goes through a copy of the provider with retries off,
+    and the shared registry's provider is left as it was.
+    """
+    import copy
+
+    from lib.hal.registry import get_registry, parse_model_address
+
+    registry = get_registry()
+    name, model = parse_model_address(seat.model, known_providers={p.name for p in registry.list_providers()})
+    provider = registry.get(name) if name else None
+    if provider is None or not hasattr(provider, "_max_retries"):
+        raise RuntimeError(f"no HAL provider for {seat.model!r} whose retries can be switched off")
+    once = copy.copy(provider)
+    once._max_retries = 0
+    resp = once.chat(prompt, model=model, max_tokens=seat.max_out, temperature=1.0)
+    text = str(getattr(resp, "text", "") or "")
+    if getattr(resp, "finish_reason", "") == "length":
+        raise RuntimeError("answer cut off at its output cap")
+    if not text.strip():
+        raise RuntimeError("no answer")
+    return text, str(getattr(resp, "model", "") or seat.model)
+
+
 def _live_call(seat: Seat, prompt: str, timeout: int) -> tuple:
     if seat.transport == "claude-p":
         from lib.ultrathink_trio import LIVE_TRANSPORTS, Rung
@@ -1045,6 +1101,8 @@ def _live_call(seat: Seat, prompt: str, timeout: int) -> tuple:
         return LIVE_TRANSPORTS["claude-p"](Rung(seat.id, seat.model, "claude-p"), prompt)
     if seat.transport == "council":
         return _council_call(seat, prompt, timeout)
+    if seat.transport == "hal":
+        return _hal_call(seat, prompt, timeout)
     raise RuntimeError(f"no text transport for {seat.transport!r}")
 
 
@@ -1126,11 +1184,13 @@ def _ready_home():
     return None
 
 
-def live_deps(roles_path=None) -> Deps:
+def live_deps(roles_path=None, choices=None) -> Deps:
+    """The live wiring. ``choices`` maps a role to the seat the operator dictated for it."""
     from lib.claude_dir import get_claude_dir
 
     worktrees = os.environ.get("GRIP_CONNECT_WORKTREES") or str(Path.home() / ".grip-worktrees")
-    return Deps(roles=load_roles(roles_path), state_dir=get_claude_dir() / "state" / "connect",
+    return Deps(roles=dictate(load_roles(roles_path), choices or {}),
+                state_dir=get_claude_dir() / "state" / "connect",
                 worktrees_dir=Path(worktrees), call=_live_call, code=_live_code, tests=_live_tests,
                 seal=_live_seal, home=_ready_home, shield=_live_shield)
 
@@ -1138,11 +1198,58 @@ def live_deps(roles_path=None) -> Deps:
 # --- command line ------------------------------------------------------------------------------------
 
 
+def _is_grip(repo: Path) -> bool:
+    """True the way forbidden_matcher already tells GRIP apart from any other repository:
+    GRIP carries bin/grip-pr-monitor; the file is absent (or unreadable) everywhere else."""
+    try:
+        from lib.merge_yourself import machinery_pattern
+
+        return machinery_pattern(Path(repo)) is not None
+    except Exception:  # noqa: BLE001 -- an unreadable sweep script means "not GRIP"
+        return False
+
+
+def _top_level_folders(repo: Path) -> list:
+    """The repository's tracked top-level folders that are not themselves forbidden: the
+    choices --roots takes, so a pick is never one step 2's own check would refuse anyway
+    (AGORA, GRIP#9272 round 1 -- the unfiltered list could offer e.g. hooks/)."""
+    try:
+        tracked = chk.git(repo, "ls-files").splitlines()
+    except chk.CheckError:
+        return []
+    forbidden = chk.forbidden_matcher(repo)
+    return sorted(f for f in {p.split("/", 1)[0] + "/" for p in tracked if "/" in p} if not forbidden(f))
+
+
+def _default_roots(repo: Path) -> tuple:
+    """GRIP's own layout outside a typed --roots; any other repository must type one, so a
+    plan can never silently drop a file that sat outside a guessed fence (GRIP#9272). The
+    unsafe-driver check runs before _top_level_folders touches git at all (AGORA round 2,
+    measured against a real repository): plain `git ls-files` can run a configured
+    core.fsmonitor command even with hooks disabled, which must never happen ahead of the
+    admission step's own check for exactly that."""
+    if _is_grip(repo):
+        return DEFAULT_ROOTS
+    unsafe = _unsafe_driver_refusal(repo)
+    if unsafe:
+        raise ConnectRefused(unsafe)
+    picks = ", ".join(_top_level_folders(repo)) or "(no tracked top-level folder)"
+    raise ConnectRefused(f"{repo} is not GRIP, so --roots is required: pick from {picks}")
+
+
 def _request(args) -> Request:
-    roots = tuple(r if r.endswith("/") else r + "/" for r in args.roots.split(",") if r.strip())
-    return Request(task=" ".join(args.task), repo=Path(args.repo).resolve(), base=args.base,
+    repo = Path(args.repo).resolve()
+    roots = (_default_roots(repo) if args.roots is None else
+             tuple(r.strip() if r.strip().endswith("/") else r.strip() + "/"
+                   for r in args.roots.split(",") if r.strip()))
+    return Request(task=" ".join(args.task), repo=repo, base=args.base,
                    files=tuple(args.file), roots=roots, plan_only=args.cmd == "plan",
                    accept_open_reads=args.accept_open_reads)
+
+
+def _choices(args) -> dict:
+    """The seats dictated with --planner, --coder and --reviewer; an unset flag leaves the role to the rule."""
+    return {role: getattr(args, role, None) for role in ROLES}
 
 
 def _print_result(res: dict) -> None:
@@ -1160,8 +1267,8 @@ def _print_result(res: dict) -> None:
 
 def _cmd_run(args) -> int:
     try:
-        res = run(_request(args), live_deps())
-    except ConnectRefused as exc:
+        res = run(_request(args), live_deps(choices=_choices(args)))
+    except (ConnectRefused, DictateRefused) as exc:
         print(f"/connect refused: {exc}", file=sys.stderr)
         return 2
     _print_result(res)
@@ -1169,7 +1276,11 @@ def _cmd_run(args) -> int:
 
 
 def _cmd_roster(args) -> int:
-    roles = load_roles()
+    try:
+        roles = dictate(load_roles(), _choices(args))
+    except DictateRefused as exc:
+        print(f"/connect refused: {exc}", file=sys.stderr)
+        return 2
     for triple, found in explain(roles)[:args.limit]:
         names = " + ".join(f"{s.role} {s.id}" for s in triple)
         print(f"{'OK  ' if not found else 'NO  '}{names}" + (f"  -- {'; '.join(found)}" if found else ""))
@@ -1204,6 +1315,14 @@ def _cmd_verify(args) -> int:
     return 1 if problems else 0
 
 
+def _seat_flags(parser: argparse.ArgumentParser) -> None:
+    """--planner, --coder and --reviewer: dictate a seat by role-file id or HAL model address."""
+    for role in ROLES:
+        parser.add_argument(f"--{role}", default=None, metavar="SEAT",
+                            help=f"dictate the {role}: a seat id from config/connect-roles.json or a HAL "
+                                 "model address such as moonshot/kimi-k3.1-pro; R1 to R5 still apply")
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="grip-connect", description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1213,10 +1332,16 @@ def _parser() -> argparse.ArgumentParser:
         s.add_argument("--repo", default=os.getcwd())
         s.add_argument("--base", default="origin/main")
         s.add_argument("--file", action="append", default=[])
-        s.add_argument("--roots", default=",".join(DEFAULT_ROOTS))
+        s.add_argument("--roots", default=None,
+                       help="comma-separated folders the coder may touch, such as lib/,tests/; "
+                            f"defaults to {','.join(DEFAULT_ROOTS)} inside GRIP, and is required "
+                            "in any other repository")
         s.add_argument("--accept-open-reads", action="store_true",
                        help="run although the coder can read outside its worktree (GRIP#9154)")
-    sub.add_parser("roster").add_argument("--limit", type=int, default=8)
+        _seat_flags(s)
+    roster = sub.add_parser("roster")
+    roster.add_argument("--limit", type=int, default=8)
+    _seat_flags(roster)
     status = sub.add_parser("status")
     status.add_argument("run", nargs="?")
     status.add_argument("--limit", type=int, default=10)

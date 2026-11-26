@@ -7,7 +7,7 @@ from the council (same model family as the system under test).
 
 Provider tiers:
     Fast:     Gemini 3.5 Flash-Lite + GPT-OSS 120B (2 families, fast)
-    Standard: Gemini 3.1 Pro + GPT-OSS 120B + Qwen 3.8 27B (3 families)
+    Standard: Gemini 4 Carbon + GPT-OSS 120B + Qwen 3.8 27B (3 families)
     Proof:    Standard + GPT-OSS 20B and Gemini 3.8 Flash as tiebreakers (5 seats)
 
     Fast/Proof seats repointed from gemini-2.5-flash/gemini-2.5-pro on
@@ -17,7 +17,8 @@ Provider tiers:
 The Haiku seat bills a per-token Anthropic key, so it joins standard and proof
 only with GRIP_CLAUDE_ALLOW_PAID=1 (then 4 families, and 4 and 6 seats).
 
-Lead scorer: Gemini 3.1 Pro (strongest non-Claude reasoning model).
+Lead scorer: Gemini 4 Carbon (Google's strongest reasoning model; it replaced
+Gemini 3.1 Pro on 2026-11-26).
 
 Usage:
     from lib.moe.external_scorer import external_score
@@ -64,7 +65,7 @@ def _paid_anthropic_allowed() -> bool:
 # with no row at 1.0 (lib/moe/council.py), as much as all these rows together,
 # so every seat needs one.
 COUNCIL_WEIGHTS = {
-    "gemini-3.1-pro": 0.30,
+    "gemini-4-carbon": 0.30,
     "gpt-oss-120b": 0.20,
     "qwen3.8-27b": 0.20,
     "anthropic-haiku": 0.15,
@@ -76,7 +77,7 @@ COUNCIL_WEIGHTS = {
 #: The name each Gemini or Groq model's scores carry into the council. A model
 #: with no row here scores under its raw id, which has no weight.
 _SEAT_NAMES = {
-    "gemini-3.1-pro-preview": "gemini-3.1-pro",
+    "gemini-4-carbon": "gemini-4-carbon",
     "gemini-3.5-flash-lite": "gemini-3.5-flash-lite",
     "gemini-3.8-flash": "gemini-3.8-flash",
     "openai/gpt-oss-120b": "gpt-oss-120b",
@@ -246,7 +247,7 @@ def _finalize_score(provider_name: str, raw_text: str) -> ExternalScore:
 
 def _score_with_gemini(output: str, task: str, task_type: str,
                        dimensions: str, model: str) -> ExternalScore:
-    """Score using the Gemini API (3.1 Pro, 2.5 Pro or 2.5 Flash)."""
+    """Score using the Gemini API (4 Carbon, the lead scorer, or a Flash model)."""
     provider_name = _SEAT_NAMES.get(model, model)
     try:
         from lib.providers.gemini import GeminiProvider
@@ -347,9 +348,9 @@ def external_score(
     raw_scores: list[ExternalScore] = []
 
     if mode in ("standard", "proof"):
-        # Gemini 3.1 Pro -- LEAD scorer
+        # Gemini 4 Carbon -- LEAD scorer (replaced 3.1 Pro on 2026-11-26, V>>)
         raw_scores.append(_score_with_gemini(
-            output, task, task_type, dimensions_text, "gemini-3.1-pro-preview"))
+            output, task, task_type, dimensions_text, "gemini-4-carbon"))
 
     if mode in ("fast", "standard", "proof"):
         # Gemini 2.5 Flash (fast mode only)

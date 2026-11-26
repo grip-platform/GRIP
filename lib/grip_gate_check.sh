@@ -36,14 +36,49 @@ if [ ! -r "$VENV_UTILS" ]; then
     echo "grip_gate_check.sh: missing resolver $VENV_UTILS (is CLAUDE_DIR a real GRIP checkout?)" >&2
     exit 1
 fi
+# Cleared first: a calling bash process can already have a function of
+# this name in scope (exported with `export -f`, or sourced from
+# BASH_ENV) before this script ever runs. Without clearing it, the
+# `declare -F` check below would see that pre-existing function and
+# report success regardless of whether THIS sourcing defined anything,
+# which is a narrower claim than "declare -F succeeded" actually tests
+# (Codex, grip-platform/GRIP#10098). `unset -f` on a name with no
+# function is a harmless no-op (exit 0), so this is safe under `set -e`
+# whether or not anything was ever in scope.
+unset -f resolve_venv_python 2>/dev/null || true
 # shellcheck source=../scripts/lib/venv-utils.sh
 source "$VENV_UTILS"
 
 cd "$CLAUDE_DIR"
 
+# resolve_venv_python's contract (scripts/lib/venv-utils.sh): on success it
+# echoes exactly one path and returns 0 -- a venv interpreter OR a working
+# system fallback, either one -- and on failure it echoes nothing and
+# returns 1. Both shapes reach the prefix check below, which is why that
+# check compares the PATH's prefix rather than only testing for emptiness: a
+# system fallback is non-empty too, and is exactly what must be refused
+# (rules/never-system-python-for-grip.md). A future edit to venv-utils.sh
+# must keep this contract, or this refusal logic silently stops working.
+# declare -F, not command -v: the claim being tested is "the sourced file
+# defined this FUNCTION", and command -v would also report success for an
+# unrelated external binary that happened to share the name (AGORA, Speaker
+# B, grip-platform/GRIP#9573) -- confirmed by direct test: `command -v ls`
+# succeeds (ls is a real external command) while `declare -F ls` correctly
+# fails (ls is not a function).
+if ! declare -F resolve_venv_python >/dev/null 2>&1; then
+    echo "grip_gate_check.sh: $VENV_UTILS did not define resolve_venv_python (is it an old or mismatched venv-utils.sh?)" >&2
+    exit 1
+fi
+
 grip_python="$(resolve_venv_python "$CLAUDE_DIR/venv" || true)"
 if [[ "$grip_python" != "$CLAUDE_DIR/venv/"* ]]; then
-    echo "grip_gate_check.sh: no GRIP venv Python at $CLAUDE_DIR/venv; refusing the system interpreter (rules/never-system-python-for-grip.md)." >&2
+    # Phrased to hold in BOTH shapes resolve_venv_python can return (see the
+    # contract comment above): a wrong-but-real interpreter, or genuinely
+    # nothing. An intermediate draft of this line asserted "refusing the
+    # system interpreter it resolved to instead" unconditionally, which is
+    # false in the second shape -- nothing was resolved to refuse -- the
+    # self-contradiction AGORA (Speaker B, grip-platform/GRIP#9573) found.
+    echo "grip_gate_check.sh: no GRIP venv Python at $CLAUDE_DIR/venv; refusing to run (resolved interpreter: ${grip_python:-none found}) (rules/never-system-python-for-grip.md)." >&2
     echo "grip_gate_check.sh: create it with python3 -m venv \"$CLAUDE_DIR/venv\", or point CLAUDE_DIR at an install that has one." >&2
     exit 1
 fi

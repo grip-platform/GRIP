@@ -1,4 +1,4 @@
-"""Exogenous {gemini-3.1-pro-preview + gpt-5.5} council callable.
+"""Exogenous {gemini-4-carbon + gpt-5.5} council callable.
 
 Two genuinely distinct provider families (Google + OpenAI) — exogenous to
 Claude/Anthropic. Satisfies the exogenous-anchor-law requirement that the
@@ -63,16 +63,17 @@ def _token(env_var: str, keychain_service: str) -> str:
 
 # ── Exogenous roster ──────────────────────────────────────────────────────────
 # Format: (id, happi_provider_string, auth_dict, human_description)
-# gemini-3.1-pro-preview = Google family
+# gemini-4-carbon       = Google family (replaced gemini-3.1-pro-preview,
+#                         V>> 2026-11-26)
 # gpt-5.5               = OpenAI family
 # Both are non-Anthropic — exogenous to Opus/Claude by construction.
 
 EXOGENOUS_ROSTER: list[tuple[str, str, dict, str]] = [
     (
-        "gemini-3.1-pro-preview",
-        "gemini/gemini-3.1-pro-preview",
+        "gemini-4-carbon",
+        "gemini/gemini-4-carbon",
         {"scheme": "apikey", "token": _token("GEMINI_API_KEY", "grip-gemini")},
-        "Google Gemini 3.1 Pro Preview",
+        "Google Gemini 4 Carbon",
     ),
     (
         "gpt-5.5",
@@ -95,7 +96,7 @@ def roster_provider_families() -> set[str]:
     """Return the set of distinct provider families in EXOGENOUS_ROSTER.
 
     Extracts the family prefix from the happi provider string
-    (``"gemini/gemini-3.1-pro-preview"`` → ``"gemini"``).
+    (``"gemini/gemini-4-carbon"`` → ``"gemini"``).
 
     Goodhart-proof: the test asserts ``len() == 2``, not ``len(roster) == 2``.
     Two gemini entries would return ``{"gemini"}`` and fail the assertion.
@@ -109,7 +110,7 @@ def run_exogenous_council(
     hal_bin: Optional[str] = None,
     timeout: int = 90,
 ) -> CouncilVerdict:
-    """Run the exogenous {gemini-3.1-pro-preview + gpt-5.5} council.
+    """Run the exogenous {gemini-4-carbon + gpt-5.5} council.
 
     Dispatches the same prompt to both providers in parallel (via
     ``dispatch_parallel``) then applies MESH deliberation (``mesh_deliberate``).

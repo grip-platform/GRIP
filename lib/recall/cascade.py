@@ -107,7 +107,8 @@ def _ruling_id(ruling, roots):
 
 def _pinned_id(ruling, path):
     number = int(ruling.source.rsplit(":", 1)[1])
-    line = path.read_text(encoding="utf-8").splitlines()[number - 1]
+    # The same decoding as rulings._read, which found this line number.
+    line = path.read_text(encoding="utf-8", errors="replace").splitlines()[number - 1]
     target = line.rsplit(" :: ", 1)[1].strip().removesuffix(".md")
     return "memory/" + target + ".md"
 

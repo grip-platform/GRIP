@@ -145,7 +145,8 @@ LADDER: dict[str, tuple[Rung, ...]] = {
         Rung("astra-codex", "gpt-6-astra", "codex"),
         Rung("astra-hal", "openai/gpt-6-astra", "hal", requires_key="openai", opt_in=PAID_OPT_IN),
         Rung("grok-4.6", "grok-4.6", "chat", target="xai"),
-        Rung("gemini-pro", "gemini-3.1-pro-preview", "council", target="gemini-pro"),
+        # Gemini 4 Carbon replaced 3.1 Pro on this rung on 2026-11-26 (V>>).
+        Rung("gemini-carbon", "gemini-4-carbon", "council", target="gemini-carbon"),
     ),
     "deepseek": (
         Rung("deepseek-v4-pro", "deepseek/deepseek-v4-pro", "hal"),

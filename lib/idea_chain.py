@@ -209,9 +209,14 @@ def _short(node: PrecogIDR) -> str:
     return f"{node.kind} {node.fingerprint[:12]}"
 
 
+def _only_ideas(records: Sequence[PrecogIDR]) -> list[PrecogIDR]:
+    """The one definition of an idea record: a record whose kind is one of ``KINDS``."""
+    return [n for n in records if n.kind in KINDS]
+
+
 def read_ledger(path: Path | str | None = None) -> list[PrecogIDR]:
     """Every idea record in the ledger, in file order."""
-    return [n for n in read_idr_chain(path=ledger_path(path)) if n.kind in KINDS]
+    return _only_ideas(read_idr_chain(path=ledger_path(path)))
 
 
 def nodes_of(idea_id: str, path: Path | str | None = None) -> list[PrecogIDR]:
@@ -338,7 +343,13 @@ def _read_text(path: Path | str) -> str:
 def _portable(source: Path | str) -> str:
     """The source path to record: relative to this checkout when the file lies
     inside it, so one verdict has one fingerprint on every machine; any other
-    path is kept as given."""
+    path is kept as given.
+
+    Symlinks are resolved first, so a ``~/.claude`` path into the shared tree
+    still counts as inside. The cost: a file inside the checkout that is itself
+    a symlink to somewhere outside it (an installed plugin's skill, say) is kept
+    as given, and is portable only if every machine types the same path.
+    """
     try:
         return Path(source).resolve().relative_to(_REPO.resolve()).as_posix()
     except ValueError:
@@ -599,7 +610,8 @@ def verify_idea(idea_id: str, path: Path | str | None = None) -> Report:
     """Signatures, rules, digest and Merkle root for one idea, plus the whole ledger's signatures.
 
     The forests are built and checked by the unmodified ``lib.idr_forest``
-    functions: the idea ledger is checked exactly as the main chain is.
+    functions: the idea ledger is checked exactly as the main chain is. One idea
+    is the batch of one in ``verify_ideas``, so it costs one read of the ledger.
     """
     return verify_ideas([idea_id], path)[0]
 
@@ -612,9 +624,14 @@ def verify_ideas(ids: Sequence[str], path: Path | str | None = None) -> list[Rep
     quadratic in the size of the ledger (AGORA on GRIP#9973).
     """
     ledger = ledger_path(path)
+    before = _raw_lines(ledger)
     every = read_idr_chain(path=ledger)
-    records = [n for n in every if n.kind in KINDS]
-    shared = _ledger_problems(ledger, records, len(every))
+    after = _raw_lines(ledger)
+    records = _only_ideas(every)
+    # An append between the reads would make the line count disagree with the
+    # parse, so a moving ledger is named as moving, never as unreadable lines.
+    unread = after - len(every) if after == before else None
+    shared = _ledger_problems(records, unread)
     ledger_verdict = _ledger_integrity(records)
     by_idea: dict[str, list[PrecogIDR]] = {}
     for node in records:
@@ -667,10 +684,12 @@ def _ledger_integrity(records: list[PrecogIDR]) -> str:
     return _integrity(forest)
 
 
-def _ledger_problems(ledger: Path, records: list[PrecogIDR], parsed: int) -> list[str]:
+def _ledger_problems(records: list[PrecogIDR], unread: int | None) -> list[str]:
+    """Ledger-wide problems. ``unread`` is None when the ledger grew while it was read."""
     problems = []
-    unread = _raw_lines(ledger) - parsed
-    if unread:
+    if unread is None:
+        problems.append("the ledger changed while it was read; run verify again")
+    elif unread:
         problems.append(f"{unread} ledger line(s) could not be read as records")
     opened = {_idea_of(n) for n in records if n.kind == ROOT}
     orphans = sum(1 for n in records if _idea_of(n) not in opened)

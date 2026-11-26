@@ -14,6 +14,7 @@ text ever reaches a shell string.
 bin/grip-connect run "add mul(a, b) to lib/calc.py with a test" --file lib/calc.py --accept-open-reads
 bin/grip-connect plan "<task>"          # admit and plan only; nothing is changed
 bin/grip-connect roster                  # the seats the role rule picks today, and why others lost
+bin/grip-connect roster --reviewer moonshot/kimi-k3.1-pro   # dictate a seat; R1 to R5 still decide
 bin/grip-connect status                  # recent runs and their outcomes
 bin/grip-connect stop [RUN_ID]           # a running /connect stops within five seconds
 bin/grip-connect verify RUN_ID           # every artefact against its signed leaf
@@ -27,10 +28,13 @@ bin/mesh room --room connect-<RUN_ID> tail 50   # --room goes before the subcomm
    and it holds no credits that Codex could fall back to. The worktree starts at a
    freshly fetched `origin/main`, under `~/.grip-worktrees/`, with every git-crypt
    path left out.
-2. **Plan.** The planner gets the task, the tracked file list and the files named
-   with `--file`, in one text-only call. It returns PLAN JSON. A plan that names CI,
-   hooks, gates, rules, settings, agent instructions or an encrypted file is refused.
-   A path outside `--roots` is dropped and noted.
+2. **Plan.** The planner gets the task, the tracked file list, the files named with
+   `--file`, and the `--roots` it may touch, in one text-only call. It returns PLAN
+   JSON. A plan that names CI, hooks, gates, rules, settings, agent instructions, an
+   encrypted file, or a path outside `--roots` is refused, naming `--roots`. Outside
+   GRIP, a run with no `--roots` refuses before the planner is even called, naming
+   the repository's own tracked top-level folders to pick from; inside GRIP, the
+   default stays `lib/,tests/,bin/,skills/,docs/,scripts/`.
 3. **Run.** `codex exec` gets the plan on stdin in the worktree. The sandbox allows
    writes in the worktree only, the network is off, the environment is an allowlist,
    both API-key variables are blank, and `lib/openai_billing.check` passes the argv
@@ -71,26 +75,62 @@ planner, coder and reviewer triple and drops one that breaks a rule:
 - **R1:** two seats share a vendor, or the planner and the coder share a harness.
 - **R2:** GPT runs off the ChatGPT subscription, Claude runs on a paid key, or
   Claude takes the coder seat.
-- **R3:** a metered or free model takes a seat with no token bound, or its worst
-  case at list price exceeds the per-run cap.
+- **R3:** a metered or free model takes a seat with no token bound, a metered seat
+  has no list price for both input and output, or its worst case at list price
+  exceeds the per-run cap.
 - **R4:** the coder's harness has no verified sandbox.
 - **R5:** the seat has no headroom now, or it already failed in this run.
 
 The best surviving triple wins on rank. Billing class breaks a tie: flat-rate first,
 then free, then metered. Today that is Fable 5.2 to plan, Codex (GPT-6 Astra) to
 code and DeepSeek v4 Pro to review. If both Claude seats fail, DeepSeek plans and
-Gemini 3.1 Pro reviews. A seat that has already served is never replaced.
+Gemini 4 Carbon reviews. Carbon's seat carries the list price that starts on 1 December
+2026, 4 US dollars in and 20 out per million tokens, so the cost brake never reserves less
+than a call can cost once the price doubles. Its output cap is 32,768 tokens, the floor
+Google's Carbon migration guide gives. A seat that has already served is never replaced.
+
+## Dictate the seats
+
+`--planner`, `--coder` and `--reviewer` on `run`, `plan` and `roster` name a seat
+yourself instead of leaving it to the rule. A value is a seat id from
+`config/connect-roles.json`, or any HAL model address in `config/model_catalog.yaml`,
+such as `moonshot/kimi-k3.1-pro`. A dictated role keeps that one seat only, so it is
+never swapped for another, and R1 to R5 still decide:
+
+- A HAL model on the planner or reviewer seat makes one text-only call through
+  GRIP's HAL registry (the `hal` transport), at temperature 1, with the role's
+  bounds from the `dictated` table in the role file.
+- A HAL model is free only on a local tier; every other HAL call is metered, whatever
+  the catalogue's `paid` flag or `subscription` tier says. A metered seat needs a list
+  price, from an override row under `dictated.prices` or from the published price
+  `lib/hal/cost_tracker.py` bills, or R3 refuses it.
+  It is never priced at zero.
+- The seat's maker comes from the shared classifier in `lib/model_attribution.py`,
+  never from the provider name, so Gemma through Ollama still counts as Google
+  under R1. A model whose maker the classifier cannot name is refused.
+- A HAL model on the coder seat is refused: it has no token bound (R3), and no HAL
+  coder harness has a verified sandbox (R4). Codex stays the coder.
+- Claude through HAL breaks R2 (the paid key), and so does GPT outside Codex on
+  the subscription.
+
+Run `roster` with the same flags first: it prints the dictated triple and every
+rule it breaks, and an address that names nothing is refused with exit code 2.
 
 ## The brakes
 
 - **Cost.** A metered call reserves its worst case before it is sent: the prompt's
   bytes at the input price plus the output cap at the output price. The run's cap is
-  $0.75. The reservation stands, because the transports report no token counts. The
+  1.15 US dollars, so a run with Claude down still reaches Gemini 4 Carbon: DeepSeek
+  planning reserves up to 0.33 and Carbon reviewing up to 0.78 (under the earlier cap
+  of 0.75, Carbon could never be reserved after DeepSeek, and Grok 4.6 reviewed
+  instead). The cap does not fund a repair round's second review on that path; at worst
+  case that needs about 1.89. The reservation stands, because the transports report no token counts. The
   cap is a worst case, not expected spend: DeepSeek v4 Pro spends its output cap on
   hidden reasoning before it answers, so its seats carry a 64,000-token cap (a
   16,384 cap returned no answer for a 13 KB review prompt on 2026-10-05), which is
-  $0.25 of output at its peak price. The two live runs of 2026-11-11 reserved $0.04
-  each with the earlier, smaller caps.
+  0.25 US dollars of output at its peak price. The two live runs of 2026-11-11 reserved
+  0.04 US dollars each with the earlier, smaller caps. Amounts here are written in words
+  because Claude Code replaces a dollar sign followed by a digit with a skill argument.
 - **Time.** Plan 900 seconds, run 1,200, check 300 (half each for the head and the
   base), review 900.
 - **Stop.** `grip-connect stop` sets `state/connect/STOP`, or `STOP-<RUN_ID>` for

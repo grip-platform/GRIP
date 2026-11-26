@@ -54,7 +54,8 @@ PROJECTS_DIR = CLAUDE_DIR / "projects"
 _NEXT_UP_MD_TTL_DAYS = 7
 
 # Import unified path encoding
-sys.path.insert(0, str(CLAUDE_DIR / "lib"))
+if str(_LIB) not in sys.path:  # own lib (GRIP#9857), not CLAUDE_DIR's
+    sys.path.insert(0, str(_LIB))
 from path_encoding import encode_project_path  # noqa: E402
 from message_filters import is_command_wrapper  # noqa: E402
 from atomic_write import atomic_write_json  # noqa: E402

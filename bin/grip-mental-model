@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# grip-mental-model -- one up-to-date picture of GRIP, composed from the readers it has.
+# The contract it keeps is in lib/mental_model.py (GRIP#9967).
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec "$here/bin/grip-py" "$here/lib/mental_model.py" "$@"

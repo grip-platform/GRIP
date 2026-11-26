@@ -84,7 +84,7 @@ Activate when:
 !`git diff --stat HEAD 2>/dev/null | tail -5`
 
 **Remote sync:**
-!`git rev-list --left-right --count HEAD...@{upstream} 2>/dev/null | awk '{print "ahead: "$1", behind: "$2}' || echo "no upstream"`
+!`git rev-list --left-right --count HEAD...@{upstream} 2>/dev/null | awk '{print "ahead: "$(1)", behind: "$(2)}' || echo "no upstream"`
 
 Use the above pre-injected data instead of running these commands manually.
 

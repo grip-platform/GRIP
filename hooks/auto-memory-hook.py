@@ -60,7 +60,7 @@ def _resolve_project_memory_dir() -> Path:
 
     The folder name comes from lib/path_encoding.py, the encoder Claude Code's
     own folder names agree with, so ``~/.claude`` still becomes
-    ``-Users-x--claude``. The hand-rolled slug it replaces turned only slashes
+    ``-Users-you--claude``. The hand-rolled slug it replaces turned only slashes
     and dots into dashes. That left a Windows path absolute, so pathlib dropped
     ``CLAUDE_DIR / "projects"`` and the memories landed in a stray folder in
     the home directory that nothing reads (GRIP#6821).

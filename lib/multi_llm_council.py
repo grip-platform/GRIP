@@ -101,9 +101,9 @@ DEFAULT_MODELS = {
         "attack": "Find the weakest empirical assumption",
     },
     "gemini_pro": {
-        "name": "Gemini 3.1 Pro",
+        "name": "Gemini 4 Carbon",
         "provider": "gemini",
-        "model": "gemini-3.1-pro-preview",
+        "model": "gemini-4-carbon",
         "role": "mathematical logician",
         "attack": "Find the logical gap or hidden assumption",
     },
@@ -293,9 +293,15 @@ class Council:
     def _query(self, model_config: dict, prompt: str) -> str:
         """Query a model and return raw text."""
         if model_config["provider"] == "gemini":
+            # 8192, not 1024 (2026-11-26): Gemini 4 Carbon thinks before it answers
+            # and the thinking counts against max_tokens ("max_output_tokens caps
+            # your combined thinking and output tokens", ai.google.dev/gemini-api/
+            # docs/whats-new-gemini-4-carbon). It thought 61-89 tokens on a one-word
+            # prompt and returned no text at a 64-token cap. 8192 matches
+            # lib/ultrathink_trio._COUNCIL_MAX_TOKENS; a cap bills only what is used.
             result = self._get_gemini().generate(
                 prompt, model=model_config["model"],
-                temperature=0.3, max_tokens=1024
+                temperature=0.3, max_tokens=8192
             )
         else:
             model = model_config["model"]

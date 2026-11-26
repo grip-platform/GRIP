@@ -81,7 +81,7 @@ Cache the newest plan automatically when a session ends, and read it back on req
   "plan_content": "...",
   "cached_at": "2025-12-12T20:00:00Z",
   "project_path": "~/.claude",
-  "project_encoded": "-Users-laurie--claude"
+  "project_encoded": "-Users-you--claude"
 }
 ```
 

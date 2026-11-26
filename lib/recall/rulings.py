@@ -19,8 +19,11 @@ class Ruling:
 
 
 def _read(path):
+    # errors="replace", as the corpus layer decodes: an encrypted rule in a
+    # clone without the git-crypt key is not UTF-8, and a strict read of it
+    # failed this whole layer (found 2026-11-26).
     try:
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8", errors="replace")
     except FileNotFoundError:
         return {}, ""
     fields, _ = corpus.frontmatter(text)
@@ -83,9 +86,8 @@ def _paramount(rules):
 def load(claude_dir, *, roots=None) -> list[Ruling]:
     base = Path(claude_dir)
     if roots is None:
-        slug = str(base.resolve()).replace("/", "-").replace(".", "-")
         roots = corpus.CorpusRoots(
-            memory_dir=Path(os.environ.get("GRIP_RECALL_MEMORY_DIR") or base / "projects" / slug / "memory"),
+            memory_dir=Path(os.environ.get("GRIP_RECALL_MEMORY_DIR") or corpus.default_memory_dir(base)),
             rules_dir=Path(os.environ.get("GRIP_RECALL_RULES_DIR") or base / "rules"))
     return _pinned(roots.memory_dir) + _remembered(base / "CLAUDE.md") + _paramount(roots.rules_dir)
 

@@ -280,8 +280,10 @@ type: brief description
 
 [optional body]
 
-Primary Author: Your Name
+Primary Author: <operator signature>
 ```
+
+Fill `<operator signature>` with what `bin/grip-operator-signature` prints.
 
 ### Types
 
@@ -306,7 +308,7 @@ npm install -D @commitlint/cli @commitlint/config-conventional
 echo "module.exports = {extends: ['@commitlint/config-conventional']}" > commitlint.config.js
 
 # Add Husky hook
-npx husky add .husky/commit-msg 'npx --no -- commitlint --edit "$1"'
+npx husky add .husky/commit-msg 'npx --no -- commitlint --edit "${1}"'
 ```
 
 ## Repository Analysis

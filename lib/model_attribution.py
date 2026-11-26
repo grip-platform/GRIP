@@ -59,6 +59,7 @@ _VENDOR_PREFIXES: tuple[tuple[str, str], ...] = (
     ("o1-", "openai"),
     ("o3-", "openai"),
     ("gemini", "google"),
+    ("gemma", "google"),
     ("deepseek", "deepseek"),
     ("grok", "xai"),
     ("qwen", "alibaba"),

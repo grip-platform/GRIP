@@ -6,7 +6,7 @@ operator memorising `kimi-k3`. Two rules, both operator-chosen (V>> 2026-07-31):
 
 FLAGSHIP, not newest. config/providers.yaml lists models newest-first, but
 newest is not best: taking the first entry gives `claude-sonnet-5` over
-`claude-opus-5`, and `gemini-3.5-flash` over `gemini-3.1-pro-preview`. So each
+`claude-opus-5`, and `gemini-3.5-flash` over `gemini-4-carbon`. So each
 family carries an explicit flagship pin. The pin is DATA, and
 tests/test_grip_harness_family.py asserts every pin still exists in
 providers.yaml, so a pin cannot rot into a model the gateway no longer routes.
@@ -58,7 +58,9 @@ FAMILY_FLAGSHIP: "dict[str, str]" = {
     # Opus 5.5 from 2026-09-24: V>> made it the launch default (cheaper than
     # Opus 5, and the vendor's recommended starting model).
     "claude": "claude-opus-5-5",
-    "gemini": "gemini-3.1-pro-preview",
+    # Gemini 4 Carbon from 2026-11-26: V>> replaced 3.1 Pro with Google's
+    # strongest model wherever 3.1 Pro was a seat or a default.
+    "gemini": "gemini-4-carbon",
     "deepseek": "deepseek-v4-pro",
     # glm-5.3, not glm-5.1: Zhipu's GLM Coding Plan has answered every `glm-5.1`
     # request with GLM-5.3 since at least 2026-11-24 (GRIP#9431 -- two probes,

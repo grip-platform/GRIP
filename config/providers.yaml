@@ -27,7 +27,7 @@ providers:
     type: cloud
     base_url: https://generativelanguage.googleapis.com/v1beta/openai
     api_key_source: keychain:grip-gemini
-    models: [gemini-3.5-flash, gemini-3.1-pro-preview, gemini-3.1-flash-lite, gemini-3.5-flash-lite, gemini-2.5-flash-lite, gemini-4-argon, gemini-3.6-flash, gemini-3.8-flash, gemini-4-carbon, gemini-4-hydrogen]
+    models: [gemini-3.5-flash, gemini-3.1-pro-preview, gemini-3.1-flash-lite, gemini-3.5-flash-lite, gemini-2.5-flash-lite, gemini-4-argon, gemini-3.6-flash, gemini-3.8-flash, gemini-4-carbon, gemini-4-hydrogen, gemini-4-neon]
     # gemini-3.5-flash was deprecated on 2026-10-08 (changelog: "API requests to
     # gemini-3.5-flash are automatically routed to gemini-3.6-flash"); it stays listed
     # while the id is accepted, so `--gemini flash` keeps its meaning. gemini-3.6-flash
@@ -55,8 +55,12 @@ providers:
     # gemini-3.8-flash, so no earlier qualifier moves: `--gemini 4` still
     # names gemini-4-argon (position is behaviour;
     # tests/test_model_onboarding_parity.py). `--gemini carbon` and
-    # `--gemini hydrogen` name the new ids; FAMILY_FLAGSHIP and every
-    # chain/seat stay on gemini-3.1-pro-preview.
+    # `--gemini hydrogen` name the new ids. On 2026-11-26 V>> moved FAMILY_FLAGSHIP,
+    # the quality_cost complex tier and the premium tier chain from
+    # gemini-3.1-pro-preview to gemini-4-carbon; 3.1 Pro stays listed and priced.
+    # gemini-4-neon added 2026-11-26 (GA 2026-11-18, ai.google.dev/gemini-api/
+    # docs/changelog), appended LAST after gemini-4-hydrogen for the same reason:
+    # `--gemini 4` still names gemini-4-argon, `--gemini neon` names the new id.
 
   - name: qwen
     type: cloud
@@ -380,7 +384,7 @@ routing:
   quality_cost:
     simple:  groq/openai/gpt-oss-120b
     standard: openrouter/deepseek/deepseek-v4-flash
-    complex: gemini/gemini-3.1-pro-preview
+    complex: gemini/gemini-4-carbon
     local:   ollama/gemma4:26b
 
   # Tier-scoped fallback chains — failures stay within cost tier before escalating
@@ -388,7 +392,7 @@ routing:
     free:    [ollama/gemma4:26b, openrouter/openrouter/free]
     cheap:   [groq/openai/gpt-oss-20b, qwen/qwen3.5-flash, openrouter/deepseek/deepseek-v4-flash]
     mid:     [gemini/gemini-3.5-flash-lite, deepseek/deepseek-flash, moonshot/kimi-k2.6]
-    premium: [xai/grok-4.3, gemini/gemini-3.1-pro-preview, qwen/qwen3.7-max, moonshot/kimi-k2.7-code]
+    premium: [xai/grok-4.3, gemini/gemini-4-carbon, qwen/qwen3.7-max, moonshot/kimi-k2.7-code]
 
   # Council models for cross-LLM deliberation (HALCouncil)
   # Architecture diversity: Groq OSS, Google, xAI, Alibaba, DeepSeek, Mistral open-weight

@@ -1,5 +1,5 @@
 ---
-description: Moat-grounded, cost-tiered reasoning — ground the question in GRIP's verified moat + RED chain, run a cheap Pool-B pass, escalate to the sovereign council only if the answer is unconfident. $0, off the weekly Anthropic limit.
+description: Moat-grounded, cost-tiered reasoning — ground the question in GRIP's verified moat + RED chain, run a cheap Pool-B pass, escalate to the sovereign council only if the answer is unconfident. No cost, off the weekly Anthropic limit.
 disable-model-invocation: false
 harness: universal
 ---
@@ -31,7 +31,7 @@ Pool-B, escalate to the sovereign council only if a confidence criterion is unme
 ## Notes
 
 - Both tiers run on **Pool-B** (HAL `grip_infer` + `bin/grip-sovereign-council`) —
-  non-Anthropic, $0, off the weekly limit (`rules/pool-a-offload-routing.md`).
+  non-Anthropic, no cost, off the weekly limit (`rules/pool-a-offload-routing.md`).
 - Fail-open: if a tier is unreachable, the best answer in hand is returned — never
   a hard error.
 - Falsifier + N=1 maturity caveat: see `skills/ultrareason/SKILL.md`.

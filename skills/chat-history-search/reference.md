@@ -9,7 +9,7 @@
 **Location:** `~/.claude/projects/{encoded-project-path}/{session-uuid}.jsonl`
 
 **Path Encoding:** Forward slashes replaced with hyphens
-- Example: `~/project/` → `-Users-name-project`
+- Example: `~/project/` → `-Users-you-project`
 
 ### Schema (User Message)
 

@@ -3,7 +3,7 @@
 L1 (`prove_it.verify_quote`) proves a quote EXISTS verbatim in the source. L2
 asks a panel of external, non-Claude LLMs the next question: does that quote
 actually *support* the claim? Each provider votes supported/partial/unsupported;
-a majority (MoE) is taken; an LLM-as-judge (Gemini 3.1 Pro) synthesises a final
+a majority (MoE) is taken; an LLM-as-judge (Gemini 4 Carbon) synthesises a final
 verdict + one-line reason.
 
 Two invariants from `rules/llm-augmentation-pattern.md`:
@@ -89,6 +89,13 @@ def _parse_why(text: str, key: str = "why") -> str:
 #: 190 tokens thinking, 2.5 Pro about 680, the 3.1 Pro judge about 190), so each
 #: returned no verdict and the judge always fell through to Groq. 2048 leaves room.
 _GEMINI_MAX_TOKENS = 2048
+
+#: The Gemini judge's own budget. Gemini 4 Carbon took the judge seat on 2026-11-26;
+#: Google's migration guide says to raise max_output_tokens to at least 32,768 for
+#: it, and it was not measured on this prompt (3.1 Pro thought about 190 tokens
+#: here). 8192 matches the council judges' cap and is billed only as used. The
+#: voters keep _GEMINI_MAX_TOKENS.
+_GEMINI_JUDGE_MAX_TOKENS = 8192
 
 
 def _gemini_vote(claim: str, quote: str, model: str = "gemini-3.5-flash-lite"):
@@ -212,13 +219,13 @@ def _default_panel(mode: str = "standard") -> list[tuple]:
 
 
 def _gemini_judge(claim: str, quote: str, votes: dict, whys: dict):
-    """LLM-as-judge synthesis (Gemini 3.1 Pro). Returns (verdict, synthesis)."""
+    """LLM-as-judge synthesis (Gemini 4 Carbon). Returns (verdict, synthesis)."""
     from providers.gemini import GeminiProvider  # type: ignore
     vote_lines = "\n".join(f"- {name}: {v} ({whys.get(name, '')})" for name, v in votes.items())
     p = GeminiProvider()
     r = p.generate(JUDGE_PROMPT.format(claim=claim, quote=quote, votes=vote_lines),
-                   model="gemini-3.1-pro-preview", temperature=0.1,
-                   max_tokens=_GEMINI_MAX_TOKENS)
+                   model="gemini-4-carbon", temperature=0.1,
+                   max_tokens=_GEMINI_JUDGE_MAX_TOKENS)
     txt = r.text if hasattr(r, "text") else str(r)
     return _parse_verdict(txt), _parse_why(txt, "synthesis")
 

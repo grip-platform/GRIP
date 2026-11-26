@@ -28,7 +28,7 @@ python3 -m lib.active_llm frontier
 ## The frontier roster
 
 The council that backs /frontier work is: **GPT-5.6 Sol** (OpenAI),
-**DeepSeek**, **Gemini 3.1 Pro** (judge — Pro, not Flash), plus the
+**DeepSeek**, **Gemini 4 Carbon** (judge — Google's strongest, not Flash), plus the
 harness-aware seat above (Claude outside Claude Code / Kimi K3 inside).
 
 Kimi K3 was chosen by council investigation on 2026-08-26: GPT-5.6 Sol and

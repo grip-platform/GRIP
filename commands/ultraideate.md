@@ -12,8 +12,10 @@ protocol, the honest limits, and the measure live in
 `skills/ultraideate/SKILL.md`; this stub deliberately does not duplicate them.
 
 Kernel: `~/.grip/venv/bin/python -m lib.ultraideate rank "<topic>" --top N
-[--ideas-file FILE | --seeds-file FILE] [--json] [--seal]`. `--seeds-file`
+[--ideas-file FILE | --seeds-file FILE] [--json] [--seal] [--shuffle]`. `--seeds-file`
 scores the operator's own ideas together with DIVERGE's and always shows them.
+`--shuffle` shows the top ideas in random order, to separate Jev's ranking
+from the operator just picking whatever is shown first (GRIP#9471).
 `~/.grip/venv/bin/python -m lib.ultraideate picks <run_id> <ids> --topic "<topic>"`
 records the operator's pick against that run's full ranked order. The `report` subcommand
 (`~/.grip/venv/bin/python -m lib.ultraideate report`) reads the picks log,

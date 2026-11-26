@@ -70,11 +70,11 @@ Ask: "How should converge outputs be scored?"
 | Option | Description | Cost |
 |--------|-------------|------|
 | self-only | Current behaviour, fastest | Free |
-| external-on-proof | External scoring only during /proof | Low (Gemini 3.1 Pro lead, Groq free tier) |
+| external-on-proof | External scoring only during /proof | Low (Gemini 4 Carbon lead, Groq free tier) |
 | external-on-converge | Every /converge gets external scoring | Medium |
 | council | Self + 2 external, weighted median | Medium (recommended) |
 
-Note: Gemini 3.1 Pro is the lead scorer. Claude is EXCLUDED from the external council (same model family = self-scoring bias).
+Note: Gemini 4 Carbon is the lead scorer. Claude is EXCLUDED from the external council (same model family = self-scoring bias).
 
 ### Step 5 (Confirmation)
 

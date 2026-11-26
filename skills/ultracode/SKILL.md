@@ -42,7 +42,7 @@ does not provide — and this kernel does — is the delta:
 | `kernel.py` | `content_hash` · immutable `State`/`Node` DAG · idempotent `run()` · `Adapter` seam |
 | `primitives.py` | `dispatch` (fan-out) · `verify` (MONOTONE: l2 can only tighten l1, never rescue) · `synthesize` (exogenous judge) · `recurse` (bounded refine-to-criterion) |
 | `topology.py` | `chain` (CoT) · `tree` (ToT beam search) · `forest` (FoT + judge) · `solve(cfg.topology)` router |
-| `adapters.py` | `DeterministicAdapter` ($0, portable) · `HALAdapter` (Pool B, availability-guarded) |
+| `adapters.py` | `DeterministicAdapter` (free, portable) · `HALAdapter` (Pool B, availability-guarded) |
 | `workflows.py` | named-workflow registry — envelopes stay pure data; both harnesses resolve the same name |
 | `harness.py` | HAPPI seam: `make_envelope` / `parse_envelope` (fail-closed) / `execute_envelope` (THE single executor) / headless `main()` (NDJSON started/delta/completed, exit 0 on completed) |
 
@@ -57,7 +57,7 @@ does not provide — and this kernel does — is the delta:
 ```python
 from lib.ultracode.harness import execute_envelope, make_envelope
 
-env = make_envelope("teach_quiz", {"subject": "x"})          # deterministic, $0
+env = make_envelope("teach_quiz", {"subject": "x"})          # deterministic, free
 env_live = make_envelope("teach_quiz", {"subject": "x"}, adapter="hal")  # Pool B
 result = execute_envelope(env)                                # {output, result_hash, calls, …}
 ```
