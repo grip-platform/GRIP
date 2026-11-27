@@ -9,7 +9,9 @@ because a fallback ladder per seat can put two seats on one vendor.
 
 - R1: two seats share a vendor, or the planner and the coder share a harness.
 - R2: a never-rule breaks -- GPT off the ChatGPT subscription, Claude on the paid
-  key, or Claude on the coder seat.
+  key, or Claude on the coder seat. One exception: the planner alone may also
+  reach a still-subscription-billed Claude seat through HAL's CCH signer
+  (``claude-cch``) instead of ``claude -p`` (GRIP#9272).
 - R3: a metered or free model sits on a seat with no token bound, a metered seat
   has no list price recorded, or a metered seat's worst case at list price
   exceeds the per-run cap.
@@ -45,7 +47,8 @@ BILLING_CLASSES = ("subscription", "membership", "free", "metered")
 #: Ties go flat-rate first, then free, then metered.
 _TIE = {"subscription": 0, "membership": 0, "free": 1, "metered": 2}
 #: The harness each transport runs in. R1 keeps the planner and coder apart.
-_HARNESS = {"claude-p": "claude-code", "codex-agent": "codex", "council": "http", "hal": "http"}
+_HARNESS = {"claude-p": "claude-code", "claude-cch": "http", "codex-agent": "codex",
+            "council": "http", "hal": "http"}
 DEFAULT_ROLES = Path(__file__).resolve().parents[1] / "config" / "connect-roles.json"
 DEFAULT_CATALOG = Path(__file__).resolve().parents[1] / "config" / "model_catalog.yaml"
 MICRO = 1_000_000
@@ -241,10 +244,19 @@ def _r1(triple: tuple) -> str:
     return ""
 
 
+#: GRIP#9272 (Fable B): the official CLI stopped taking claude-fable-5-2 around
+#: 2026-11-13, so the planner role alone may also reach a subscription-billed
+#: Claude seat through HAL's CCH signer instead of claude -p. Nothing wider:
+#: the coder and reviewer roles, and every other billing or transport, are
+#: refused exactly as before.
+_ANTHROPIC_PLANNER_TRANSPORTS = ("claude-p", "claude-cch")
+
+
 def _r2(seat: Seat) -> str:
     if seat.vendor == "openai" and (seat.billing, seat.transport) != ("subscription", "codex-agent"):
         return f"R2: {seat.id} would run GPT off the ChatGPT subscription"
-    if seat.vendor == "anthropic" and (seat.billing, seat.transport) != ("subscription", "claude-p"):
+    ok = _ANTHROPIC_PLANNER_TRANSPORTS if seat.role == "planner" else ("claude-p",)
+    if seat.vendor == "anthropic" and (seat.billing, seat.transport) not in {("subscription", t) for t in ok}:
         return f"R2: {seat.id} would run Claude on the paid key"
     if seat.vendor == "anthropic" and seat.role == "coder":
         return f"R2: {seat.id} would put Claude on the unbounded coder seat"

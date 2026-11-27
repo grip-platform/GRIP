@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field, fields
@@ -50,9 +51,46 @@ try:  # package import (PYTHONPATH=~/.grip)
 except ImportError:  # direct import with lib/ on the path
     from next_step_router import RELEASE_SECONDS, SILENT_WAIT_SECONDS
 
+# Every read-modify-write of the store holds one lock across processes
+# (GRIP#10171, a Codex finding): a whole-file write could otherwise erase what
+# another writer recorded in between, such as an answer arriving while a
+# withdrawal ran. The canonical lock is lib/file_lock.py, whose bare `_compat`
+# import needs lib/ itself on sys.path, as lib/audit_chain.py notes. lib/ is
+# appended, not inserted, so nothing in it can shadow another module.
+_LIB = Path(__file__).resolve().parent
+if str(_LIB) not in sys.path:
+    sys.path.append(str(_LIB))
+from file_lock import FileLock  # noqa: E402
+
+# Well inside the recorder hook's 10-second deadline (config/hooks.registry.json),
+# so a lock wait ends before the harness kills the hook (a Codex finding); a write
+# takes milliseconds.
+_LOCK_TIMEOUT_S = 3.0
+
+# A question still open this long after it was asked has EXPIRED (GRIP#10186,
+# rules/lifecycle-closed-or-expired.md). It stays open and unanswered: a reply
+# that names it by its ref still reaches it, and its session may still withdraw
+# it. But no board, alert or notice counts it as current work. By 2026-11-27,
+# 737 parked questions had built up, and while any one of them stayed open no
+# new parking notice was sent. Expiry is worked out at every read, so nothing
+# is rewritten and no reaper is needed.
+EXPIRY_S = 7 * 24 * 3600
+
+# A parking notice that failed to send is tried again after this long, never on
+# every 20-second sweep (GRIP#10186 item 5).
+NOTICE_RETRY_S = 15 * 60
+
+# ... and at most this many times in all. A failed try still holds the notice
+# thread, so later questions stay silent, and a transport that reports failure
+# for a message that did arrive can repeat it at most twice. The bound on the
+# phone stays structural, as the anti-1,120 design requires.
+NOTICE_ATTEMPTS = 3
+
 __all__ = [
     "Pending",
     "PendingStore",
+    "PendingReader",
+    "PendingWriter",
     "plain_alert",
     "should_alert",
     "board",
@@ -60,6 +98,13 @@ __all__ = [
     "NOT_NEEDED",
     "parking_notice",
     "parked_board",
+    "withdraw",
+    "withdraw_refusal",
+    "bare_session",
+    "live_questions",
+    "EXPIRY_S",
+    "NOTICE_RETRY_S",
+    "NOTICE_ATTEMPTS",
     "ALERT_LOCK",
     "SILENT_WAIT_SECONDS",
     "RELEASE_SECONDS",
@@ -170,6 +215,20 @@ class Pending:
     materiality: str | None = None
     # The HALT class that makes it his, in plain words, or None when there is none.
     why_yours: str | None = None
+    # A withdrawal (GRIP#10171): the session that asked closes a question whose
+    # work was settled another way, such as an answer given inside the session or
+    # a step done once he allowed it. It is never an answer: `answer` and
+    # `answered_at` stay empty, so it authorises nothing.
+    withdrawn_at: float | None = None
+    withdrawn_reason: str | None = None
+    withdrawn_by: str | None = None
+    # The parking notice (GRIP#10186 item 5). The question whose notice was
+    # tried, delivered or not, holds the one notice thread until it is answered,
+    # withdrawn or expires. A failed notice is tried again, NOTICE_RETRY_S
+    # apart and at most NOTICE_ATTEMPTS times in all.
+    notice_sent_at: float | None = None
+    notice_tried_at: float | None = None
+    notice_attempts: int = 0
 
     @property
     def needs_decision(self) -> bool:
@@ -199,11 +258,46 @@ class Pending:
 
     @property
     def is_open(self) -> bool:
-        return self.answered_at is None
+        return self.answered_at is None and self.withdrawn_at is None
+
+    def is_expired(self, now: float | None = None) -> bool:
+        """Open, and asked more than EXPIRY_S ago. Expiry never answers anything."""
+        now = time.time() if now is None else now
+        return self.is_open and now - self.asked_at > EXPIRY_S
 
 
-class PendingStore:
-    """Atomic, concurrency-safe JSON store shared by every session and shim."""
+def _closed(row: dict) -> bool:
+    """Answered or withdrawn: either way, nobody is waiting on it any more."""
+    return row.get("answered_at") is not None or row.get("withdrawn_at") is not None
+
+
+def bare_session(session_id: str | None) -> str:
+    """A session id without the mesh's `cc-` prefix, so both spellings match."""
+    sid = (session_id or "").strip()
+    return sid[3:] if sid.startswith("cc-") else sid
+
+
+def withdraw_refusal(question: Pending | None, reason: str, by_session: str) -> str | None:
+    """Why withdrawing this question would be refused, in plain words, or None when allowed.
+
+    One rule for PendingWriter.withdraw, which applies it under the lock, and for a
+    command that explains a refusal afterwards (GRIP#10186 item 1b).
+    """
+    if question is None:
+        return "there is no such question"
+    if not question.is_open:
+        return "the question is already closed"
+    if not (reason or "").strip():
+        return "no reason was given"
+    if not _SESSION_ID.match(by_session or ""):
+        return f"{by_session!r} is not a session id"
+    if bare_session(question.session_id) != bare_session(by_session):
+        return "only the session that asked may withdraw it"
+    return None
+
+
+class _PendingFile:
+    """The store's one JSON file: read whole, and written atomically under one lock."""
 
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
@@ -229,22 +323,34 @@ class PendingStore:
             Path(tmp).unlink(missing_ok=True)
             raise
 
-    def add(self, pending: Pending) -> Pending:
-        data = self._read()
-        # Re-asking the same question does not create a second entry, which is
-        # what stops a restarted or looping session earning a fresh alert.
-        if pending.question_id in data:
-            return _from_row(data[pending.question_id])
-        data[pending.question_id] = asdict(pending)
-        self._write(data)
-        return pending
+    def _locked(self) -> FileLock:
+        """One writer at a time, across every session and shim, through a sidecar lock file."""
+        return FileLock(self.path, sidecar=True, timeout=_LOCK_TIMEOUT_S)
+
+
+class PendingReader(_PendingFile):
+    """What a reader may ask of the store, and nothing that changes it (GRIP#10186).
+
+    The boards, the notices and the reply count read through this role, so they
+    cannot change the store by mistake. A read takes no lock: every write
+    replaces the file whole, so a reader sees the old store or the new one.
+    """
 
     def open_questions(self) -> list[Pending]:
-        return [_from_row(v) for v in self._read().values() if v.get("answered_at") is None]
+        return [_from_row(v) for v in self._read().values() if not _closed(v)]
+
+    def question(self, question_id: str) -> Pending | None:
+        """The stored question with this id, open or closed, or None."""
+        row = self._read().get(question_id)
+        return None if row is None else _from_row(row)
 
     def alerted(self) -> Pending | None:
-        """The one question currently holding the global alert, if any."""
-        live = [p for p in self.open_questions() if p.alerted_at is not None and not p.parked]
+        """The one question currently holding the global alert, if any.
+
+        An expired question never holds it. The sweep never parks an expired
+        question, so without this check one could hold the budget for ever.
+        """
+        live = [p for p in live_questions(self) if p.alerted_at is not None and not p.parked]
         live.sort(key=lambda p: p.alerted_at or 0, reverse=True)
         return live[0] if live else None
 
@@ -252,18 +358,73 @@ class PendingStore:
         """False when another question already holds the notification budget."""
         return self.alerted() is None
 
+    def notice_holder(self, now: float | None = None) -> Pending | None:
+        """The live parked question that holds the one parking-notice thread, if any.
+
+        It is the question whose notice was tried, delivered or not. While it is
+        open and not expired, a newly parked question joins the board without a
+        notice, so a failing transport is never tried once per new question.
+        """
+        held = [p for p in live_questions(self, now) if p.parked and p.notice_tried_at is not None]
+        return max(held, key=lambda p: p.notice_tried_at or 0.0, default=None)
+
+    def resolve_reply(self, text: str) -> Pending | None:
+        """Work out which question a reply from a phone is answering.
+
+        Explicit ref wins. Otherwise, because only one question may hold an
+        alert at a time, an un-addressed reply has exactly one possible target —
+        which is the whole reason for the global budget. If nothing is alerted
+        and exactly one live question is open, that one takes it; if several are
+        open and none alerted, the reply is genuinely ambiguous and NOTHING is
+        guessed, because guessing here answers the wrong question on his behalf.
+        An expired question is reached only by its ref (GRIP#10186).
+        """
+        head = text.strip().split()
+        if head:
+            token = head[0].strip("#:,.").lower()
+            for p in self.open_questions():
+                if p.ref == token:
+                    return p
+            # A ref that names a question already answered or withdrawn addresses
+            # THAT question, which is closed: the reply must never fall through to
+            # another one (GRIP#10171, a Codex finding). The watcher picks a reply
+            # by an open ref, and the question can close before it is delivered.
+            if any(qid[:4] == token for qid in self._read()):
+                return None
+        live = self.alerted()
+        if live is not None:
+            return live
+        openq = live_questions(self)
+        return openq[0] if len(openq) == 1 else None
+
+
+class PendingWriter(_PendingFile):
+    """Every change to the store, each a read-modify-write under the one lock."""
+
+    def add(self, pending: Pending) -> Pending:
+        with self._locked():
+            data = self._read()
+            # Re-asking the same question does not create a second entry, which is
+            # what stops a restarted or looping session earning a fresh alert.
+            if pending.question_id in data:
+                return _from_row(data[pending.question_id])
+            data[pending.question_id] = asdict(pending)
+            self._write(data)
+        return pending
+
     def mark_alerted(self, question_id: str, when: float | None = None) -> bool:
         """Latch the alert. Returns False if it had already fired.
 
         The latch is the single property standing between this feature and the
         advisor V>> killed: `alert_once` has to BE once, not be named once.
         """
-        data = self._read()
-        row = data.get(question_id)
-        if row is None or row.get("alerted_at") is not None:
-            return False
-        row["alerted_at"] = when if when is not None else time.time()
-        self._write(data)
+        with self._locked():
+            data = self._read()
+            row = data.get(question_id)
+            if row is None or row.get("alerted_at") is not None:
+                return False
+            row["alerted_at"] = when if when is not None else time.time()
+            self._write(data)
         return True
 
     def park(self, question_id: str, assumed_default: str | None = None) -> bool:
@@ -275,54 +436,116 @@ class PendingStore:
         ledger then shows both halves — that he was asked, and what was chosen
         in his absence — instead of only the flattering one.
         """
-        data = self._read()
-        row = data.get(question_id)
-        if row is None or row.get("answered_at") is not None:
-            return False
-        row["parked"] = True
-        # Absence of a declared default is itself a state worth recording, and
-        # recording it is the whole point: None renders identically to "nothing
-        # depended on this", which is how the gap hides.
-        row["assumed_default"] = (
-            assumed_default if assumed_default is not None else UNDECLARED
-        )
-        row["default_source"] = "agent" if assumed_default is not None else None
-        self._write(data)
+        with self._locked():
+            data = self._read()
+            row = data.get(question_id)
+            if row is None or _closed(row):
+                return False
+            row["parked"] = True
+            # Absence of a declared default is itself a state worth recording, and
+            # recording it is the whole point: None renders identically to "nothing
+            # depended on this", which is how the gap hides.
+            row["assumed_default"] = (
+                assumed_default if assumed_default is not None else UNDECLARED
+            )
+            row["default_source"] = "agent" if assumed_default is not None else None
+            self._write(data)
         return True
 
     def answer(self, question_id: str, text: str, via: str) -> Pending | None:
         """Record V>>'s reply, from whichever shim it arrived on."""
-        data = self._read()
-        row = data.get(question_id)
-        if row is None or row.get("answered_at") is not None:
-            return None
-        row["answered_at"] = time.time()
-        row["answer"] = text
-        row["answered_via"] = via
-        self._write(data)
+        with self._locked():
+            data = self._read()
+            row = data.get(question_id)
+            if row is None or _closed(row):
+                return None
+            row["answered_at"] = time.time()
+            row["answer"] = text
+            row["answered_via"] = via
+            self._write(data)
         return _from_row(row)
 
-    def resolve_reply(self, text: str) -> Pending | None:
-        """Work out which question a reply from a phone is answering.
+    def mark_noticed(self, question_id: str, when: float, delivered: bool) -> bool:
+        """Record a parking-notice try, which makes this question the notice holder.
 
-        Explicit ref wins. Otherwise, because only one question may hold an
-        alert at a time, an un-addressed reply has exactly one possible target —
-        which is the whole reason for the global budget. If nothing is alerted
-        and exactly one question is open, that one takes it; if several are open
-        and none alerted, the reply is genuinely ambiguous and NOTHING is
-        guessed, because guessing here answers the wrong question on his behalf.
+        Returns False when the question is missing or closed. It never answers anything.
         """
-        head = text.strip().split()
-        if head:
-            token = head[0].strip("#:,.").lower()
-            for p in self.open_questions():
-                if p.ref == token:
-                    return p
-        live = self.alerted()
-        if live is not None:
-            return live
-        openq = self.open_questions()
-        return openq[0] if len(openq) == 1 else None
+        with self._locked():
+            data = self._read()
+            row = data.get(question_id)
+            if row is None or _closed(row):
+                return False
+            row["notice_tried_at"] = when
+            row["notice_attempts"] = int(row.get("notice_attempts") or 0) + 1
+            if delivered:
+                row["notice_sent_at"] = when
+            self._write(data)
+        return True
+
+    def withdraw(self, question_id: str, reason: str, by_session: str) -> Pending | None:
+        """Close the asking session's own question when its work was settled another way.
+
+        GRIP#10171: an answer given inside the session, or a step done once he allowed
+        it, never reached this store, so such a question stayed open forever. Only the
+        session that asked may withdraw it, and only with a reason. A withdrawal is
+        never an answer: `answer` and `answered_at` stay empty, so nothing can read it
+        as his decision, and a later reply finds the question closed. Returns None when
+        `withdraw_refusal` names a refusal: the question is missing or already closed,
+        the reason is blank, or `by_session` is not the asking session.
+
+        Two sessions that end on the same step text share one row, because the
+        question id comes from that text (the de-duplication that stops a restarted
+        session earning a fresh alert). The row belongs to its first asker, and its
+        withdrawal closes it for both, because the same text names the same step.
+        `bin/grip-pending-withdraw` is the command a session runs.
+
+        `by_session` is stored verbatim as `withdrawn_by`; `bare_session` drops the
+        mesh's `cc-` prefix only to compare it with the asker. The ownership check
+        stops one session closing another's question by mistake. It is not a
+        security boundary: the store is a plain local file that any local process
+        can write (GRIP#10186 item 3).
+        """
+        reason = (reason or "").strip()
+        with self._locked():
+            data = self._read()
+            row = data.get(question_id)
+            if withdraw_refusal(None if row is None else _from_row(row), reason, by_session):
+                return None
+            row["withdrawn_at"] = time.time()
+            row["withdrawn_reason"] = reason
+            row["withdrawn_by"] = by_session
+            self._write(data)
+        return _from_row(row)
+
+
+class PendingStore(PendingReader, PendingWriter):
+    """Atomic, concurrency-safe JSON store shared by every session and shim.
+
+    It holds both roles. A caller that only reads can take a PendingReader
+    instead, and then it cannot change the store by mistake.
+    """
+
+
+def live_questions(store: PendingReader, now: float | None = None) -> list[Pending]:
+    """The open questions that are still current work: every one not expired."""
+    return _live_and_expired(store.open_questions(), now)[0]
+
+
+def _live_and_expired(
+    questions: list[Pending], now: float | None = None
+) -> tuple[list[Pending], list[Pending]]:
+    """Split open questions in two, so no report counts an expired one as current work."""
+    now = time.time() if now is None else now
+    live: list[Pending] = []
+    expired: list[Pending] = []
+    for p in questions:
+        (expired if p.is_expired(now) else live).append(p)
+    return live, expired
+
+
+def withdraw(store: PendingWriter, question_id: str, reason: str, by_session: str) -> Pending | None:
+    """The function form of PendingWriter.withdraw, for callers that import it by name."""
+    return store.withdraw(question_id, reason, by_session)
 
 
 def plain_alert(pending: Pending) -> str:
@@ -390,7 +613,7 @@ def should_alert(
     return not independent_work_remains
 
 
-def board(store: PendingStore) -> str:
+def board(store: PendingReader) -> str:
     """The pull surface: everything waiting on him, across every session.
 
     This is the primary mechanism and the push is the option layered on top. A
@@ -403,9 +626,10 @@ def board(store: PendingStore) -> str:
     view and can be corrected. With no chore open, the render is exactly what it
     was before the materiality verdict existed.
     """
-    openq = sorted(store.open_questions(), key=lambda p: p.asked_at)
+    openq, expired = _live_and_expired(store.open_questions())
+    openq.sort(key=lambda p: p.asked_at)
     if not openq:
-        return "Nothing is waiting on you."
+        return _join_sections(["Nothing is waiting on you."], _expired_section(expired))
 
     routable = [p for p in openq if p.is_routable]
     decisions = [p for p in routable if p.needs_decision]
@@ -414,6 +638,7 @@ def board(store: PendingStore) -> str:
         _board_decisions(decisions, chores),
         _chore_section(chores, _board_item, "chore"),
         _unroutable_section([p for p in openq if not p.is_routable]),
+        _expired_section(expired),
     )
 
 
@@ -479,6 +704,15 @@ def _unroutable_section(unroutable: list[Pending]) -> list[str]:
             + [f"  [{p.ref}] {_one_line(p.summary)}" for p in unroutable])
 
 
+def _expired_section(expired: list[Pending]) -> list[str]:
+    """One line for the expired questions, never folded into the live count (GRIP#10186)."""
+    if not expired:
+        return []
+    noun = "question" if len(expired) == 1 else "questions"
+    return [f"{len(expired)} older {noun}, unanswered for over {EXPIRY_S // 86400} days, "
+            "kept on record but not current work."]
+
+
 # ------------------------------------------------- the parking notice
 
 # Astra's specification (gpt-6-astra via the HAL gateway, 2026-09-20), which
@@ -509,22 +743,29 @@ def _unroutable_section(unroutable: list[Pending]) -> list[str]:
 # notification cannot guarantee it."
 
 
-def parking_notice(store: PendingStore, newly_parked: Pending) -> str | None:
+def parking_notice(store: PendingReader, newly_parked: Pending, now: float | None = None) -> str | None:
     """The text to send when a question parks, or None to stay silent.
 
     Returns None when a parking notice is already outstanding — the thread is
     unacknowledged, so this question is appended to the board and the operator
-    is NOT pinged again. Silence here is the feature.
+    is NOT pinged again. Silence here is the feature. An expired question never
+    earns a notice, and never counts as one outstanding (GRIP#10186). `now` is
+    the caller's clock, so the sweep that parked the question decides its expiry
+    and this notice on one reading.
+
+    Outstanding means another live question holds the notice thread, because its
+    notice was tried (item 5). Before, any other parked question counted, so a
+    parked question that never got a notice, because the operator was away or
+    the send failed, silenced every later one.
     """
-    others = [
-        p for p in store.open_questions()
-        if p.parked and p.question_id != newly_parked.question_id
-    ]
-    if others:
-        return None  # a notice is already outstanding; append, do not ping
+    now = time.time() if now is None else now
+    holder = store.notice_holder(now)
+    held_elsewhere = holder is not None and holder.question_id != newly_parked.question_id
+    if newly_parked.is_expired(now) or held_elsewhere:
+        return None  # expired, or another question holds the thread; append, do not ping
 
     summary = " ".join(newly_parked.summary.split()).rstrip(".")
-    waited = max(1, int((time.time() - newly_parked.asked_at) // 60))
+    waited = max(1, int((now - newly_parked.asked_at) // 60))
     return (
         f"Decision needed — {newly_parked.ref}: {summary}?\n"
         f"\n"
@@ -543,22 +784,22 @@ def parking_notice(store: PendingStore, newly_parked: Pending) -> str | None:
     )
 
 
-def parked_board(store: PendingStore) -> str:
+def parked_board(store: PendingReader) -> str:
     """Everything parked and unanswered — the surface the notice points at.
 
     Decisions first, then chores in their own section, exactly as on `board`.
+    Expired questions get one line of their own, as on `board`.
     """
-    parked = sorted(
-        (p for p in store.open_questions() if p.parked),
-        key=lambda p: p.asked_at,
-    )
+    live, expired = _live_and_expired([p for p in store.open_questions() if p.parked])
+    parked = sorted(live, key=lambda p: p.asked_at)
     if not parked:
-        return "Nothing is parked."
+        return _join_sections(["Nothing is parked."], _expired_section(expired))
     decisions = [p for p in parked if p.needs_decision]
     chores = [p for p in parked if not p.needs_decision]
     return _join_sections(
         _parked_decisions(decisions),
         _chore_section(chores, _parked_item, "parked chore"),
+        _expired_section(expired),
         ["Reading this is not answering it — reply with a ref."],
     )
 

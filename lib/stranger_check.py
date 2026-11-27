@@ -48,6 +48,22 @@ TIMEOUT_MARK = "@@STRANGER TIMEOUT@@"
 COUNT_RE = re.compile(r"(\d+) (passed|failed|skipped|errors?|xfailed|xpassed|deselected)\b")
 SUMMARY_RE = re.compile(r"\b\d+ (passed|failed|skipped|errors?)\b.* in [\d.]+s\b")
 FAILING_RE = re.compile(r"^(FAILED|ERROR) (\S+?\.py)(?:::.*?)?(?: - (.*))?$")
+# pytest's long report: a "=== FAILURES ===" or "=== ERRORS ===" section, one
+# "___ test name ___" header per test, its "E   ..." error lines, its "path:line:"
+# frame locations, and "--- Captured ... ---" output that belongs to the test, not the error.
+SECTION_RE = re.compile(r"^={3,} (.+?) ={3,}$")
+TEST_HEADER_RE = re.compile(r"^_{3,} (.+?) _{3,}$")
+ERROR_LINE_RE = re.compile(r"^E(?:\s+(.*))?$")
+# A location never starts with whitespace or with "E" and whitespace, so neither an
+# error line nor an indented message line that mentions "x.py:12:" is read as one.
+LOCATION_RE = re.compile(r"^(?!E\s)(\S.*?\.py):(\d+):(?: (.*))?$")
+CAPTURED_RE = re.compile(r"^-{3,} Captured .+ -{3,}$")
+# The report's caps: error lines kept per test, characters per line, rows per list.
+ERROR_LINES_PER_TEST = 8
+ERROR_LINE_CHARS = 300
+CUT_MARK = "..."
+MORE_MARK = "[more lines cut]"
+REPORT_ROWS = 12
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
 DEFAULT_TIMEOUT_S = 2400
 CONTAINER_IMAGE = "ubuntu:24.04"
@@ -161,6 +177,7 @@ class Report:
     failing_files: list = field(default_factory=list)
     reasons: list = field(default_factory=list)
     verdict: str = "RED"
+    failures: list = field(default_factory=list)
 
 
 # ── README parsing ──────────────────────────────────────────────────────────
@@ -320,6 +337,143 @@ def failing_files(text: str) -> list:
     return sorted(by_file.values(), key=lambda e: (-e["count"], e["file"]))
 
 
+class _FailureReader:
+    """Reads pytest's FAILURES and ERRORS sections into [{test, where, lines}].
+
+    The checker runs pytest with --tb=line. That prints each failure as its "E" line,
+    further message lines indented four spaces, any captured output, and then the
+    location line, "path:line: <the error's first line>"; a setup error keeps its
+    "___ ERROR at setup ___" header. In the long format each test has a header and its
+    last frame location is the one that raised. Captured output is never read as part
+    of an error. After it, a failure ends at the location that repeats the error's first
+    line, or failing that at a location in a file the summary lists, so one unusual
+    message can never hide every failure after it.
+    """
+
+    def __init__(self, files: "list | None" = None) -> None:
+        self.entries: list = []
+        self._files = files or []
+        self._open: "dict | None" = None
+        self._head = ""
+        self._inside = self._captured = self._message = False
+
+    def feed(self, line: str) -> None:
+        section = SECTION_RE.match(line)
+        if section:
+            self.close()
+            self._inside = section.group(1) in ("FAILURES", "ERRORS")
+        elif self._inside:
+            self._feed_inside(line)
+
+    def close(self) -> None:
+        self._open, self._head = None, ""
+        self._captured = self._message = False
+
+    def _start(self, test: str) -> dict:
+        self.close()
+        self._open = {"test": test, "where": "", "lines": []}
+        self.entries.append(self._open)
+        return self._open
+
+    def _feed_inside(self, line: str) -> None:
+        header, location = TEST_HEADER_RE.match(line), LOCATION_RE.match(line)
+        if header:
+            self._start(header.group(1))
+        elif location:
+            self._on_location(f"{location.group(1)}:{location.group(2)}", (location.group(3) or "").strip())
+        elif CAPTURED_RE.match(line):
+            self._captured, self._message = True, False
+        elif not self._captured:
+            self._feed_message(line)
+
+    def _on_location(self, where: str, message: str) -> None:
+        if self._captured:
+            self._end_captured(where, message)
+        elif self._open is None:
+            if message:  # --tb=line with no "E" line: the location line carries the error
+                entry = self._start("")
+                entry["where"] = where
+                self._add(entry, message)
+                self.close()
+        elif self._open["test"]:
+            self._open["where"] = where  # long format: the last frame is the one that raised
+        else:
+            self._open["where"] = where  # --tb=line: the location line ends the failure
+            self.close()
+
+    def _end_captured(self, where: str, message: str) -> None:
+        """After captured output, --tb=line's own location repeats the error's first line;
+        a location in a file the summary lists is the fallback. Any other location there
+        is the test's output."""
+        entry = self._open
+        if entry is None:
+            self.close()
+        elif not entry["test"] and (message == self._head or _summary_name(where, self._files)):
+            entry["where"] = where
+            self.close()
+
+    def _feed_message(self, line: str) -> None:
+        error = ERROR_LINE_RE.match(line)
+        if error:
+            text = error.group(1) or ""
+            entry = self._open if self._open is not None else self._start("")
+            if not self._message:
+                # A new block starts after any non-error line, such as the blank line and
+                # "The above exception ..." between chained errors, so _head ends up as the
+                # last error's first line, the one --tb=line's location repeats.
+                self._head = text
+            self._add(entry, text)
+            self._message = True
+        elif self._message and line.startswith("    "):
+            self._add(self._open, line.strip())
+        else:
+            self._message = False
+
+    @staticmethod
+    def _add(entry: dict, text: str) -> None:
+        lines = entry["lines"]
+        if len(lines) < ERROR_LINES_PER_TEST:
+            cut = ERROR_LINE_CHARS - len(CUT_MARK)
+            lines.append(text if len(text) <= ERROR_LINE_CHARS else text[:cut] + CUT_MARK)
+        elif len(lines) == ERROR_LINES_PER_TEST:
+            lines.append(MORE_MARK)  # more lines followed: say so rather than drop them silently
+
+
+def _summary_name(where: str, files: list) -> str:
+    """The name the summary gives the file in 'path:line', or "" when it lists none.
+    The longest match wins, so "tests/test_x.py" beats a root-level "test_x.py"."""
+    path = where.rpartition(":")[0].replace("\\", "/")
+    matches = [name for name in files if path == name or path.endswith("/" + name)]
+    return max(matches, key=len, default="")
+
+
+def _short_where(where: str, files: list) -> str:
+    """'path:line' with the path as the summary names that file, else the file name."""
+    if ":" not in where:
+        return where
+    path, _, line = where.rpartition(":")
+    name = _summary_name(where, files) or path.replace("\\", "/").rsplit("/", 1)[-1]
+    return f"{name}:{line}"
+
+
+def failure_lines(text: str) -> list:
+    """[{test, where, lines}] for each failure and error pytest reported, in order.
+
+    ``lines`` holds the error's own lines, at most ERROR_LINES_PER_TEST and then MORE_MARK
+    when more followed, each at most ERROR_LINE_CHARS and ending in CUT_MARK when cut;
+    ``where`` is the file and line that
+    raised, the file named as the summary names it; ``test`` is the header pytest
+    printed, or "" where --tb=line prints none.
+    """
+    files = [entry["file"] for entry in failing_files(text)]
+    reader = _FailureReader(files)
+    for raw in text.splitlines():
+        reader.feed(raw.rstrip())
+    for entry in reader.entries:
+        entry["where"] = _short_where(entry["where"], files)
+    return reader.entries
+
+
 # ── the verdict ─────────────────────────────────────────────────────────────
 
 def judge(report: Report, commands: list, output: str) -> Report:
@@ -354,6 +508,7 @@ def _judge_tests(report: Report, commands: list, tested: str) -> None:
         return
     report.tests = pytest_counts(tested)
     report.failing_files = failing_files(tested)
+    report.failures = failure_lines(tested)
     if not report.tests:
         report.reasons.append("no pytest summary line was printed")
     elif report.tests.get("failed") or report.tests.get("errors"):
@@ -368,10 +523,16 @@ def render(report: Report, all_files: bool = False) -> str:
         out.append(f"  [{row['source']:7}] {row['label']:8} {state:8} {row['text']}")
     if report.tests:
         out.append("  tests: " + ", ".join(f"{n} {w}" for w, n in sorted(report.tests.items())))
-    shown = report.failing_files if all_files else report.failing_files[:12]
+    shown = report.failing_files if all_files else report.failing_files[:REPORT_ROWS]
     if shown:
         out.append(f"  failing files ({len(report.failing_files)}):")
         out += [f"    {e['count']:4} {e['file']} :: {e['first']}" for e in shown]
+    errors = report.failures if all_files else report.failures[:REPORT_ROWS]
+    if errors:
+        out.append(f"  first errors ({len(errors)} of {len(report.failures)} tests):")
+        for entry in errors:
+            out.append("    " + (" ".join(x for x in (entry["where"], entry["test"]) if x) or "?"))
+            out += [f"      {line}" for line in entry["lines"]]
     out += [f"  why red: {reason}" for reason in report.reasons]
     out.append(f"VERDICT: {report.verdict}")
     return "\n".join(out)

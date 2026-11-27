@@ -6,12 +6,31 @@
 # session's inbox. A second WhatsApp socket would contend with the daemon's own
 # Baileys session, so this reads the file the daemon writes instead.
 set -euo pipefail
+
+# It takes no arguments: the interval comes from GRIP_ANSWER_WATCH_INTERVAL, and
+# launchd starts it bare (config/launchd/com.grip.answer-watch.plist.template). So
+# an argument, such as a --help probe, gets the usage and never starts the loop,
+# which parks overdue questions, can message the operator and reads his WhatsApp
+# mirror (GRIP#10172).
+usage() {
+  echo "usage: grip-answer-watch   (no arguments; runs until stopped)"
+  echo "Routes the operator's shim replies to the sessions waiting on them, every"
+  echo "GRIP_ANSWER_WATCH_INTERVAL seconds (default 20). While it runs, it parks overdue"
+  echo "pending questions and may send the operator WhatsApp notices, one at a time."
+}
+if [ "$#" -gt 0 ]; then
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+fi
+
 CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 INTERVAL="${GRIP_ANSWER_WATCH_INTERVAL:-20}"
 exec "$CLAUDE_DIR/bin/grip-py" - "$INTERVAL" <<'PY'
 import sys, time, pathlib
 sys.path.insert(0, str(pathlib.Path.home() / ".grip"))
-from lib.answer_watcher import scan_for_answers, sweep_overdue, operator_is_afk
+from lib.answer_watcher import scan_for_answers, sweep_overdue, notices_held, renotify
 from lib.pending_question import PendingStore, parked_board
 from lib.whatsapp_transport import post
 from lib.answer_watcher import OPERATOR_JID
@@ -25,8 +44,15 @@ while True:
         # require the ASKING session to take another turn, so a session that
         # went idle never parked its question and nothing ever fired.
         for ref, notified in sweep_overdue(store):
-            state = "notified" if notified else ("held: operator AFK" if operator_is_afk() else "silent: a notice is already outstanding")
+            state = "notified" if notified else ("held: away marker or outbound brake" if notices_held() else "silent: another question holds the notice, or the send failed")
             print(f"[answer-watch] parked {ref} ({state})", flush=True)
+        # When the question holding the notice closes, the next one gets it, and
+        # a failed notice is tried again after a pause, at most three times
+        # (GRIP#10186 item 5).
+        renotified = renotify(store)
+        if renotified:
+            ref, delivered = renotified
+            print(f"[answer-watch] notice for {ref}: {'delivered' if delivered else 'failed, tried again later'}", flush=True)
         for ref, delivered, reason in scan_for_answers(store):
             print(f"[answer-watch] {ref}: {'DELIVERED' if delivered else 'not delivered'} — {reason}", flush=True)
             if delivered and OPERATOR_JID:  # no operator configured: no acknowledgement to send

@@ -33,7 +33,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from lib.pending_question import Pending, PendingStore
+from lib.pending_question import Pending, PendingStore, live_questions
 
 __all__ = ["DeliveryResult", "mesh_db_path", "deliver_answer"]
 
@@ -82,7 +82,7 @@ def deliver_answer(
 
     pending = store.resolve_reply(text)
     if pending is None:
-        n = len(store.open_questions())
+        n = len(live_questions(store))  # an expired question is not current work (GRIP#10186)
         return DeliveryResult(
             False,
             "nothing is waiting" if n == 0

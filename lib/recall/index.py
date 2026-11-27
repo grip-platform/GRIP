@@ -518,13 +518,19 @@ def verify_artefact(artefact, store=None) -> dict:
 
 
 # ------------------------------------------------------------- extraction
+# A path named in a record's text, in one of three forms. The first is a Windows
+# path from a drive letter, with either separator: a folder name may hold single
+# spaces (C:\Users\Jane Example\...), the file name may not. The other two are
+# POSIX: absolute or home-relative, and relative with an extension.
 _PATH_RE = re.compile(
-    r"(?:~/|/)[\w.@-]+(?:/[\w.@-]+)+|\b[\w-]+(?:/[\w.@-]+)+\.[A-Za-z0-9]{1,12}\b")
+    r"\b[A-Za-z]:[\\/](?:[\w.@-]+(?: [\w.@-]+)*[\\/])*[\w.@-]+"
+    r"|(?:~/|/)[\w.@-]+(?:/[\w.@-]+)+|\b[\w-]+(?:/[\w.@-]+)+\.[A-Za-z0-9]{1,12}\b")
 _RECEIPT_NAME_RE = re.compile(r"\b[\w.-]+\.receipt\.json\b")
 _HASH_RE = re.compile(r"\b[0-9a-f]{40,64}\b")
 _FH_TOKEN_RE = re.compile(r"\b[0-9a-f]{8,64}@v\d+\b")
 _EXCLUDE_PARTS = ("/node_modules/", "/venv/", "/.venv/", "/__pycache__/", "/.git/",
                   "/usr/", "/opt/homebrew/", "/System/", "/dist/", "/build/")
+_DRIVE_RE = re.compile(r"[A-Za-z]:[\\/]")
 _TYPE_BY_EXT = {
     "mp4": "render", "mov": "render", "webm": "render", "gif": "render",
     "png": "render", "jpg": "render", "jpeg": "render", "svg": "render", "pdf": "render",
@@ -551,7 +557,10 @@ def _iter_strings(obj, depth: int = 0):
 
 
 def _subject_from_name(name: str) -> str:
-    base = name.rsplit("/", 1)[-1]
+    # The file's own name, after the last separator of either kind. A Windows path
+    # uses backslashes, and split on "/" alone it stayed whole, so a receipt found
+    # on disk was filed under its full path and no claim ever matched it.
+    base = re.split(r"[\\/]", name)[-1]
     if base.endswith(".receipt.json"):
         return base[: -len(".receipt.json")]
     base = re.sub(r"@v\d+$", "", base)
@@ -589,14 +598,24 @@ def _pointer_artefact(subject: str, ts: str, origin: str, rec_id: str,
     )
 
 
+def _excluded(token: str) -> bool:
+    """A path inside a dependency, build or system folder. The exclusions are written
+    with "/", so a Windows path is compared in that form, and without case, because
+    Windows folder names ignore case. A POSIX path is compared as written."""
+    if _DRIVE_RE.match(token):
+        folded = token.replace("\\", "/").lower()
+        return any(x.lower() in folded for x in _EXCLUDE_PARTS)
+    return any(x in token for x in _EXCLUDE_PARTS)
+
+
 def _record_path_tokens(text: str) -> set:
     tokens = set(_PATH_RE.findall(text)) | set(_RECEIPT_NAME_RE.findall(text))
-    tokens = {t for t in tokens if not any(x in t for x in _EXCLUDE_PARTS)}
+    tokens = {t for t in tokens if not _excluded(t)}
     # a bare filename is redundant when a longer captured token already ends
-    # with it (the full path carries the information; the name would only
-    # create a duplicate pointer artefact)
+    # with it after either separator (the full path carries the information;
+    # the name would only create a duplicate pointer artefact)
     return {t for t in tokens
-            if not any(u != t and u.endswith("/" + t) for u in tokens)}
+            if not any(u != t and u.endswith(("/" + t, "\\" + t)) for u in tokens)}
 
 
 def _path_token_artefact(token: str, ts: str, origin: str, rec_id: str,

@@ -10,6 +10,13 @@ filter switched off, and each encrypted file is then marked skip-worktree and
 removed, so neither plaintext nor ciphertext of an encrypted file is in front
 of a coder. Nothing in the repository's shared config changes.
 
+A run's ``hide`` globs leave out more tracked files the same way, in the coder's
+worktree and in both test worktrees. A listing or a search of the worktree's
+folder then finds none of them. It is not confinement: the index still names
+them (``git ls-files``), and their contents stay in the shared object store,
+which ``git show`` and ``git grep --cached`` read. Reads outside the worktree
+stay open too (GRIP#9154).
+
 The tests run under Codex's seatbelt profile ``:workspace``. Measured
 2026-11-11 on codex-cli 0.156.1 from a directory outside /tmp: writes to the
 parent directory and to $HOME were blocked, and so were curl and a raw socket.
@@ -18,6 +25,7 @@ and they are why a run's worktree must live outside /tmp.
 """
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 import shlex
@@ -85,19 +93,41 @@ def forbidden_matcher(repo):
     return lambda path: bool(FORBIDDEN_RE.search(path) or (sweep and sweep.search(path)))
 
 
-def make_worktree(repo, ref: str, dest) -> Path:
-    """A detached worktree at ``ref`` with every git-crypt path left out."""
+def hidden_by(paths, patterns) -> list:
+    """The subset of ``paths`` that match a ``hide`` glob. The rules are fnmatch's, case
+    sensitive, and ``*`` also matches a ``/``, so ``notes/*`` covers every depth below it."""
+    return [p for p in paths if p and any(fnmatch.fnmatchcase(p, pat) for pat in patterns)]
+
+
+def tracked_files(cwd, ref: str) -> list:
+    """Every file tracked at ``ref``. A submodule entry is left out: its checkout is a
+    directory, not a file, and its contents are not in this repository's tree."""
+    entries = git(cwd, "ls-tree", "-r", "-z", ref).split("\0")
+    return [e.split("\t", 1)[1] for e in entries if "\t" in e and e.split(" ", 2)[1] == "blob"]
+
+
+def make_worktree(repo, ref: str, dest, hide=()) -> Path:
+    """A detached worktree at ``ref`` with every git-crypt file, and every tracked file
+    that matches a ``hide`` glob, left out. A worktree that fails part-way is removed."""
     dest = Path(dest)
     git(repo, *NO_DECRYPT, "worktree", "add", "--detach", str(dest), ref, timeout=600)
-    tracked = git(dest, "ls-files", "-z").split("\0")
-    hidden = git_crypt_paths(dest, tracked)
+    try:
+        _leave_out(dest, hide)
+    except BaseException:
+        remove_worktree(repo, dest)
+        raise
+    return dest
+
+
+def _leave_out(dest: Path, hide) -> None:
+    tracked = tracked_files(dest, "HEAD")
+    hidden = sorted(set(git_crypt_paths(dest, tracked)) | set(hidden_by(tracked, hide)))
     if hidden:
         git(dest, *AS_STORED, "update-index", "--skip-worktree", "-z", "--stdin", stdin="\0".join(hidden) + "\0")
         _unlink_each(dest, hidden)
     tmp = dest / TMP_DIRNAME
     tmp.mkdir(exist_ok=True)
     (tmp / ".gitignore").write_text("*\n", encoding="utf-8")
-    return dest
 
 
 def _unlink_each(root: Path, rel_paths) -> None:
@@ -316,8 +346,8 @@ def _copy_tests(src: Path, dest: Path, test_paths) -> None:
             shutil.copy2(src / rel, dest / rel)
 
 
-def _base_run(repo, base_ref: str, head_wt: Path, name: Path, copy, run):
-    base_wt = make_worktree(repo, base_ref, name)
+def _base_run(repo, base_ref: str, head_wt: Path, name: Path, copy, run, hide=()):
+    base_wt = make_worktree(repo, base_ref, name, hide=hide)
     try:
         _copy_tests(head_wt, base_wt, sorted(set(copy)))
         return run(base_wt)
@@ -337,7 +367,7 @@ def _red_green_verdict(tree: str, head, before) -> dict:
             "base": before.facts() if before else None, "output": output}
 
 
-def red_green(repo, base_ref: str, wt, test_paths, support, run) -> dict:
+def red_green(repo, base_ref: str, wt, test_paths, support, run, hide=()) -> dict:
     """The change's tests must pass on the staged tree and fail on ``base_ref``.
 
     ``run(worktree) -> Finished``. The head run gets a clean worktree of exactly
@@ -346,14 +376,16 @@ def red_green(repo, base_ref: str, wt, test_paths, support, run) -> dict:
     worktree at the base commit with the change's test files AND its changed
     test-support files (``support``: a conftest.py, a tests/ helper) copied in,
     so a missing helper is never mistaken for proof that the change is needed.
+    Both leave out the ``hide`` globs too: a test's output goes back to the coder
+    in a repair round, so a test must not be able to print a hidden file.
     """
     wt = Path(wt)
     tree, commit = staged_commit(wt, base_ref)
-    head_wt = make_worktree(repo, commit, wt.with_name(wt.name + "-head"))
+    head_wt = make_worktree(repo, commit, wt.with_name(wt.name + "-head"), hide=hide)
     try:
         head = run(head_wt)
         before = (_base_run(repo, base_ref, head_wt, wt.with_name(wt.name + "-base"),
-                            [*test_paths, *support], run) if head.passed else None)
+                            [*test_paths, *support], run, hide=hide) if head.passed else None)
     finally:
         remove_worktree(repo, head_wt)
     return _red_green_verdict(tree, head, before)

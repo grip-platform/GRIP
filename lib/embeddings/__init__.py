@@ -11,7 +11,7 @@ Modules:
 Usage:
     from embeddings import get_engine
     engine = get_engine()
-    vector = engine.embed_single("hello world")
+    vector = engine.embed_text("hello world")  # the float32 vector, as bytes
 
 Backward compat:
     from embeddings import EmbeddingEngine

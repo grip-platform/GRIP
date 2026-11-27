@@ -335,7 +335,7 @@ def _check_memory_md(encoded: str) -> str:
     else:
         return f"  [ ] MEMORY.md (not found at {mem_path})"
     try:
-        return f"  [x] MEMORY.md ({len(mem_path.read_text().splitlines())} lines)"
+        return f"  [x] MEMORY.md ({len(mem_path.read_text(encoding='utf-8').splitlines())} lines)"
     except UnicodeDecodeError:
         return "  [x] MEMORY.md (git-crypt encrypted)"
     except OSError as e:
@@ -361,7 +361,11 @@ def _check_session_jsonl(encoded: str) -> str:
     jsonl_files = [f for f in sorted(proj_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True) if not f.name.startswith("agent-")]
     if not jsonl_files:
         return "  [ ] Session JSONL (no sessions)"
-    return f"  [x] Session JSONL ({sum(1 for _ in open(jsonl_files[0]))} entries)"
+    # Count lines as bytes: a text read used the platform's encoding (cp1252 on
+    # Windows) and failed on a transcript's UTF-8 (GRIP#10066 follow-up).
+    with open(jsonl_files[0], "rb") as transcript:
+        entries = sum(1 for _ in transcript)
+    return f"  [x] Session JSONL ({entries} entries)"
 
 
 def _report_subsystem_status(cwd: str, encoded: str) -> None:
@@ -483,15 +487,24 @@ def _save_dna(results: list, allowed: set | None) -> None:
 
 
 def _extract_gen_instance(grip_index: str) -> tuple[str, str]:
-    """Extract generation and instance ID from the grip index file."""
+    """Extract generation and instance ID from the grip index file.
+
+    The newest entry comes from next_step_block's shared selector (newest
+    ``serialized_at``), never from position: a retried save can append an older
+    entry last. Its id is read as ``instance_id``, the key both index writers
+    use. The import sits inside the ``try`` because next_step_block names
+    Path.home() when it loads, which raises where no home folder exists.
+    """
     gen, inst = "0", "unknown"
     try:
+        from next_step_block import select_latest_instance
+
         if Path(grip_index).exists():
-            data = json.loads(Path(grip_index).read_text())
-            instances = data.get("instances", [])
-            if instances:
-                gen = str(instances[-1].get("lineage", {}).get("generation", 0))
-                inst = str(instances[-1].get("id", "unknown"))[:8]
+            data = json.loads(Path(grip_index).read_text(encoding="utf-8"))
+            latest = select_latest_instance(data.get("instances", []))
+            if latest:
+                gen = str(latest.get("lineage", {}).get("generation", 0))
+                inst = str(latest.get("instance_id", "unknown"))[:8]
     except Exception:
         pass
     return gen, inst

@@ -17,6 +17,7 @@ mesh themselves stay out until the BLOCKED count shows they are needed.
 
 Usage (bin/grip-connect):
     grip-connect run "<task>" [--repo PATH] [--base REF] [--file PATH ...] [--roots lib/,tests/]
+                     [--hide GLOB ...]     tracked files to leave out of every worktree
     grip-connect plan "<task>" ...         admit and plan only; nothing is changed
     grip-connect roster                    the seats assign() picks, and what stopped the others
     grip-connect status [RUN_ID]
@@ -32,6 +33,7 @@ import os
 import posixpath
 import re
 import secrets
+import subprocess
 import sys
 import textwrap
 import threading
@@ -98,6 +100,7 @@ class Request:
     roots: tuple = DEFAULT_ROOTS
     plan_only: bool = False
     accept_open_reads: bool = False
+    hide: tuple = ()
 
 
 @dataclass
@@ -361,14 +364,29 @@ def _fetch(req: Request) -> str:
     return "fetched"
 
 
-def _admit_facts(r: Run, fetched: str) -> dict:
+def _admit_facts(r: Run, fetched: str, hidden: int) -> dict:
     return {"run": r.id, "task_sha256": r.task_sha, "task": r.req.task, "repo": Path(r.req.repo).name,
             "base": r.req.base, "base_commit": r.base_commit, "fetch": fetched,
             "roster": {role: seat.public() for role, seat in r.roster.items()},
             "cap_micro_usd": r.budget.cap_micro, "step_seconds": r.deps.roles.step_seconds,
             "repair_rounds": r.deps.roles.repair_rounds, "coder_home_index": r.home[0],
             "roots": list(r.req.roots), "context_files": list(r.req.files),
-            "accept_open_reads": r.req.accept_open_reads}
+            "accept_open_reads": r.req.accept_open_reads, "hide": list(r.req.hide),
+            "hidden_files": hidden}
+
+
+def _hidden_count(req: Request, base_commit: str) -> int:
+    """How many tracked files the --hide globs leave out at the base commit. A glob that
+    matches none refuses the run before anything is made: a typo would hide nothing and
+    leave the file it was meant for in front of the coder."""
+    if not req.hide:
+        return 0
+    tracked = chk.tracked_files(req.repo, base_commit)
+    unmatched = [pat for pat in req.hide if not chk.hidden_by(tracked, (pat,))]
+    if unmatched:
+        raise ConnectRefused("a --hide pattern matches no tracked file (a submodule is never hidden), "
+                             "so it would hide nothing: " + ", ".join(unmatched))
+    return len(chk.hidden_by(tracked, req.hide))
 
 
 def _open(req: Request, deps: Deps, run_id: str, lock: RepoLock, note: str) -> Run:
@@ -379,15 +397,17 @@ def _open(req: Request, deps: Deps, run_id: str, lock: RepoLock, note: str) -> R
         raise ConnectRefused(_no_roster(deps.roles, unavailable))
     fetched = _fetch(req) if deps.fetch else "no fetch"
     base_commit = chk.git(req.repo, "rev-parse", "--verify", req.base + "^{commit}").strip()
+    hidden = _hidden_count(req, base_commit)
     run_dir = deps.state_dir / "runs" / run_id
     run_dir.mkdir(parents=True)
-    wt = chk.make_worktree(req.repo, base_commit, Path(deps.worktrees_dir) / f"connect-{run_id}")
+    wt = chk.make_worktree(req.repo, base_commit, Path(deps.worktrees_dir) / f"connect-{run_id}",
+                           hide=req.hide)
     r = Run(id=run_id, req=req, deps=deps, dir=run_dir, room=f"connect-{run_id}", roster=roster,
             budget=Budget(deps.roles.cap_micro), lock=lock, wt=wt, base_commit=base_commit,
             home=home, task_sha=sha256_text(req.task), forbidden=chk.forbidden_matcher(req.repo),
             notes=[note] if note else [])
     _post(r, "join", f"/connect run {run_id} admitted: {_roster_line(roster)}")
-    _record(r, "admit", _admit_facts(r, fetched))
+    _record(r, "admit", _admit_facts(r, fetched, hidden))
     return r
 
 
@@ -546,7 +566,7 @@ def plan_prompt(task: str, pack: str, roots: tuple = DEFAULT_ROOTS) -> str:
 def _file_block(wt: Path, rel: str) -> str:
     path = (wt / rel).resolve()
     if not path.is_relative_to(wt.resolve()) or not path.is_file():
-        return f"FILE {rel}: not in the worktree (missing, outside it, or encrypted)"
+        return f"FILE {rel}: not in the worktree (missing, outside it, encrypted or hidden)"
     return f"FILE {rel}:\n{path.read_text(encoding='utf-8', errors='replace')[:FILE_LIMIT]}"
 
 
@@ -593,13 +613,15 @@ def _out_of_roots_problem(clean, roots) -> list:
     return [f"outside the allowed roots (--roots {','.join(roots)}): " + ", ".join(outside)] if outside else []
 
 
-def _scope(paths, roots, forbidden, encrypted) -> tuple:
-    """(kept paths, problems): a path outside the roots, forbidden, or git-crypt refuses the plan."""
+def _scope(paths, roots, forbidden, encrypted, hidden=frozenset()) -> tuple:
+    """(kept paths, problems): a path outside the roots, forbidden, git-crypt or hidden by
+    --hide refuses the plan."""
     clean = [_clean_path(p) for p in paths]
     problems = [f"a path leaves the repository: {p!r}" for p, c in zip(paths, clean) if not c]
     problems += [f"names a protected path (CI, hooks, gates, rules, settings): {c}" for c in clean
                  if c and forbidden(c)]
     problems += [f"names a git-crypt path: {c}" for c in clean if c in encrypted]
+    problems += [f"names a path hidden by --hide: {c}" for c in clean if c in hidden]
     problems += _out_of_roots_problem(clean, roots)
     return sorted({c for c in clean if c and _under_roots(c, roots)}), problems
 
@@ -618,8 +640,10 @@ def validate_plan(raw, r: Run) -> tuple:
     problems = _shape(raw)
     if problems:
         return {}, problems
-    encrypted = set(chk.git_crypt_paths(r.wt, [_clean_path(p) for p in raw["files_allowed"]]))
-    kept, problems = _scope(raw["files_allowed"], r.req.roots, r.forbidden, encrypted)
+    named = [_clean_path(p) for p in raw["files_allowed"]]
+    encrypted = set(chk.git_crypt_paths(r.wt, named))
+    hidden = set(chk.hidden_by(named, r.req.hide))
+    kept, problems = _scope(raw["files_allowed"], r.req.roots, r.forbidden, encrypted, hidden)
     tests = sorted({_clean_path(t) for t in raw["test_paths"]} - {""})
     problems += _test_problems(tests, kept)
     problems += [f"more than {MAX_FILES} files"] if len(kept) > MAX_FILES else []
@@ -788,7 +812,7 @@ def _check(r: Run, plan: dict, attempt: int) -> dict:
     support = [f for f in files if chk.is_test_side(f) and f not in plan["test_paths"]]
     tests = None if faults else chk.red_green(
         r.req.repo, r.base_commit, r.wt, plan["test_paths"], support,
-        lambda wt: r.deps.tests(r, wt, plan["test_paths"], budget))
+        lambda wt: r.deps.tests(r, wt, plan["test_paths"], budget), hide=r.req.hide)
     _checkpoint(r)  # a stop or veto that ended a test run ends the run, never the repair round
     ok = not faults and bool(tests and tests["ok"])
     r.tested_tree = tests["tree"] if ok else ""
@@ -1094,11 +1118,110 @@ def _hal_call(seat: Seat, prompt: str, timeout: int) -> tuple:
     return text, str(getattr(resp, "model", "") or seat.model)
 
 
+#: lib/connect_cch_bridge.py, beside this file.
+_CCH_BRIDGE = Path(__file__).resolve().with_name("connect_cch_bridge.py")
+#: The signer's own HTTP request has a fixed 120-second timeout (HAL's
+#: lib/hal/utils/cch.py _REQUEST_TIMEOUT_S, no caller override exists), so a
+#: CCH planning call can never genuinely run longer than that -- unlike the
+#: claude-p seat, which has taken up to 663s on this same question (measured
+#: 2026-11-11). ``timeout`` (the plan step's 900s budget) is deliberately NOT
+#: forwarded: this bound must stay a few seconds ABOVE the signer's fixed
+#: ceiling, never below it and never tied to the caller's step budget, or the
+#: bridge process would be killed before the signer's own timeout could ever
+#: fire and report a clean error.
+_CCH_TIMEOUT_S = 130
+
+
+def _cch_reply(proc: "subprocess.CompletedProcess") -> dict:
+    """The bridge's stdout as a dict, or {} for anything that is not one.
+
+    A non-JSON or non-object stdout (null, a bare number, a list, garbage) is
+    not itself the failure signal -- ``_cch_call`` checks ``returncode`` and
+    ``"error" in reply`` for that. This only keeps ``.get``/``"error" in`` from
+    ever running against something that is not a dict (AGORA round 2, Qwen4-Max).
+    """
+    try:
+        reply = json.loads(proc.stdout.strip() or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return reply if isinstance(reply, dict) else {}
+
+
+def _cch_text(reply: dict, proc: "subprocess.CompletedProcess") -> str:
+    """The reply's answer text, or a RuntimeError naming why there is none.
+
+    The "no answer" case carries a stdout/stderr snippet: returncode 0 with no
+    usable text most often means something else was printed ahead of main()'s
+    JSON line, which a bare "no answer" would hide (AGORA round 3, Qwen4-Max).
+    The snippet is redacted first: this subprocess handles an OAuth token end
+    to end, and the snippet is persisted into the run's own notes file, so a
+    credential-shaped substring must never leave this function unscrubbed
+    (AGORA round 4, Qwen4-Max). The whole output is redacted BEFORE it is cut
+    to length: a cut first can split a credential so the redactor no longer
+    matches it, and its first characters would survive (AGORA round 5).
+    """
+    from lib.secret_redactor import redact_secrets
+
+    text = str(reply.get("text") or "")
+    if reply.get("finish_reason") == "max_tokens":
+        raise RuntimeError("answer cut off at its output cap")
+    if text.strip():
+        return text
+    detail = redact_secrets(proc.stdout.strip() or proc.stderr.strip())[:200]
+    raise RuntimeError(f"no answer (bridge stdout: {detail!r})" if detail else "no answer")
+
+
+def _cch_call(seat: Seat, prompt: str, timeout: int) -> tuple:
+    """A Claude planner seat via HAL's CCH signer -- the one route R2 lets off claude -p.
+
+    GRIP#9272 (Fable B): the official CLI stopped taking claude-fable-5-2 around
+    2026-11-13, while the Anthropic Messages API still serves it when the
+    request is signed to bill the CC subscription (the real HAL's own
+    lib/hal/utils/cch.py). GRIP's own lib/hal/ answers the same dotted import
+    path with a different, in-process provider abstraction that carries no
+    subscription.py, so the call cannot be an in-process import -- it runs as
+    its own process (lib/connect_cch_bridge.py), exactly as the claude-p and
+    codex-agent seats already do, started with ``-I`` so a stray inherited
+    PYTHONPATH can never put GRIP's own lib/ ahead of the bridge's own
+    HAL_HOME insertion. Any failure here -- no token, a timeout, a bad reply --
+    raises, which ``_attempt`` records as a dead seat, so the role re-assigns
+    to the next-ranked planner (Opus 5.5). A machine with no ``~/.hal``
+    checkout (or ``$HAL_HOME``) at all degrades the same way, visibly, in the
+    run's notes -- this seat then simply never serves there, and Opus 5.5
+    plans every run, which is the intended fallback, not a crash.
+
+    ``finish_reason`` is read as the real Anthropic Messages API's own
+    ``stop_reason`` vocabulary (``max_tokens`` on a cap hit), never HAL's or
+    OpenAI's normalised ``length`` -- the bridge forwards that field verbatim,
+    it does not translate it.
+    """
+    if not _CCH_BRIDGE.is_file():
+        raise RuntimeError(f"CCH bridge script missing: {_CCH_BRIDGE}")
+    request = {"prompt": prompt, "model": seat.model}
+    if seat.max_out:
+        request["max_tokens"] = seat.max_out
+    proc = subprocess.run([sys.executable, "-I", str(_CCH_BRIDGE)], input=json.dumps(request),
+                          capture_output=True, text=True, timeout=_CCH_TIMEOUT_S)
+    reply = _cch_reply(proc)
+    if proc.returncode != 0 or "error" in reply:
+        from lib.secret_redactor import redact_secrets
+
+        # reply["error"] is already scrubbed at its source (the bridge's own
+        # main()); proc.stderr is not -- it is raw output from a process this
+        # subprocess runs an OAuth token through, and only reaches here when
+        # the bridge died before main() could redact anything itself.
+        detail = reply.get("error") or redact_secrets(proc.stderr.strip())[:300]
+        raise RuntimeError(detail or f"bridge exit {proc.returncode}")
+    return _cch_text(reply, proc), str(reply.get("model") or seat.model)
+
+
 def _live_call(seat: Seat, prompt: str, timeout: int) -> tuple:
     if seat.transport == "claude-p":
         from lib.ultrathink_trio import LIVE_TRANSPORTS, Rung
 
         return LIVE_TRANSPORTS["claude-p"](Rung(seat.id, seat.model, "claude-p"), prompt)
+    if seat.transport == "claude-cch":
+        return _cch_call(seat, prompt, timeout)
     if seat.transport == "council":
         return _council_call(seat, prompt, timeout)
     if seat.transport == "hal":
@@ -1244,7 +1367,7 @@ def _request(args) -> Request:
                    for r in args.roots.split(",") if r.strip()))
     return Request(task=" ".join(args.task), repo=repo, base=args.base,
                    files=tuple(args.file), roots=roots, plan_only=args.cmd == "plan",
-                   accept_open_reads=args.accept_open_reads)
+                   accept_open_reads=args.accept_open_reads, hide=tuple(args.hide))
 
 
 def _choices(args) -> dict:
@@ -1338,6 +1461,11 @@ def _parser() -> argparse.ArgumentParser:
                             "in any other repository")
         s.add_argument("--accept-open-reads", action="store_true",
                        help="run although the coder can read outside its worktree (GRIP#9154)")
+        s.add_argument("--hide", action="append", default=[], metavar="GLOB",
+                       help="leave tracked files matching GLOB out of every worktree, as git-crypt "
+                            "files are; repeatable; fnmatch rules, so * also crosses /; a GLOB that "
+                            "matches no tracked file refuses the run. Not confinement: git ls-files "
+                            "still names the files and git show still reads them")
         _seat_flags(s)
     roster = sub.add_parser("roster")
     roster.add_argument("--limit", type=int, default=8)

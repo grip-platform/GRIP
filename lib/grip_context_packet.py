@@ -64,7 +64,14 @@ class GRIPContextPacket:
 
 
 def get_grip_identity() -> tuple[str, int, str]:
-    """Get current GRIP instance identity from project index."""
+    """Get current GRIP instance identity from project index.
+
+    The newest entry comes from next_step_block's shared selector (newest
+    ``serialized_at``), never from position, and its fields are read where the
+    index writers put them: ``instance_id`` and ``lineage.generation``. The
+    import sits inside the ``try`` because next_step_block names Path.home()
+    when it loads, which raises where no home folder exists.
+    """
     # Claude Code's project-directory encoding, from the single shared encoder:
     # ~/.bar -> -Users-you--bar, C:\Users\<first> <last>\.bar -> C--Users-<first>-<last>--bar
     project_encoded = encode_project_path(Path.cwd())
@@ -72,13 +79,14 @@ def get_grip_identity() -> tuple[str, int, str]:
 
     if grip_index.exists():
         try:
+            from next_step_block import select_latest_instance
+
             data = json.loads(grip_index.read_text(encoding="utf-8"))
-            instances = data.get("instances", [])
-            if instances:
-                latest = instances[-1]
+            latest = select_latest_instance(data.get("instances", []))
+            if latest:
                 return (
-                    latest.get("id", "unknown")[:8],
-                    latest.get("generation", 0),
+                    str(latest.get("instance_id", "unknown"))[:8],
+                    latest.get("lineage", {}).get("generation", 0),
                     "139efc67"  # Root ancestor
                 )
         except Exception:

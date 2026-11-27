@@ -28,11 +28,14 @@ import json
 import os
 from pathlib import Path
 
-from lib.pending_question import PendingStore
+from lib.pending_question import Pending, PendingStore
 from lib.reply_router import deliver_answer
 from lib.wa_identities import operator_jid
 
-__all__ = ["OPERATOR_JID", "thread_path", "scan_for_answers", "sweep_overdue", "operator_is_afk"]
+__all__ = [
+    "OPERATOR_JID", "thread_path", "scan_for_answers", "sweep_overdue", "renotify",
+    "operator_is_afk", "notices_held",
+]
 
 # GRIP_OPERATOR_JID, else the private file (lib/wa_identities.py). None means no
 # operator is configured on this machine: nothing is watched and nothing is sent.
@@ -191,6 +194,22 @@ def operator_is_afk() -> bool:
     """
     return afk_remaining_seconds() is not None
 
+
+def notices_held() -> bool:
+    """True while the away marker or the outbound brake holds every notice.
+
+    Neither spends a try: a held notice is not a failed one, so notices resume
+    when the hold lifts (GRIP#10186 item 5).
+    """
+    if operator_is_afk():
+        return True
+    try:
+        from lib.whatsapp_transport import STOP_MARKER
+    except ImportError:
+        return False
+    return STOP_MARKER.exists()
+
+
 def sweep_overdue(store: PendingStore, *, now: float | None = None) -> list[tuple[str, bool]]:
     """Park every question past the ceiling, whoever asked it.
 
@@ -211,29 +230,80 @@ def sweep_overdue(store: PendingStore, *, now: float | None = None) -> list[tupl
     import time as _t
 
     from lib.next_step_router import RELEASE_SECONDS
-    from lib.pending_question import parking_notice
 
     now = _t.time() if now is None else now
     out: list[tuple[str, bool]] = []
     for q in store.open_questions():
-        if q.parked or (now - q.asked_at) < RELEASE_SECONDS:
+        # An expired question is not current work: parking it now would page
+        # the operator about something over a week old (GRIP#10186).
+        if q.parked or q.is_expired(now) or (now - q.asked_at) < RELEASE_SECONDS:
             continue
         if not store.park(q.question_id):
             continue
         fresh = next((x for x in store.open_questions()
                       if x.question_id == q.question_id), None)
-        notified = False
-        if fresh is not None and not operator_is_afk():
-            text = parking_notice(store, fresh)
-            if text and OPERATOR_JID:
-                try:
-                    from lib.whatsapp_transport import post
-                    # post() reports a refused or failed send as ok=False and
-                    # raises only on a malformed recipient, so "did not raise"
-                    # is not "delivered". Record what the transport said.
-                    sent = post(OPERATOR_JID, text + "\n\nReply here with the ref and your answer.")
-                    notified = bool(sent.get("ok"))
-                except Exception:
-                    pass
+        notified = fresh is not None and not notices_held() and _send_notice(store, fresh, now)
         out.append((q.ref, notified))
     return out
+
+
+def _send_notice(store: PendingStore, question: Pending, now: float) -> bool:
+    """Send one question's parking notice, if it earns one, and record the attempt.
+
+    Returns True only when the transport reports delivery. A delivered notice makes
+    the question the holder of the one notice thread (GRIP#10186 item 5).
+    """
+    from lib.pending_question import parking_notice
+
+    text = parking_notice(store, question, now)
+    if not text or not OPERATOR_JID:
+        return False
+    try:
+        from lib.whatsapp_transport import post
+        # post() reports a refused or failed send as ok=False and raises only on
+        # a malformed recipient, so "did not raise" is not "delivered". Record
+        # what the transport said.
+        sent = post(OPERATOR_JID, text + "\n\nReply here with the ref and your answer.")
+        delivered = bool(sent.get("ok"))
+    except Exception:
+        delivered = False
+    store.mark_noticed(question.question_id, now, delivered)
+    return delivered
+
+
+def renotify(store: PendingStore, *, now: float | None = None) -> tuple[str, bool] | None:
+    """Send the parking notice that is due, if any: a retry, or the newest question's first.
+
+    Codex on GRIP#10183: once the question holding the notice closed (answered,
+    withdrawn or expired), the questions parked after it were never notified,
+    because the sweep skips rows already parked. Now, with no holder, the newest
+    live parked question gets its first notice. With a holder whose notice
+    failed, that holder is tried again after NOTICE_RETRY_S, at most
+    NOTICE_ATTEMPTS times in all. Nothing is sent while notices are held.
+    Returns (ref, delivered) when a notice was tried, else None.
+    """
+    import time as _t
+
+    now = _t.time() if now is None else now
+    if notices_held() or not OPERATOR_JID:
+        return None
+    holder = store.notice_holder(now)
+    target = _newest_parked(store, now) if holder is None else _due_retry(holder, now)
+    return None if target is None else (target.ref, _send_notice(store, target, now))
+
+
+def _newest_parked(store: PendingStore, now: float) -> Pending | None:
+    """With no notice holder, the newest live parked question earns the next notice."""
+    from lib.pending_question import live_questions
+
+    parked = [p for p in live_questions(store, now) if p.parked]
+    return max(parked, key=lambda p: p.asked_at, default=None)
+
+
+def _due_retry(holder: Pending, now: float) -> Pending | None:
+    """The holder again, when its notice failed, it has tries left and the pause has passed."""
+    from lib.pending_question import NOTICE_ATTEMPTS, NOTICE_RETRY_S
+
+    if holder.notice_sent_at is not None or holder.notice_attempts >= NOTICE_ATTEMPTS:
+        return None
+    return holder if now - (holder.notice_tried_at or 0.0) >= NOTICE_RETRY_S else None

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# grip-pending-withdraw -- the asking session withdraws its own settled pending
+# question, or lists its open ones (GRIP#10171). A withdrawal is never an answer.
+#
+#   grip-pending-withdraw --list
+#   grip-pending-withdraw REF --reason "why it is settled"
+#
+# The logic and its --help live in lib/pending_withdraw.py.
+set -euo pipefail
+CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
+exec "$CLAUDE_DIR/bin/grip-py" "$CLAUDE_DIR/lib/pending_withdraw.py" "$@"

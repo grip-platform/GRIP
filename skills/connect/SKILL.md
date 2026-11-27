@@ -27,7 +27,12 @@ bin/mesh room --room connect-<RUN_ID> tail 50   # --room goes before the subcomm
    rule picks the seats. A Codex home is chosen only if both of its windows have room
    and it holds no credits that Codex could fall back to. The worktree starts at a
    freshly fetched `origin/main`, under `~/.grip-worktrees/`, with every git-crypt
-   path left out.
+   path left out. `--hide GLOB` (repeatable) leaves out matching tracked files the
+   same way, in the coder's worktree and in both test worktrees, and a plan that names
+   one is refused. A glob that matches no tracked file refuses the run, and a
+   submodule entry is never hidden. It is not
+   confinement: `git ls-files` still names the files, `git show` and
+   `git grep --cached` still read them, and reads outside the worktree stay open.
 2. **Plan.** The planner gets the task, the tracked file list, the files named with
    `--file`, and the `--roots` it may touch, in one text-only call. It returns PLAN
    JSON. A plan that names CI, hooks, gates, rules, settings, agent instructions, an

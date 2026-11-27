@@ -1038,19 +1038,40 @@ def _log_nonzero_exit(proc, envelope_id: str, provider: str) -> Optional[str]:
 # for free instead of needing its own per-call copy.
 _PROVIDER_TIMEOUT_MARGIN_S = 5
 
+# HAL's own HAPPI provider default (named here, not imported -- it is a fact
+# about HAL's providers, which GRIP's lib/ does not own). Named per AGORA
+# review (round 2) rather than left as a bare 120 inside the guard below.
+_HAPPI_PROVIDER_DEFAULT_TIMEOUT_S = 120
+
 
 def _apply_default_provider_timeout(envelope: dict, timeout: Optional[int]) -> None:
     """MUTATES envelope["flags"]["timeout_s"] in place from timeout, unless
-    already set.
+    already set -- and only when timeout exceeds HAL's own provider default.
 
     setdefault at both levels: a caller's explicit flags.timeout_s (the
     judge's, via _judge_envelope) always stands, and an envelope with no
     "flags" dict degrades to one being created rather than crashing. A
     falsy timeout (None or 0) means "no deadline" and is left alone.
 
-    AGORA review (GRIP#10086) asked what happens if the SAME envelope dict
-    is later reused for a retry or a fallback with a SHORTER timeout --
-    setdefault is sticky, so the first, longer timeout_s would survive.
+    Scoped to timeout > _HAPPI_PROVIDER_DEFAULT_TIMEOUT_S (AGORA review,
+    round 2) because that is the ONLY case this PR exists to fix: a
+    subprocess timeout AT OR BELOW HAL's native 120 s default was never
+    artificially truncated in the first place, so deriving a shorter
+    provider timeout there would buy nothing and could only cost something.
+    Concretely, it would move _RUNG_TIMEOUT_OVERRIDES rungs (currently just
+    qwen/qwen3.5-flash, deliberately given a short 45 s subprocess budget so
+    a SUBPROCESS-level timeout there is recognised as substitutable -- see
+    _dispatch_one) onto a provider-level timeout instead, which races the
+    subprocess kill, would very likely win it by design (5 s margin), and
+    reports a different failure string than the exact "timeout" the
+    fast-fail-substitutable check matches -- silently losing that
+    substitutability for the one rung built to need it. See
+    test_a_short_fast_fail_rung_keeps_its_subprocess_level_timeout in
+    tests/test_happi_provider_timeout_propagation.py.
+
+    AGORA review (round 1) also asked what happens if the SAME envelope
+    dict is later reused for a retry or a fallback with a SHORTER timeout
+    -- setdefault is sticky, so the first, longer timeout_s would survive.
     Checked against every call site that reaches this function
     (_dispatch_attempt, _dispatch_speaker, _ask_judge): each builds a FRESH
     envelope via _build_envelope / _judge_envelope for every attempt,
@@ -1061,7 +1082,7 @@ def _apply_default_provider_timeout(envelope: dict, timeout: Optional[int]) -> N
     envelope gets the sticky-first-value contract documented here, not a
     surprise.
     """
-    if not timeout:
+    if not timeout or timeout <= _HAPPI_PROVIDER_DEFAULT_TIMEOUT_S:
         return
     envelope.setdefault("flags", {}).setdefault(
         "timeout_s", max(1, int(timeout) - _PROVIDER_TIMEOUT_MARGIN_S))

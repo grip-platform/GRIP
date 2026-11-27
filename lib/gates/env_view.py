@@ -30,11 +30,18 @@ for: `echo "the value is $X here"` reached it as `echo ""`.
 - a string or a heredoc body that holds a command substitution or a backtick is
   kept whole, because that code runs;
 - each word is read as the shell runs it, after quote removal: a quoted string
-  loses its quotes, an ANSI-C string (`$'...'`) is decoded, and a backslash
-  outside quotes is dropped, which is also how `eval` or a nested shell would
-  read the text, the most cautious reading. So `\\grep`, `'grep'`, `g"r"ep`
-  and `$'\\x67rep'` are all `grep`, and a directory before a command name, as
-  in `/usr/bin/grep`, changes nothing (GRIP#10120). The command a string
+  loses its quotes, an ANSI-C or locale string (`$'...'`, `$"..."`) loses its
+  `$` too and an ANSI-C one is decoded, and a backslash outside quotes is
+  dropped. So `\\grep`, `'grep'`, `g"r"ep`, `$"grep"` and `$'\\x67rep'` are
+  all `grep`, and a directory before a command name, as in `/usr/bin/grep`,
+  changes nothing (GRIP#10120). An escaped separator, blank, bracket or brace
+  is word text. It reads as `_` when every command in the text only prints its
+  words (`echo`, `printf`, `print`) and no substitution or redirection hides one,
+  so `echo env\\ \\|\\ grep\\ KEY` prints a literal and is not a listing (Codex
+  on GRIP#10159). Any other command may read the words as shell text again (a
+  shell, `eval`, `ssh`, `xargs sh -c`, or a name the view cannot read), so
+  there the backslash is dropped, as such a command reads it, and
+  `eval env\\ \\|\\ grep\\ KEY` is a listing (GRIP#10199 review). The command a string
   belongs to is found on a copy where every separator, blank or quote that is
   text is masked, so an escaped `|` starts no command, and a command word the
   view cannot read, such as `"$X"`, may be a search, so its quoted arguments
@@ -62,8 +69,9 @@ since the view cannot tell how the shell reads it.
 
 Still not judged, as before: the body of a quoted-delimiter heredoc that a shell
 or an interpreter runs (`bash <<'EOF'`), words that are code only for an
-interpreter inside a long string (`python -c "..."`), and a command named
-through a variable, brace expansion or a glob (`$G`, `{grep,}`, `gre?`).
+interpreter inside a long string (`python -c "..."`, `bash -c '...'`,
+GRIP#10198), and a command named through a variable, brace expansion or a glob
+(`$G`, `{grep,}`, `gre?`).
 """
 
 from __future__ import annotations
@@ -119,6 +127,20 @@ _COMMENT_AFTER = " \t\n;|&("
 #: before a newline survives in the view only at the end of a comment, where
 #: it is text.
 _ESCAPE = re.compile(r"\\([^\n])")
+#: Characters that build command structure: escaped, each is word text, and
+#: the judged text reads it as `_` when every command only prints (Codex on
+#: GRIP#10159).
+_STRUCTURE = re.compile(r"[|;&()<>{}\s]")
+#: Commands that print their words and never read them as shell text. Any
+#: other command may read its words as shell text again, where an escaped
+#: separator is syntax: a shell, `eval`, `ssh`, `xargs sh -c`, `watch`, or a
+#: name the view cannot read (GRIP#10199 review).
+_PRINT_COMMANDS = frozenset({"echo", "printf", "print"})
+#: A command substitution or a redirection. A substitution runs a command that
+#: no command word shows, and a redirection can stand before the command word,
+#: as in `< x eval ...`, where the word scan does not see it (AGORA on
+#: GRIP#10204).
+_HIDDEN = re.compile(r"\$\(|`|[<>]")
 #: An escape that the shell removes inside a double-quoted string.
 _DQ_ESCAPE = re.compile(r"\\([$`\"\\])")
 #: An escape inside an ANSI-C string, `$'...'`, as bash and zsh read it.
@@ -193,10 +215,11 @@ class _QuoteScan:
 
     def _mark(self, was: str, i: int) -> None:
         """Record where a quote opens and which quote it is, and its span when
-        it closes."""
+        it closes. A double quote after an unescaped `$` opens a locale string,
+        which bash reads as a double-quoted one."""
         if self.quote and not was:
             self.opened = i
-            self.kinds[i] = self.quote
+            self.kinds[i] = '$"' if self.quote == '"' and self.prev == "$" else self.quote
         elif was and not self.quote:
             self.spans.append((self.opened, i + 1))
 
@@ -432,17 +455,21 @@ def _string_spans(text: str, bodies: dict[int, int],
     return [span for span in scan.spans if span[1] <= limit], scan.kinds, limit
 
 
-def _command_words(text: str) -> tuple[list[int], list[bool]]:
+def _command_words(text: str) -> tuple[list[int], list[bool], bool]:
     """Where each command word starts on the detection copy, and whether it may
     be a search command, whose quoted arguments are patterns, not prose: a
-    plain name is one when its last part is, and any other word may be."""
+    plain name is one when its last part is, and any other word may be. Also
+    whether every command word names a command that only prints its words."""
     starts: list[int] = []
     searches: list[bool] = []
+    prints = True
     for m in _COMMAND_WORD.finditer(text):
         word = m.group(1)
+        name = word.rsplit("/", 1)[-1]
         starts.append(m.start(1))
-        searches.append(not _PLAIN.fullmatch(word) or word.rsplit("/", 1)[-1] in _PATTERN_COMMANDS)
-    return starts, searches
+        searches.append(not _PLAIN.fullmatch(word) or name in _PATTERN_COMMANDS)
+        prints = prints and name in _PRINT_COMMANDS
+    return starts, searches, prints
 
 
 def _kept(inner: str, search: bool) -> str | None:
@@ -472,8 +499,8 @@ def _ansi_escape(m: re.Match[str]) -> str:
 
 def _unquoted(text: str, start: int, end: int, kind: str) -> str:
     """A quoted string's text after quote removal: a single-quoted string as
-    written, a double-quoted one without the escapes the shell removes there,
-    and an ANSI-C one decoded."""
+    written, a double-quoted or locale (`$"..."`) one without the escapes the
+    shell removes there, and an ANSI-C one decoded."""
     inner = text[start + 1:end - 1]
     if kind == "'":
         return inner
@@ -486,12 +513,13 @@ def _segments(text: str, bodies: dict[int, int], spans: list[tuple[int, int]],
               kinds: dict[int, str], limit: int) -> list[tuple[str, int, int]]:
     """The text before `limit` in order, as (kind, start, end): "text" for
     shell text, "body" for a kept heredoc body, or a quoted string's quote.
-    An ANSI-C string's `$` is left out of the shell text before it."""
+    The `$` of an ANSI-C or a locale string is left out of the shell text
+    before it."""
     marks = sorted([(s, e, "body") for s, e in bodies.items() if s < limit]
                    + [(s, e, kinds[s]) for s, e in spans])
     out, pos = [], 0
     for start, end, kind in marks:
-        cut = start - 1 if kind == "$'" else start
+        cut = start - 1 if kind.startswith("$") else start
         if pos < cut:
             out.append(("text", pos, cut))
         out.append((kind, start, end))
@@ -519,13 +547,23 @@ def _detect_form(text: str, segment: tuple[str, int, int]) -> str:
     return _SYNTAX.sub(_MASK, _unquoted(text, start, end, kind))
 
 
-def _final_form(text: str, segment: tuple[str, int, int], search: bool) -> str:
-    """A segment as the guard judges it: shell text with each escape's
-    backslash dropped, a kept body as it is, and a quoted string's text after
-    quote removal, as `_kept` makes it."""
+def _judged_escape(m: re.Match[str]) -> str:
+    """An escaped character in a text whose every command only prints: `_` for
+    one that would build command structure, since the escape makes it word
+    text, and the character itself otherwise, so `\\grep` reads as `grep` and
+    `\\$X` as `$X`."""
+    return "_" if _STRUCTURE.match(m.group(1)) else m.group(1)
+
+
+def _final_form(text: str, segment: tuple[str, int, int], search: bool, literal: bool) -> str:
+    """A segment as the guard judges it: shell text with each escape read by
+    `_judged_escape` when the text is `literal`, and otherwise with every
+    escape's backslash dropped, as a command that reads its words as shell
+    text again reads them; a kept body as it is; and a quoted string's text
+    after quote removal, as `_kept` makes it."""
     kind, start, end = segment
     if kind == "text":
-        return _ESCAPE.sub(r"\1", text[start:end])
+        return _ESCAPE.sub(_judged_escape if literal else r"\1", text[start:end])
     if kind == "body":
         return text[start:end]
     inner = _unquoted(text, start, end, kind)
@@ -551,7 +589,10 @@ def _search_at(starts: list[int], searches: list[bool], at: int) -> bool:
 def _strings_view(text: str, bodies: dict[int, int], stop: int) -> str:
     """The text before the raw point with each word read as the shell runs it,
     and each quoted string as `_kept` makes it for the command it belongs to,
-    found on the detection copy; the raw text after."""
+    found on the detection copy; the raw text after. An escaped separator in
+    shell text stays text only when every command only prints its words, no
+    substitution or redirection hides one, and no raw text follows, where a
+    command the view cannot see may run what was printed."""
     spans, kinds, limit = _string_spans(text, bodies, stop)
     segments = _segments(text, bodies, spans, kinds, limit)
     detect: list[str] = []
@@ -562,8 +603,10 @@ def _strings_view(text: str, bodies: dict[int, int], stop: int) -> str:
         offsets.append(size)
         detect.append(form)
         size += len(form)
-    starts, searches = _command_words("".join(detect))
-    out = [_final_form(text, segment, _search_at(starts, searches, at))
+    detection = "".join(detect)
+    starts, searches, prints = _command_words(detection)
+    literal = prints and not _HIDDEN.search(detection) and not text[limit:].strip()
+    out = [_final_form(text, segment, _search_at(starts, searches, at), literal)
            for segment, at in zip(segments, offsets)]
     return "".join(out) + _raw_tail(text[limit:])
 
